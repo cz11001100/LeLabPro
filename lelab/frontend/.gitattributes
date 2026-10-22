@@ -1,0 +1,17 @@
+# LeLabPro 不使用 Git LFS。
+# 3D 网格（最大 36MB）以普通 Git 对象存放，低于 GitHub 单文件 100MB 上限，
+# 这样 git clone 无需安装 git-lfs 就能拿到完整可用的仓库。
+#
+# 上游 Hugging Face Space 版本在此文件里把 *.stl / *.safetensors 等大量二进制
+# 扩展名路由到 LFS，本仓库已移除这些规则。
+
+*.stl  binary
+*.glb  binary
+*.gltf binary
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.woff binary
+*.woff2 binary

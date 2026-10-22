@@ -1,0 +1,62 @@
+# ---- 必须保留（不要加宽泛的 dist/ 或 lerobot/ 规则）----
+# lelab/frontend/dist/  预构建前端，一条命令安装依赖它
+# lerobot/              打过补丁的框架源码
+# *.stl                 3D 模型网格（走 LFS）
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Python 构建产物（只针对 build 目录，不要写成裸 dist/，否则会误伤前端产物）
+build/
+wheels/
+sdist/
+
+# ---- 虚拟环境（安装脚本会生成名为 lerobot/ 的环境目录，但那是本地产物不是仓库内容）----
+.venv/
+venv/
+env/
+ENV/
+uv-env/
+
+# ---- 本地凭据与状态 ----
+.env
+.env.*
+*.pem
+*.key
+id_rsa*
+
+# ---- 训练与本地数据产物 ----
+outputs/
+wandb/
+datasets/
+media/
+*.log
+tmp*.json
+package-lock.json.bak
+
+# 模型权重不入库（太大）
+*.safetensors
+*.pt
+*.ckpt
+*.onnx
+
+# ---- IDE / 系统 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# ---- Node ----
+node_modules/
+*.tsbuildinfo
+.eslintcache
+coverage/

@@ -1,0 +1,1894 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+import re
+import shutil
+import threading
+import time
+import traceback
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+from lerobot.scripts.lerobot_record import DatasetRecordConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.robots.so_follower import SO101FollowerConfig
+from lerobot.utils.constants import HF_LEROBOT_HOME
+
+# Import the main record functionality to reuse it
+from lerobot.scripts.lerobot_record import RecordConfig
+from lerobot.teleoperators.so_leader import SO101LeaderConfig
+
+from .dataset_repair import DatasetRepairError, reindex_episodes_to_contiguous, repair_local_dataset
+from .utils.config import setup_calibration_files, with_lelab_tag
+from .utils.devices import safe_disconnect_device
+
+logger = logging.getLogger(__name__)
+
+# Global variables for recording state
+recording_active = False
+recording_thread: threading.Thread | None = None
+# Live SO101Follower for the active session, set once the robot connects so the
+# /camera-feed endpoint can peek its cameras' latest frames. Reset to None on
+# teardown. Always gated behind `recording_active` by readers.
+current_robot = None
+recording_events = None  # Events dict for controlling recording session
+recording_config = None  # Store recording configuration
+recording_start_time = None  # Track when recording started
+session_end_elapsed_seconds = None  # Final session duration after the run ends
+current_episode = 1  # Track current episode number
+saved_episodes = 0  # Track how many episodes have been saved
+current_phase = "preparing"  # Track current phase: "preparing", "recording", "resetting", "completed"
+phase_start_time = None  # Track when current phase started
+last_recording_info: dict[str, Any] | None = (
+    None  # Snapshot of the most recently completed dataset (for /dataset-info)
+)
+# Guards the start path so two concurrent POST /start-recording calls cannot
+# both pass the active-flag check.
+_state_lock = threading.Lock()
+
+# Upload progress tracking
+upload_progress: dict[str, Any] = {
+    "active": False,
+    "phase": "",
+    "current": 0,
+    "total": 0,
+    "percent": 0,
+    "dataset_repo_id": "",
+    "error": None,
+    "completed": False,
+}
+
+
+class RecordingRequest(BaseModel):
+    leader_port: str
+    follower_port: str
+    leader_config: str
+    follower_config: str
+    dataset_repo_id: str
+    single_task: str
+    num_episodes: int = 5
+    episode_time_s: int = 30
+    reset_time_s: int = 10
+    fps: int = 30
+    video: bool = True
+    push_to_hub: bool = False
+    tags: list[str] = []
+    private: bool = False
+    resume: bool = False
+    streaming_encoding: bool = True
+    cameras: dict = {}
+    test_mode: bool = False  # Skip robot connection for testing
+    ema_alpha: float | None = None  # EMA low-pass filter for jitter reduction
+
+
+class UploadRequest(BaseModel):
+    dataset_repo_id: str
+    tags: list[str] = []
+    private: bool = False
+
+
+class DatasetInfoRequest(BaseModel):
+    dataset_repo_id: str
+    force: bool = False
+
+
+class DeleteEpisodeRequest(BaseModel):
+    dataset_repo_id: str
+    episode_index: int | None = None
+    # Multiple selections go through a single rebuild: the rebuild re-encodes the
+    # whole dataset anyway, so one-at-a-time would cost N full re-encodes.
+    episode_indices: list[int] = []
+
+
+def _platform_backend():
+    """Pin the OpenCV backend per-platform so the index→camera mapping matches
+    what the /available-cameras thumbnails were captured with. cv2.CAP_ANY can
+    pick different backends across calls on macOS, silently reordering cameras
+    between the modal preview and the recording."""
+    import platform
+
+    from lerobot.cameras.configs import Cv2Backends
+
+    system = platform.system()
+    if system == "Darwin":
+        return Cv2Backends.AVFOUNDATION
+    if system == "Linux":
+        return Cv2Backends.V4L2
+    if system == "Windows":
+        # DirectShow, matching the order /available-cameras enumerates (via
+        # pygrabber) so a camera_index always opens the previewed device.
+        return Cv2Backends.DSHOW
+    return Cv2Backends.ANY
+
+
+def _build_camera_configs(cameras: dict, default_backend) -> dict:
+    """Convert the frontend camera dict into OpenCVCameraConfig objects.
+
+    `backend` (a Cv2Backends name) and `fourcc` (a 4-char code) are optional per
+    camera; when omitted they fall back to `default_backend` and auto-detect.
+    """
+    from lerobot.cameras.configs import Cv2Backends
+    from lerobot.cameras.opencv import OpenCVCameraConfig
+
+    camera_configs: dict = {}
+    for camera_name, camera_data in cameras.items():
+        if camera_data.get("type") != "opencv":
+            logger.warning(
+                f"⚠️ CAMERA CONFIG: Unsupported camera type '{camera_data.get('type')}' for {camera_name}"
+            )
+            continue
+
+        backend_name = camera_data.get("backend")
+        backend = Cv2Backends[backend_name] if backend_name else default_backend
+        fourcc = camera_data.get("fourcc") or None
+
+        camera_configs[camera_name] = OpenCVCameraConfig(
+            index_or_path=camera_data.get("camera_index", 0),
+            backend=backend,
+            fps=camera_data.get("fps"),
+            width=camera_data.get("width"),
+            height=camera_data.get("height"),
+            fourcc=fourcc,
+        )
+        logger.info(
+            f"✅ CAMERA CONFIG: {camera_name} -> OpenCVCameraConfig("
+            f"index={camera_data.get('camera_index')}, backend={backend.name}, "
+            f"{camera_data.get('width')}x{camera_data.get('height')}@{camera_data.get('fps')}fps, "
+            f"fourcc={fourcc})"
+        )
+    return camera_configs
+
+
+def create_record_config(request: RecordingRequest) -> RecordConfig:
+    """Create a RecordConfig from the recording request"""
+    logger.info(f"Recording request ema_alpha: {request.ema_alpha}")
+    
+    # Setup calibration files
+    leader_config_name, follower_config_name = setup_calibration_files(
+        request.leader_config, request.follower_config
+    )
+
+    # Convert the frontend camera dict into OpenCVCameraConfig objects. Backend
+    # defaults to the platform pin unless the request overrides it per camera.
+    camera_configs = _build_camera_configs(request.cameras, _platform_backend())
+
+    # Create robot config
+    robot_config = SO101FollowerConfig(
+        port=request.follower_port,
+        id=follower_config_name,
+        cameras=camera_configs,
+        ema_alpha=request.ema_alpha,
+    )
+    logger.info(f"Recording robot config created with ema_alpha={robot_config.ema_alpha}")
+
+    # Create teleop config
+    teleop_config = SO101LeaderConfig(
+        port=request.leader_port,
+        id=leader_config_name,
+    )
+
+    # Create dataset config
+    dataset_config = DatasetRecordConfig(
+        repo_id=request.dataset_repo_id,
+        single_task=request.single_task,
+        num_episodes=request.num_episodes,
+        episode_time_s=request.episode_time_s,
+        reset_time_s=request.reset_time_s,
+        fps=request.fps,
+        video=request.video,
+        push_to_hub=request.push_to_hub,
+        # Upstream typing: tags is `list[str] | None`. None when push is off
+        # keeps the lerobot default.
+        tags=with_lelab_tag(request.tags) if request.push_to_hub else None,
+        private=request.private,
+        streaming_encoding=request.streaming_encoding,
+    )
+
+    # Create the main record config
+    record_config = RecordConfig(
+        robot=robot_config,
+        teleop=teleop_config,
+        dataset=dataset_config,
+        resume=request.resume,
+        display_data=False,  # Don't display data in API mode
+        play_sounds=False,  # Don't play sounds in API mode
+    )
+
+    return record_config
+
+
+def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
+    """Handle start recording request by using the existing record() function"""
+    global \
+        recording_active, \
+        recording_thread, \
+        recording_events, \
+        recording_config, \
+        recording_start_time, \
+        session_end_elapsed_seconds, \
+        current_episode, \
+        saved_episodes, \
+        current_phase, \
+        phase_start_time, \
+        last_recording_info
+
+    from . import rollout as _rollout, teleoperate as _teleoperate
+
+    # Claim the active flag under the lock so two concurrent starts can't both
+    # pass the precondition check.
+    with _state_lock:
+        if recording_active:
+            return {"success": False, "message": "Recording is already active"}
+        if _teleoperate.teleoperation_active:
+            return {"success": False, "message": "Teleoperation is currently active. Stop it first."}
+        if _rollout.inference_active:
+            return {"success": False, "message": "Inference is currently active. Stop it first."}
+        recording_active = True
+        recording_thread = None
+        recording_events = None
+        recording_config = None
+        recording_start_time = None
+        session_end_elapsed_seconds = None
+        current_episode = 1
+        saved_episodes = 0
+        current_phase = "preparing"
+        phase_start_time = None
+        last_recording_info = None
+
+    try:
+        # Sanitize the dataset name so push_to_hub never rejects a finished
+        # recording over an invalid character. HF repo names allow only
+        # [A-Za-z0-9._-]; everything else becomes "_".
+        if request.dataset_repo_id:
+            if "/" in request.dataset_repo_id:
+                namespace, name = request.dataset_repo_id.split("/", 1)
+                name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+                request.dataset_repo_id = f"{namespace}/{name}"
+            else:
+                request.dataset_repo_id = re.sub(r"[^A-Za-z0-9._-]", "_", request.dataset_repo_id)
+        logger.info(f"Starting recording for dataset: {request.dataset_repo_id}")
+        logger.info(f"Task: {request.single_task}")
+
+        recording_config = request
+        recording_events = {
+            "exit_early": False,  # Right arrow key -> "Skip to next episode" button
+            "stop_recording": False,  # ESC key -> "Stop recording" button
+            "rerecord_episode": False,  # Left arrow key -> "Re-record episode" button
+        }
+
+        record_config = create_record_config(request)
+
+        def recording_worker():
+            global \
+                recording_active, \
+                recording_start_time, \
+                session_end_elapsed_seconds, \
+                current_phase, \
+                phase_start_time, \
+                current_episode, \
+                saved_episodes, \
+                last_recording_info
+            recording_start_time = time.time()
+            current_episode = 1
+            saved_episodes = 0
+
+            try:
+                logger.info(
+                    "Recording session started: dataset=%s task=%r episodes=%d",
+                    request.dataset_repo_id,
+                    request.single_task,
+                    request.num_episodes,
+                )
+
+                # Give the frontend's camera streams time to release the
+                # underlying devices before lerobot tries to open them.
+                if request.cameras:
+                    logger.info(
+                        "Waiting for camera resources to be released (cameras: %s)",
+                        list(request.cameras.keys()),
+                    )
+                    time.sleep(2.0)
+
+                dataset = record_with_web_events(record_config, recording_events)
+                logger.info(f"Recording completed successfully. Dataset has {dataset.num_episodes} episodes")
+                last_recording_info = {
+                    "success": True,
+                    "dataset_repo_id": request.dataset_repo_id,
+                    "num_episodes": dataset.num_episodes,
+                    "single_task": request.single_task,
+                    "fps": dataset.fps,
+                    "features": list(dataset.features.keys()),
+                    "total_frames": dataset.num_frames,
+                    "robot_type": getattr(dataset.meta, "robot_type", "Unknown robot"),
+                    "source": "local",
+                }
+            except Exception as e:
+                # lerobot's init_logging() installs a root formatter that only
+                # renders the message, so logger.exception() would drop the
+                # traceback. Fold it into the message instead.
+                logger.error("Recording session failed: %s\n%s", e, traceback.format_exc())
+                current_phase = "error"
+                if recording_start_time:
+                    session_end_elapsed_seconds = int(time.time() - recording_start_time)
+                # Episodes already saved survive the failure (it can happen in
+                # the reset phase, in finalize, or in the Hub push), so keep the
+                # count: the frontend still offers them for upload.
+                last_recording_info = {
+                    "success": False,
+                    "error": str(e),
+                    "dataset_repo_id": request.dataset_repo_id,
+                    "saved_episodes": saved_episodes,
+                }
+            finally:
+                if current_phase != "error":
+                    current_phase = "completed"
+                if recording_start_time:
+                    session_end_elapsed_seconds = int(time.time() - recording_start_time)
+                recording_active = False
+                recording_start_time = None
+                phase_start_time = None
+                current_episode = 1
+                saved_episodes = 0
+                logger.info("Recording session ended")
+
+        recording_thread = threading.Thread(target=recording_worker, name="recording-worker", daemon=True)
+        recording_thread.start()
+
+        return {
+            "success": True,
+            "message": "Recording started successfully",
+            "dataset_id": request.dataset_repo_id,
+            "num_episodes": request.num_episodes,
+        }
+
+    except Exception as e:
+        recording_active = False
+        logger.error(f"Failed to start recording: {e}")
+        return {"success": False, "message": f"Failed to start recording: {str(e)}"}
+
+
+def handle_stop_recording() -> dict[str, Any]:
+    """Handle stop recording request - replaces ESC key"""
+    global current_phase, phase_start_time
+
+    if not recording_active or recording_events is None:
+        return {"success": False, "message": "No recording session is active"}
+
+    recording_events["stop_recording"] = True
+    recording_events["exit_early"] = True
+    current_phase = "stopping"
+    phase_start_time = None
+    logger.info("Stop recording triggered from web interface")
+    return {
+        "success": True,
+        "message": "Recording stop requested successfully",
+        "session_ending": True,
+    }
+
+
+def handle_exit_early() -> dict[str, Any]:
+    """Handle exit early request - replaces right arrow key"""
+    if not recording_active or recording_events is None:
+        return {"success": False, "message": "No recording session is active"}
+    recording_events["exit_early"] = True
+    # Tracking flag that record_loop won't reset, so the worker can tell
+    # "user pressed skip" from "control_time_s elapsed naturally".
+    recording_events["_exit_early_triggered"] = True
+    logger.info("Exit early triggered (current phase: %s)", current_phase)
+    phase_name = "recording phase" if current_phase == "recording" else "reset phase"
+    return {
+        "success": True,
+        "message": f"Exit early triggered successfully for {phase_name}",
+        "current_phase": current_phase,
+        "events_state": dict(recording_events),
+    }
+
+
+def handle_rerecord_episode() -> dict[str, Any]:
+    """Handle rerecord episode request - replaces left arrow key"""
+    if not recording_active or recording_events is None:
+        return {"success": False, "message": "No recording session is active"}
+    recording_events["rerecord_episode"] = True
+    recording_events["exit_early"] = True
+    logger.info("Re-record episode triggered")
+    return {
+        "success": True,
+        "message": "Re-record episode requested successfully",
+        "events_state": dict(recording_events),
+    }
+
+
+def handle_recording_status() -> dict[str, Any]:
+    """Handle recording status request"""
+    # If recording is not active and phase is completed or error, indicate session has ended
+    session_ended = not recording_active and current_phase in ["completed", "error"]
+
+    # Log when session has ended to help debug frontend polling
+    if session_ended:
+        if current_phase == "error":
+            logger.info(
+                "📡 RECORDING STATUS REQUEST: Session failed with error - frontend should stop polling"
+            )
+            print("📡 STATUS CHANGE: Frontend is still polling after session error - should stop now")
+        else:
+            logger.info("📡 RECORDING STATUS REQUEST: Session has ended - frontend should stop polling")
+            print("📡 STATUS CHANGE: Frontend is still polling after session end - should stop now")
+
+    status = {
+        "recording_active": recording_active,
+        "current_phase": current_phase,  # "preparing", "recording", "resetting", "completed"
+        "session_ended": session_ended,  # New field to indicate session completion
+        "available_controls": {
+            "stop_recording": recording_active,  # ESC key replacement
+            "exit_early": recording_active,  # Right arrow key replacement
+            "rerecord_episode": recording_active
+            and current_phase == "recording",  # Only during recording phase
+        },
+        "message": "Recording session failed with error - check logs"
+        if current_phase == "error"
+        else (
+            "Recording session has ended - stop polling"
+            if session_ended
+            else "Recording status retrieved successfully"
+        ),
+    }
+
+    # Always echo the stamped dataset id whenever a config exists, so the frontend
+    # can read the actual on-disk repo_id (post stamp) for upload navigation.
+    if recording_config:
+        status["dataset_repo_id"] = recording_config.dataset_repo_id
+
+    # Carry the failure reason and how much of the session survived it, so the
+    # frontend can offer a partial dataset for upload and only send the user
+    # home when nothing was saved.
+    if current_phase == "error" and last_recording_info:
+        status["error"] = last_recording_info.get("error", "Unknown error")
+        status["saved_episodes"] = last_recording_info.get("saved_episodes", 0)
+
+    # Add episode information if recording is active
+    if recording_active and recording_config:
+        status["current_episode"] = current_episode
+        status["total_episodes"] = recording_config.num_episodes
+        status["saved_episodes"] = saved_episodes  # Track completed episodes
+        # Names of the cameras the user configured for this session. The frontend
+        # renders a live /camera-feed/{name} preview for exactly these — nothing
+        # else — so only configured cameras are ever shown.
+        status["cameras"] = list(recording_config.cameras.keys())
+
+        # Add session start time if available
+        if recording_start_time:
+            status["session_start_time"] = recording_start_time
+            status["session_elapsed_seconds"] = int(time.time() - recording_start_time)
+
+        # Add phase timing information
+        if phase_start_time:
+            status["phase_start_time"] = phase_start_time
+            status["phase_elapsed_seconds"] = int(time.time() - phase_start_time)
+
+            # Add phase time limits
+            if current_phase == "recording":
+                status["phase_time_limit_s"] = recording_config.episode_time_s
+            elif current_phase == "resetting":
+                status["phase_time_limit_s"] = recording_config.reset_time_s
+    elif session_end_elapsed_seconds is not None:
+        status["session_elapsed_seconds"] = session_end_elapsed_seconds
+
+    return status
+
+
+def camera_feed_frames(cam_key: str, fps: float = 15.0):
+    """Yield multipart-MJPEG chunks of one recording camera's latest frames.
+
+    Reads via the camera's non-blocking `read_latest()` peek, so it shares the
+    record loop's lock-protected frame buffer with zero device contention (never
+    `async_read()`, which would consume the new-frame event and could disturb
+    record timing). Streams only while a session is live and the named camera
+    exists; ends cleanly otherwise so the browser <img> stops. Capped well below
+    the record fps so it stays a passive observer.
+    """
+    import cv2
+
+    interval = 1.0 / fps
+    # The session sets `current_robot` only after the robot connects (which is
+    # preceded by a ~2s camera-release wait), so give it a moment to appear.
+    deadline = time.time() + 15.0
+    while recording_active and current_robot is None and time.time() < deadline:
+        time.sleep(0.1)
+
+    while recording_active:
+        # Snapshot the module global once per iteration. The recording teardown
+        # clears current_robot before it disconnects the cameras, so reading it
+        # a single time avoids dereferencing a robot that went away between the
+        # check and the access.
+        robot = current_robot
+        if robot is None:
+            break
+        cam = robot.cameras.get(cam_key)
+        if cam is None:
+            # Unknown/removed camera — nothing to stream.
+            break
+        try:
+            # read_latest() returns an RGB frame (OpenCVCamera default color
+            # mode); may raise if the camera hasn't produced a fresh frame yet.
+            frame = cam.read_latest()
+        except (TimeoutError, RuntimeError):
+            time.sleep(interval)
+            continue
+        except Exception as e:
+            logger.warning("camera-feed %s: unexpected read error: %s", cam_key, e)
+            break
+
+        bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        ok, buf = cv2.imencode(".jpg", bgr)
+        if not ok:
+            time.sleep(interval)
+            continue
+        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
+        time.sleep(interval)
+
+
+def handle_get_dataset_info(request: DatasetInfoRequest) -> dict[str, Any]:
+    """Return dataset metadata from the local LeRobot cache, falling back to the
+    most recent session's snapshot only when the dataset isn't readable on disk.
+
+    The on-disk ``info.json`` has to win: it is rewritten as each episode is saved,
+    so it is at least as fresh as the snapshot. The snapshot used to take
+    precedence, and after a *failed* recording session it is an error dict with no
+    ``num_episodes`` — which made the frontend hide the entire Episodes panel
+    (`numEpisodes > 0`) for that dataset until the user started another session.
+    """
+
+    def session_snapshot() -> dict[str, Any] | None:
+        if last_recording_info and last_recording_info.get("dataset_repo_id") == request.dataset_repo_id:
+            return last_recording_info
+        return None
+
+    try:
+        import json
+        from pathlib import Path
+
+        import pandas as pd
+
+        dataset_root = Path(HF_LEROBOT_HOME) / request.dataset_repo_id
+        info_json = dataset_root / "meta" / "info.json"
+
+        if not info_json.exists():
+            snapshot = session_snapshot()
+            if snapshot is not None:
+                return snapshot
+            return {
+                "success": False,
+                "message": f"Dataset {request.dataset_repo_id} not found locally",
+            }
+
+        # Don't repair here - it can conflict with active recording
+        # Repair only happens at the start of recording session
+        
+        # Read info.json directly to avoid Hub validation issues
+        info = json.loads(info_json.read_text())
+
+        # Check if dataset has been uploaded to Hub by looking for marker file
+        uploaded_marker = dataset_root / ".uploaded_to_hub"
+        source = "both" if uploaded_marker.exists() else "local"
+
+        # Recover single_task: info.json rarely stores it; fall back to the
+        # first row of tasks.parquet (the task text every episode was recorded with).
+        single_task = info.get("single_task")
+        if not single_task:
+            tasks_parquet = dataset_root / "meta" / "tasks.parquet"
+            if tasks_parquet.exists():
+                try:
+                    tasks_df = pd.read_parquet(tasks_parquet)
+                    if not tasks_df.empty:
+                        single_task = tasks_df.iloc[0].name if tasks_df.index.name == "task" else str(tasks_df.iloc[0]["task"] if "task" in tasks_df.columns else tasks_df.index[0])
+                except Exception:
+                    pass
+        if not single_task:
+            single_task = "Unknown task"
+
+        # Per-episode frame counts, so the UI can show what each row actually is
+        # instead of total_frames / num_episodes repeated on every line — with
+        # episodes ranging from 2 to 338 frames the average identifies nothing.
+        episodes: list[dict[str, int]] = []
+        ep_parquets = sorted((dataset_root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
+        if ep_parquets:
+            try:
+                df = pd.concat(
+                    [pd.read_parquet(p, columns=["episode_index", "length"]) for p in ep_parquets]
+                )
+                episodes = [
+                    {"index": int(row.episode_index), "length": int(row.length)}
+                    for row in df.sort_values("episode_index").itertuples()
+                ]
+            except Exception as e:
+                logger.debug("Could not read per-episode lengths for %s: %s", request.dataset_repo_id, e)
+
+        return {
+            "success": True,
+            "dataset_repo_id": request.dataset_repo_id,
+            "num_episodes": info.get("total_episodes", 0),
+            "single_task": single_task,
+            "fps": info.get("fps", 0),
+            "features": list(info.get("features", {}).keys()),
+            "total_frames": info.get("total_frames", 0),
+            "robot_type": info.get("robot_type", "Unknown robot"),
+            "source": source,
+            "episodes": episodes,
+        }
+    except Exception as e:
+        logger.warning(f"Could not load local dataset {request.dataset_repo_id}: {e}")
+        snapshot = session_snapshot()
+        if snapshot is not None:
+            return snapshot
+        return {
+            "success": False,
+            "message": f"Dataset {request.dataset_repo_id} not found locally",
+        }
+
+
+def handle_delete_dataset(request: DatasetInfoRequest) -> dict[str, Any]:
+    """Remove a recorded dataset's directory from local disk."""
+    global last_recording_info
+    from pathlib import Path
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    repo_id = request.dataset_repo_id
+    root = Path(HF_LEROBOT_HOME).resolve()
+    target = (root / repo_id).resolve()
+
+    # Reject path traversal: target must stay strictly inside HF_LEROBOT_HOME.
+    if target == root or root not in target.parents:
+        return {"success": False, "message": "Invalid dataset path"}
+
+    if not target.exists():
+        return {"success": False, "message": f"Dataset not found on disk: {repo_id}"}
+
+    try:
+        shutil.rmtree(target)
+    except Exception as e:
+        logger.error(f"Failed to delete dataset {repo_id}: {e}")
+        return {"success": False, "message": f"Failed to delete dataset: {e}"}
+
+    if last_recording_info and last_recording_info.get("dataset_repo_id") == repo_id:
+        last_recording_info = None
+
+    logger.info(f"Deleted dataset directory {target}")
+    return {"success": True, "message": f"Deleted {repo_id}"}
+
+
+def handle_delete_episode(request: DeleteEpisodeRequest) -> dict[str, Any]:
+    """Remove one or more episodes from a local dataset."""
+    from pathlib import Path
+    import json
+    import pandas as pd
+    import pyarrow.parquet as pq
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    repo_id = request.dataset_repo_id
+    targets = sorted(set(request.episode_indices))
+    if not targets and request.episode_index is not None:
+        targets = [request.episode_index]
+    if not targets:
+        return {"success": False, "message": "No episodes selected"}
+    episode_idx = targets[0]
+    root = Path(HF_LEROBOT_HOME).resolve()
+    target = (root / repo_id).resolve()
+
+    if target == root or root not in target.parents:
+        return {"success": False, "message": "Invalid dataset path"}
+    if not target.exists():
+        return {"success": False, "message": f"Dataset not found on disk: {repo_id}"}
+
+    data_dir = target / "data"
+    videos_dir = target / "videos"
+    meta_dir = target / "meta"
+
+    if not data_dir.exists():
+        return {"success": False, "message": "Dataset has no data directory"}
+
+    # v3 datasets pack many episodes into one mp4 per camera, so a middle-episode
+    # delete can't be done by dropping parquet rows alone: files that hold only
+    # surviving episodes are copied, and only the files mixing kept and deleted
+    # episodes are re-encoded. See delete_episodes_via_rebuild, which defers to
+    # lerobot's own editor. The v2 path below handles per-episode mp4 layouts.
+    if list((meta_dir / "episodes").glob("chunk-*/file-*.parquet")):
+        import threading
+
+        from .dataset_repair import delete_episodes_via_rebuild, repair_progress
+
+        if repair_progress.get("active"):
+            return {"success": False, "message": "A rebuild or repair is already in progress"}
+
+        # Claim the slot before spawning the worker: it marks itself active only
+        # once it starts running, and a second request inside that window would
+        # otherwise run two rebuilds over the same directory.
+        repair_progress.update(
+            {
+                "active": True,
+                "completed": False,
+                "error": None,
+                "percent": 0,
+                "current": 0,
+                "total": 0,
+                "phase": "Starting rebuild",
+                "dataset_repo_id": repo_id,
+            }
+        )
+
+        def _run_rebuild():
+            try:
+                logger.info(delete_episodes_via_rebuild(target, repo_id, targets))
+            except Exception as e:
+                # Covers the validation failures that raise before the worker sets
+                # any progress, so `active` can't be left stuck on forever.
+                logger.error(f"Failed to delete episodes {targets} from {repo_id}: {e}")
+                repair_progress.update(
+                    {"active": False, "completed": False, "error": str(e), "phase": "Rebuild failed"}
+                )
+
+        threading.Thread(target=_run_rebuild, daemon=True, name="episode-rebuild").start()
+        return {
+            "success": True,
+            "async": True,
+            "message": f"Rebuilding {repo_id} without episodes {targets}",
+        }
+
+    if len(targets) > 1:
+        # Legacy v2 layout drops whole files, so it needs no re-encode and removing
+        # them one at a time is cheap. Highest first keeps the lower indices valid.
+        for idx in sorted(targets, reverse=True):
+            result = handle_delete_episode(
+                DeleteEpisodeRequest(dataset_repo_id=repo_id, episode_index=idx)
+            )
+            if not result.get("success"):
+                return result
+        return {"success": True, "message": f"Deleted {len(targets)} episode(s)"}
+
+    try:
+        all_parquets = sorted(data_dir.glob("chunk-*/file-*.parquet"))
+        if not all_parquets:
+            return {"success": False, "message": "No parquet files found"}
+
+        frames = [pq.read_table(p).to_pandas() for p in all_parquets]
+        combined_df = pd.concat(frames, ignore_index=True)
+
+        if "episode_index" not in combined_df.columns:
+            return {"success": False, "message": "Dataset format not supported"}
+
+        total_episodes = int(combined_df["episode_index"].nunique())
+        if episode_idx < 0 or episode_idx >= total_episodes:
+            return {"success": False, "message": f"Episode {episode_idx} out of range (0-{total_episodes - 1})"}
+
+        episode_mask = combined_df["episode_index"] == episode_idx
+        frames_to_delete = int(episode_mask.sum())
+        new_df = combined_df[~episode_mask].copy()
+
+        if len(new_df) == 0:
+            shutil.rmtree(target)
+            return {"success": True, "message": "Deleted last episode, dataset removed", "dataset_deleted": True}
+
+        new_df["index"] = range(len(new_df))
+        for chunk_dir in data_dir.glob("chunk-*"):
+            for f in chunk_dir.glob("file-*.parquet"):
+                f.unlink()
+        new_df.to_parquet(data_dir / "chunk-000" / "file-000.parquet", index=False)
+
+        for cam_dir in videos_dir.iterdir():
+            if not cam_dir.is_dir():
+                continue
+            ep_video = cam_dir / "chunk-000" / f"observation_episode_{episode_idx:06d}.mp4"
+            if ep_video.exists():
+                ep_video.unlink()
+            remaining = sorted((cam_dir / "chunk-000").glob("observation_episode_*.mp4"))
+            for new_idx, vpath in enumerate(remaining):
+                old_idx = int(vpath.stem.split("_")[-1])
+                if old_idx != new_idx:
+                    vpath.rename(vpath.parent / f"observation_episode_{new_idx:06d}.mp4")
+
+        info_path = meta_dir / "info.json"
+        new_total = total_episodes - 1
+        if info_path.exists():
+            with open(info_path) as f:
+                info = json.load(f)
+            info["total_episodes"] = new_total
+            info["total_frames"] = len(new_df)
+            info["splits"] = {"train": f"0:{new_total}"}
+            with open(info_path, "w") as f:
+                json.dump(info, f, indent=4)
+
+        stats_path = meta_dir / "stats.json"
+        if stats_path.exists():
+            stats_path.unlink()
+
+        logger.info(f"Deleted episode {episode_idx} from {repo_id} ({frames_to_delete} frames)")
+        return {"success": True, "message": f"Deleted episode {episode_idx}", "frames_removed": frames_to_delete, "remaining_episodes": new_total}
+
+    except Exception as e:
+        logger.error(f"Failed to delete episode {episode_idx} from {repo_id}: {e}")
+        return {"success": False, "message": f"Failed to delete episode: {e}"}
+
+
+def handle_check_dataset_health(request: DatasetInfoRequest) -> dict[str, Any]:
+    """Check if a dataset is healthy or corrupted."""
+    from .dataset_repair import check_dataset_health
+    try:
+        result = check_dataset_health(request.dataset_repo_id)
+        return {"success": True, **result}
+    except Exception as e:
+        logger.error(f"Health check failed for {request.dataset_repo_id}: {e}")
+        return {"success": False, "healthy": False, "error": str(e), "needs_repair": True}
+
+
+def handle_repair_dataset(request: DatasetInfoRequest) -> dict[str, Any]:
+    """Start repairing a corrupted dataset in a background thread."""
+    import threading
+    from .dataset_repair import repair_local_dataset_with_progress, repair_progress
+
+    if repair_progress.get("active"):
+        return {"success": False, "message": "A repair is already in progress"}
+
+    def _run_repair():
+        try:
+            repair_local_dataset_with_progress(request.dataset_repo_id, force=request.force)
+        except Exception as e:
+            logger.error(f"Repair failed for {request.dataset_repo_id}: {e}")
+
+    thread = threading.Thread(target=_run_repair, daemon=True)
+    thread.start()
+    return {"success": True, "message": "Repair started"}
+
+
+def _prune_stale_hub_files(hub_api, repo_id: str, root_path: Path) -> list[str]:
+    """Delete remote meta/data/video files that no longer exist locally.
+
+    `upload_folder` only adds and overwrites, so re-pushing after a local
+    re-index leaves the previous shards behind. lerobot concatenates every
+    `meta/episodes/**/*.parquet` it finds, so stragglers push frame indices past
+    `total_frames` and training dies with an out-of-bounds IndexError.
+    """
+    from huggingface_hub import CommitOperationDelete
+
+    prefixes = ("meta/", "data/", "videos/")
+    local: set[str] = set()
+    for prefix in prefixes:
+        base = root_path / prefix.rstrip("/")
+        if base.exists():
+            local.update(p.relative_to(root_path).as_posix() for p in base.rglob("*") if p.is_file())
+
+    remote = set(hub_api.list_repo_files(repo_id, repo_type="dataset"))
+    stale = sorted(f for f in remote if f.startswith(prefixes) and f not in local)
+    if not stale:
+        return []
+    hub_api.create_commit(
+        repo_id=repo_id,
+        repo_type="dataset",
+        operations=[CommitOperationDelete(path_in_repo=f) for f in stale],
+        commit_message="Prune files removed locally (stale shards break lerobot indexing)",
+    )
+    return stale
+
+
+_VIDEO_UPLOAD_ATTEMPTS = 3
+
+
+def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files, on_file) -> None:
+    """Upload the packed mp4s serially, retrying each one before giving up.
+
+    `upload_folder` hands the whole batch to `create_commit`'s default five-thread
+    pool, and five concurrent 20-70MB multipart LFS uploads is more than this
+    network carries: the batch died after 350s on
+    `videos/observation.images.up/chunk-000/file-003.mp4` while the identical file
+    finished alone in 11s. Uploading a file is idempotent, so a retry re-runs only
+    that file.
+    """
+    ordered = sorted(video_files, key=lambda p: p.stat().st_size)
+    for done, path in enumerate(ordered, start=1):
+        path_in_repo = path.relative_to(root_path).as_posix()
+        for attempt in range(1, _VIDEO_UPLOAD_ATTEMPTS + 1):
+            try:
+                hub_api.upload_file(
+                    path_or_fileobj=str(path),
+                    path_in_repo=path_in_repo,
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                    commit_message=f"Upload {path_in_repo}",
+                )
+                break
+            except Exception as e:
+                if attempt == _VIDEO_UPLOAD_ATTEMPTS:
+                    raise
+                sleep_s = 5 * attempt
+                logger.warning(
+                    "Upload attempt %d/%d failed for %s (%s); retrying in %ds", attempt, _VIDEO_UPLOAD_ATTEMPTS, path_in_repo, e, sleep_s
+                )
+                time.sleep(sleep_s)
+        on_file(done, path_in_repo)
+
+
+def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
+    """Handle dataset upload to HuggingFace Hub"""
+    global upload_progress
+
+    def update_progress(phase: str, current: int = 0, total: int = 0, percent: int = 0, error: str | None = None, completed: bool = False):
+        global upload_progress
+        upload_progress.update({
+            "active": not completed and error is None,
+            "phase": phase,
+            "current": current,
+            "total": total,
+            "percent": percent,
+            "dataset_repo_id": request.dataset_repo_id,
+            "error": error,
+            "completed": completed,
+        })
+
+    try:
+        import json
+        import os
+        from pathlib import Path
+
+        from huggingface_hub import HfApi
+
+        # hf_xet's CAS upload channel fails outright from this network
+        # ("Request middleware error: error sending request for url
+        # (https://cas-server.xethub.hf.co/v1/xorbs/...)") after the metadata and
+        # small files have already landed, leaving a repo with no videos. The
+        # classic LFS endpoint completes the same 72MB file in 49s.
+        # huggingface_hub resolves HF_HUB_DISABLE_XET once, at import time
+        # (constants.py), so setting the environment alone here would be too late —
+        # flip the module constant too, which is_xet_available() reads per call.
+        if "HF_HUB_DISABLE_XET" not in os.environ:
+            from huggingface_hub import constants as hf_constants
+
+            os.environ["HF_HUB_DISABLE_XET"] = "1"
+            hf_constants.HF_HUB_DISABLE_XET = True
+
+        update_progress("Preparing dataset...", percent=5)
+        repair_local_dataset(request.dataset_repo_id)
+
+        dataset_root = Path(HF_LEROBOT_HOME) / request.dataset_repo_id
+        info_json_path = dataset_root / "meta" / "info.json"
+
+        if not info_json_path.exists():
+            raise FileNotFoundError(f"Dataset {request.dataset_repo_id} not found locally")
+
+        # Read info.json directly — avoids LeRobotDataset() which tries to
+        # download from Hub and gets a 404 for datasets never pushed before
+        info = json.loads(info_json_path.read_text())
+        num_episodes = info.get("total_episodes", 0)
+
+        logger.info(f"Dataset {request.dataset_repo_id} has {num_episodes} episodes")
+        tags = with_lelab_tag(request.tags)
+        logger.info(f"Uploading to HuggingFace Hub with tags: {tags}, private: {request.private}")
+
+        update_progress("Creating repository...", percent=10)
+        hub_api = HfApi()
+        hub_api.create_repo(
+            repo_id=request.dataset_repo_id,
+            private=request.private,
+            repo_type="dataset",
+            exist_ok=True,
+        )
+
+        ignore_patterns = ["images/"]
+        root_path = dataset_root
+
+        data_files = list((root_path / "data").rglob("*.parquet")) if (root_path / "data").exists() else []
+        video_files = list((root_path / "videos").rglob("*.mp4")) if (root_path / "videos").exists() else []
+        meta_files = list((root_path / "meta").rglob("*")) if (root_path / "meta").exists() else []
+        total_files = len(data_files) + len(video_files) + len(meta_files)
+
+        update_progress("Uploading metadata...", current=len(meta_files), total=total_files, percent=20)
+        hub_api.upload_folder(
+            repo_id=request.dataset_repo_id,
+            folder_path=str(root_path),
+            repo_type="dataset",
+            allow_patterns=["meta/*"],
+            ignore_patterns=ignore_patterns,
+        )
+
+        update_progress("Uploading data files...", current=len(meta_files), total=total_files, percent=30)
+        hub_api.upload_folder(
+            repo_id=request.dataset_repo_id,
+            folder_path=str(root_path),
+            repo_type="dataset",
+            allow_patterns=["data/*"],
+            ignore_patterns=ignore_patterns,
+        )
+
+        data_progress = len(meta_files) + len(data_files)
+        update_progress("Data uploaded", current=data_progress, total=total_files, percent=50)
+
+        if video_files:
+            update_progress("Uploading videos...", current=data_progress, total=total_files, percent=55)
+
+            def _video_uploaded(done: int, name: str) -> None:
+                fraction = done / len(video_files)
+                update_progress(
+                    f"Uploading videos ({done}/{len(video_files)})",
+                    current=data_progress + done,
+                    total=total_files,
+                    percent=55 + int(34 * fraction),
+                )
+
+            _push_videos_one_by_one(hub_api, request.dataset_repo_id, root_path, video_files, _video_uploaded)
+
+        stale = _prune_stale_hub_files(hub_api, request.dataset_repo_id, root_path)
+        if stale:
+            logger.info("Pruned %d stale Hub files: %s", len(stale), ", ".join(stale[:8]))
+            update_progress("Pruned stale remote files", current=data_progress, total=total_files, percent=55)
+
+        update_progress("Uploading dataset card...", current=total_files - 1, total=total_files, percent=90)        # Build the dataset card manually — create_lerobot_dataset_card expects
+        # an Info object with .to_dict(), but we have a plain dict from info.json
+        from huggingface_hub import DatasetCard, DatasetCardData
+
+        dataset_structure = "[meta/info.json](meta/info.json):\n"
+        dataset_structure += f"```json\n{json.dumps(info, indent=4)}\n```\n"
+
+        card_data = DatasetCardData(
+            license="apache-2.0",
+            tags=["LeRobot"] + tags,
+            task_categories=["robotics"],
+            configs=[{"config_name": "default", "data_files": "data/*/*.parquet"}],
+        )
+        card_content = f"""---
+{card_data.to_yaml()}
+---
+
+This dataset was created using [LeRobot](https://github.com/huggingface/lerobot).
+
+## Dataset Description
+
+- **License:** apache-2.0
+
+## Dataset Structure
+
+{dataset_structure}
+"""
+        card = DatasetCard(card_content)
+        card.push_to_hub(repo_id=request.dataset_repo_id, repo_type="dataset")
+
+        update_progress("Tagging version...", current=total_files, total=total_files, percent=95)
+        from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION
+        import contextlib
+        from huggingface_hub.errors import RevisionNotFoundError
+
+        with contextlib.suppress(RevisionNotFoundError):
+            hub_api.delete_tag(request.dataset_repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
+        hub_api.create_tag(request.dataset_repo_id, tag=CODEBASE_VERSION, revision=None, repo_type="dataset")
+
+        logger.info(f"Dataset {request.dataset_repo_id} uploaded successfully to HuggingFace Hub")
+        
+        # Create marker file to remember this dataset has been uploaded
+        uploaded_marker = dataset_root / ".uploaded_to_hub"
+        uploaded_marker.touch()
+        
+        # Update last_recording_info to reflect that dataset is now on Hub
+        global last_recording_info
+        if last_recording_info and last_recording_info.get("dataset_repo_id") == request.dataset_repo_id:
+            last_recording_info["source"] = "both"
+        
+        update_progress("Upload complete!", current=total_files, total=total_files, percent=100, completed=True)
+
+        return {
+            "success": True,
+            "message": f"Dataset {request.dataset_repo_id} uploaded successfully to HuggingFace Hub",
+            "dataset_url": f"https://huggingface.co/datasets/{request.dataset_repo_id}",
+            "num_episodes": num_episodes,
+        }
+
+    except DatasetRepairError as e:
+        logger.error(f"Cannot upload {request.dataset_repo_id}: {e}")
+        update_progress("Upload failed", error=str(e))
+        return {"success": False, "message": str(e)}
+
+    except Exception as e:
+        logger.error(f"Error uploading dataset {request.dataset_repo_id}: {e}")
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        update_progress("Upload failed", error=str(e))
+
+        err_text = str(e).lower()
+        looks_like_auth = any(
+            m in err_text
+            for m in ("401", "you must be authenticated", "authentication required", "huggingfacehub_token")
+        )
+        if looks_like_auth:
+            return {
+                "success": False,
+                "message": "You're not logged into the Hugging Face Hub. Run `hf auth login` in your terminal, then retry.",
+                "docs_url": "https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication",
+            }
+        return {"success": False, "message": f"Failed to upload dataset: {str(e)}"}
+
+
+def get_upload_progress() -> dict[str, Any]:
+    """Return current upload progress."""
+    return upload_progress.copy()
+
+
+def _read_resume_episode_indices(resume_root: Path) -> list[int] | None:
+    """Return the episode_index values in the dataset's episode metadata.
+
+    Returns None when the metadata cannot be read (the caller treats that as
+    "cannot prove unsafe" and skips the guard rather than blocking on a hiccup).
+    """
+    import pandas as pd
+
+    ep_indices: list[int] = []
+    parquet_metas = sorted(resume_root.glob("meta/episodes/chunk-*/file-*.parquet"))
+    jsonl_meta = resume_root / "meta" / "episodes.jsonl"
+    try:
+        if parquet_metas:
+            df = pd.concat(
+                [pd.read_parquet(p, columns=["episode_index"]) for p in parquet_metas],
+                ignore_index=True,
+            )
+            ep_indices = df["episode_index"].astype(int).tolist()
+        elif jsonl_meta.exists():
+            import json
+
+            for line in jsonl_meta.read_text().splitlines():
+                if line.strip():
+                    ep_indices.append(int(json.loads(line)["episode_index"]))
+    except Exception as e:
+        logger.warning("RESUME: could not inspect episode indices (%s); skipping guard", e)
+        return None
+    return ep_indices
+
+
+def _read_data_episode_indices(resume_root: Path) -> list[int] | None:
+    """Return the distinct episode_index values the data shards carry.
+
+    None when the directory itself can't be read, which the caller treats as
+    "cannot prove unsafe" the same way the metadata read is.
+    """
+    import pyarrow.parquet as pq
+
+    indices: set[int] = set()
+    try:
+        for path in sorted((resume_root / "data").rglob("*.parquet")):
+            try:
+                col = pq.read_table(path, columns=["episode_index"])["episode_index"].to_pylist()
+            except Exception:
+                # A shard the writer was still appending to has no footer; reindex
+                # is what sets it aside.
+                continue
+            indices.update(int(e) for e in col)
+    except Exception as e:
+        logger.warning("RESUME: could not inspect data episode indices (%s); skipping that check", e)
+        return None
+    return sorted(indices)
+
+
+def _index_is_contiguous(indices: list[int]) -> bool:
+    """True when `indices` runs 0..N-1 with no gaps and no repeats."""
+    if not indices:
+        return True
+    unique = sorted(set(indices))
+    return len(unique) == len(indices) and len(unique) == unique[-1] + 1
+
+
+def _assert_resume_index_safe(resume_root: Path) -> None:
+    """Ensure episode indices are a contiguous 0..N-1 range before resuming.
+
+    lerobot's writer assigns the next episode index as ``meta.total_episodes``
+    (a plain count) and rejects any buffer whose index != total_episodes. That
+    scheme is only correct when indices run 0..N-1 with no gaps. If deletions
+    left gaps, or the meta already contains duplicate indices, resuming reuses
+    existing indices and merges two recording generations into one corrupt
+    dataset. Rather than blocking the resume, compact the indices in place; only
+    refuse if the reindex cannot produce a contiguous range.
+    """
+    meta_indices = _read_resume_episode_indices(resume_root)
+    if meta_indices is None or not meta_indices:
+        return
+
+    data_indices = _read_data_episode_indices(resume_root)
+    rows = len(meta_indices)
+    unique = sorted(set(meta_indices))
+    n_unique = len(unique)
+    max_idx = unique[-1]
+    duplicates = rows != n_unique
+    # Contiguous 0..max requires n_unique == max_idx + 1
+    gaps = n_unique != max_idx + 1
+    # The next index comes from the metadata, so metadata that looks clean while
+    # the data disagrees still collides on resume — an episode whose rows landed
+    # but whose metadata row did not is exactly what an interrupted save leaves.
+    disagrees = data_indices is not None and sorted(set(data_indices)) != unique
+
+    if duplicates or gaps or disagrees:
+        # The gap/duplicate is recoverable by compacting episode indices to a
+        # contiguous 0..N-1 range, so heal it instead of blocking the resume.
+        # Re-recorded or mid-deleted datasets hit this constantly; failing here
+        # forced users into a manual repair they had no way to trigger.
+        logger.info(
+            "RESUME: episode index unsafe (meta rows=%s unique=%s max=%s, data agrees=%s) — reindexing",
+            rows,
+            n_unique,
+            max_idx,
+            not disagrees,
+        )
+        try:
+            msg = reindex_episodes_to_contiguous(resume_root)
+            logger.info("RESUME: auto-reindex %s", msg or "was already consistent")
+        except Exception as e:
+            raise RuntimeError(
+                "Cannot safely resume this dataset: its episode indices are not a "
+                f"contiguous 0..N range (rows={rows}, unique={n_unique}, "
+                f"max_index={max_idx}, data agrees={not disagrees}), and automatic "
+                "reindexing failed. Record into a NEW dataset instead, or repair "
+                f"this one so episodes are contiguous before resuming. Details: {e}"
+            ) from e
+
+        # Re-read and re-verify; only refuse if the reindex didn't actually fix it.
+        meta_indices = _read_resume_episode_indices(resume_root)
+        if meta_indices is None:
+            return
+        data_indices = _read_data_episode_indices(resume_root)
+        still_unsafe = not _index_is_contiguous(meta_indices) or (
+            data_indices is not None and sorted(set(data_indices)) != sorted(set(meta_indices))
+        )
+        if still_unsafe:
+            raise RuntimeError(
+                "Cannot safely resume this dataset: episode indices are still not a "
+                f"contiguous 0..N range after reindexing (rows={len(meta_indices)}, "
+                f"unique={len(set(meta_indices))}, data={data_indices}). "
+                "Record into a NEW dataset instead."
+            )
+
+
+_MALLOC_TRIM = None  # resolved libc malloc_trim, or False where it is unavailable
+
+
+def _release_free_memory() -> None:
+    """Hand this process's freed heap pages back to the operating system.
+
+    Python releases each episode's numpy frames after ``save_episode()``, but glibc
+    keeps them in its arena, so RSS only ever climbs (~700MB per episode measured).
+    On a machine without swap the kernel then OOM-kills the server mid-save, which
+    is what made recordings stop on their own and left half-written episodes.
+    """
+    global _MALLOC_TRIM
+    import ctypes
+    import gc
+
+    gc.collect()
+    if _MALLOC_TRIM is None:
+        try:
+            fn = ctypes.CDLL("libc.so.6").malloc_trim
+            fn.argtypes = [ctypes.c_size_t]
+            fn.restype = ctypes.c_int
+            _MALLOC_TRIM = fn
+        except (OSError, AttributeError):
+            _MALLOC_TRIM = False
+    if _MALLOC_TRIM is not False:
+        try:
+            _MALLOC_TRIM(0)
+        except OSError:
+            logger.debug("malloc_trim failed", exc_info=True)
+
+
+def _discard_streaming_temp_dirs(root: Path) -> None:
+    """Delete encoder scratch left in the dataset root by an unfinished episode.
+
+    lerobot's streaming encoder writes each episode's video into
+    ``tempfile.mkdtemp(dir=root)`` and renames it into ``videos/`` once the episode
+    is saved, so anything still sitting there is footage no episode points at.
+    """
+    removed = 0
+    for tmp in root.glob("tmp*"):
+        if not tmp.is_dir():
+            continue
+        try:
+            leftovers = [p.name for p in tmp.iterdir()]
+        except OSError:
+            continue
+        if all(name.endswith("_streaming.mp4") for name in leftovers):
+            shutil.rmtree(tmp, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("🧹 Removed %d leftover video-encoding temp dir(s) from %s", removed, root)
+
+
+_CAMERA_READ_TIMEOUTS_MS = (200, 500, 1000)
+_MIN_EPISODE_FRAMES = 15  # half a second at 30fps; see the save_episode guard below
+
+
+def _harden_camera_reads(robot) -> None:
+    """Keep a camera stall from ending the session, and say which camera stalled.
+
+    The follower reads every camera through `async_read(timeout_ms=200)`, which
+    raises TimeoutError unless a *fresh* frame lands within 200ms, and lerobot's
+    record_loop has no handler for it. Measured on this rig both a hub-connected
+    and a board-connected camera stall longer than that, so three escalating
+    budgets (200/500/1000ms) cover the short ones, and a still-blank camera falls
+    back to `read_latest()`, which returns the newest buffered frame instead. That
+    costs one duplicated frame against losing the whole session and its episode.
+
+    A camera that cannot even produce a stale frame is genuinely gone: give up so
+    the recording stops rather than saving minutes of frozen footage.
+
+    Wrapping each camera rather than `get_observation` keeps a stall on one device
+    from re-triggering reads on the others, and puts the logical name in the log —
+    OpenCVCamera's own message only carries the numeric index, which cannot be
+    turned back into up/side/wrist after the fact.
+    """
+    for name, cam in getattr(robot, "cameras", {}).items():
+        original = cam.async_read
+        latest = cam.read_latest
+
+        def read(*args, cam=cam, name=name, original=original, latest=latest, **kwargs):
+            last_error = None
+            for timeout_ms in _CAMERA_READ_TIMEOUTS_MS:
+                try:
+                    return original(timeout_ms=timeout_ms)
+                except TimeoutError as e:
+                    last_error = e
+                    logger.warning(
+                        f"⚠️ CAMERA READ: {name} (device {cam.index_or_path}) stalled — "
+                        f"retrying with a {timeout_ms}ms budget"
+                    )
+            try:
+                frame = latest()
+            except Exception:
+                logger.error(
+                    f"❌ CAMERA READ: {name} (device {cam.index_or_path}) gave no frame within "
+                    f"{sum(_CAMERA_READ_TIMEOUTS_MS)}ms and has no buffered one either: {last_error}"
+                )
+                raise last_error
+            logger.warning(
+                f"⚠️ CAMERA READ: {name} (device {cam.index_or_path}) still blank after "
+                f"{sum(_CAMERA_READ_TIMEOUTS_MS)}ms — reused its buffered frame"
+            )
+            return frame
+
+        cam.async_read = read
+
+
+def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDataset:
+    """
+    Implement recording with phase tracking - exactly mirrors original record() function behavior
+    """
+    import time
+
+    from lerobot.common.control_utils import (
+        sanity_check_dataset_name,
+        sanity_check_dataset_robot_compatibility,
+    )
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.processor import make_default_processors
+    from lerobot.robots import make_robot_from_config
+    from lerobot.scripts.lerobot_record import record_loop
+    from lerobot.teleoperators import make_teleoperator_from_config
+    from lerobot.utils.feature_utils import hw_to_dataset_features
+    from lerobot.utils.utils import log_say
+
+    global current_phase, phase_start_time, current_episode, saved_episodes, current_robot
+
+    robot = make_robot_from_config(cfg.robot)
+    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
+
+    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+
+    action_features = hw_to_dataset_features(robot.action_features, "action", cfg.dataset.video)
+    obs_features = hw_to_dataset_features(robot.observation_features, "observation", cfg.dataset.video)
+    dataset_features = {**action_features, **obs_features}
+
+    if cfg.resume:
+        num_cameras = len(robot.cameras) if hasattr(robot, "cameras") else 0
+        # resume() requires an explicit root directory. If cfg.dataset.root is None,
+        # use the default HF_LEROBOT_HOME / repo_id where datasets are stored.
+        resume_root = cfg.dataset.root if cfg.dataset.root else HF_LEROBOT_HOME / cfg.dataset.repo_id
+        logger.info(f"📂 RESUME: Attempting to resume dataset at {resume_root}")
+        logger.info(f"📂 RESUME: repo_id={cfg.dataset.repo_id}")
+
+        # Check if the dataset directory exists
+        if not resume_root.exists():
+            raise FileNotFoundError(
+                f"Cannot resume dataset: directory {resume_root} does not exist. "
+                f"The dataset '{cfg.dataset.repo_id}' may not have been created yet, "
+                "or was created with a different name."
+            )
+
+        # Check if meta/info.json exists
+        info_path = resume_root / "meta" / "info.json"
+        if not info_path.exists():
+            raise FileNotFoundError(
+                f"Cannot resume dataset: {info_path} does not exist. "
+                "The dataset may be corrupted or incomplete."
+            )
+
+        # Try to repair corrupted parquet files before resuming
+        logger.info("🔧 RESUME: Checking for corrupted files and attempting repair...")
+        try:
+            repair_result = repair_local_dataset(cfg.dataset.repo_id)
+            if repair_result:
+                logger.info(f"✅ RESUME: {repair_result}")
+            else:
+                logger.info("✅ RESUME: Dataset is healthy, no repair needed")
+        except DatasetRepairError as e:
+            logger.warning(f"⚠️ RESUME: Repair failed: {e}")
+            raise
+
+        # lerobot assigns the next episode index as `meta.total_episodes` (a
+        # COUNT) and validate_episode_buffer hard-requires index == total_episodes.
+        # That only works when episode indices are contiguous from 0. If earlier
+        # deletions left gaps (count < max_index+1) or the meta already has
+        # duplicate indices, resuming reuses existing indices and silently merges
+        # two recording generations — exactly the eps 23-29 duplication that
+        # corrupted 0921_4. Refuse instead of corrupting.
+        _assert_resume_index_safe(resume_root)
+
+        try:
+            dataset = LeRobotDataset.resume(
+                cfg.dataset.repo_id,
+                root=resume_root,
+                batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+                rgb_encoder=cfg.dataset.rgb_encoder,
+                depth_encoder=cfg.dataset.depth_encoder,
+                streaming_encoding=cfg.dataset.streaming_encoding,
+                encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+                encoder_threads=cfg.dataset.encoder_threads,
+                image_writer_processes=cfg.dataset.num_image_writer_processes if num_cameras > 0 else 0,
+                image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * num_cameras
+                if num_cameras > 0
+                else 0,
+            )
+            logger.info(f"✅ RESUME: Dataset loaded successfully with {dataset.num_episodes} episodes")
+        except Exception as e:
+            logger.error(f"❌ RESUME: Failed to resume dataset: {e}")
+            raise
+
+        try:
+            sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
+            logger.info("✅ RESUME: Dataset compatibility check passed")
+        except ValueError as e:
+            logger.error(f"❌ RESUME: Dataset compatibility check failed: {e}")
+            raise
+    else:
+        # Try to repair any corrupted files from a previous failed recording
+        # with the same name before creating a new dataset
+        logger.info("🔧 RECORD: Checking for corrupted files and attempting repair...")
+        try:
+            repair_result = repair_local_dataset(cfg.dataset.repo_id)
+            if repair_result:
+                logger.info(f"✅ RECORD: {repair_result}")
+            else:
+                logger.info("✅ RECORD: Dataset is healthy, no repair needed")
+        except DatasetRepairError as e:
+            logger.warning(f"⚠️ RECORD: Repair failed: {e}")
+            raise
+
+        sanity_check_dataset_name(cfg.dataset.repo_id, None)
+        dataset = LeRobotDataset.create(
+            cfg.dataset.repo_id,
+            cfg.dataset.fps,
+            root=cfg.dataset.root,
+            robot_type=robot.name,
+            features=dataset_features,
+            use_videos=cfg.dataset.video,
+            image_writer_processes=cfg.dataset.num_image_writer_processes,
+            image_writer_threads=cfg.dataset.num_image_writer_threads_per_camera * len(robot.cameras),
+            batch_encoding_size=cfg.dataset.video_encoding_batch_size,
+            rgb_encoder=cfg.dataset.rgb_encoder,
+            depth_encoder=cfg.dataset.depth_encoder,
+            streaming_encoding=cfg.dataset.streaming_encoding,
+            encoder_queue_maxsize=cfg.dataset.encoder_queue_maxsize,
+            encoder_threads=cfg.dataset.encoder_threads,
+        )
+
+    # Bring the devices up in the same order as teleoperation: buses, then
+    # calibration, then cameras and motor configuration.
+    #
+    # `robot.connect()` can't be used here. It prompts on stdin when the motors
+    # disagree with the calibration file (EOFError under the server), and it
+    # ends with configure(), which leaves torque enabled — writing the
+    # calibration registers afterwards corrupts the bus a few seconds into the
+    # recording loop.
+    # Start with episode 1 - but track it properly
+    # When resuming, offset the counters so the UI shows the real episode numbers
+    # and the loop records exactly the remaining episodes the user asked for.
+    existing_episodes = dataset.num_episodes if cfg.resume else 0
+    current_episode = existing_episodes + 1
+    saved_episodes = existing_episodes
+
+    # Setup runs inside the same try as the recording loop: a failure partway
+    # through it still leaves buses and cameras open, and the teardown below is
+    # what frees them for the next attempt (see issue #50).
+    session_aborted = False
+    try:
+        try:
+            logger.info("🔧 ROBOT CONNECTION: Attempting to connect robot...")
+            robot.bus.connect()
+            logger.info("✅ ROBOT CONNECTION: Robot bus connected successfully")
+        except Exception as e:
+            logger.error(f"❌ ROBOT CONNECTION: Failed to connect robot: {e}")
+            raise
+
+        if teleop is not None:
+            try:
+                logger.info("🔧 TELEOP CONNECTION: Attempting to connect teleoperator...")
+                teleop.bus.connect()
+                logger.info("✅ TELEOP CONNECTION: Teleoperator bus connected successfully")
+            except Exception as e:
+                logger.error(f"❌ TELEOP CONNECTION: Failed to connect teleoperator: {e}")
+                raise
+
+        # Torque is still disabled at this point, which is what writing the
+        # calibration registers requires.
+        logger.info("Writing calibration to motors...")
+        robot.bus.write_calibration(robot.calibration)
+        if teleop is not None:
+            teleop.bus.write_calibration(teleop.calibration)
+
+        try:
+            logger.info("🔧 CAMERA CONNECTION: Connecting cameras...")
+            for cam_name, cam in robot.cameras.items():
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        cam.connect()
+                        break
+                    except (ConnectionError, OSError) as e:
+                        if attempt < max_retries:
+                            logger.warning(
+                                f"⚠️ CAMERA CONNECTION: {cam_name} failed (attempt {attempt}/{max_retries}): {e}. "
+                                f"Retrying in 1s..."
+                            )
+                            time.sleep(1.0)
+                        else:
+                            raise
+            logger.info("✅ CAMERA CONNECTION: Cameras connected successfully")
+
+            # Apply v4l2-ctl settings after camera connection
+            import cv2
+            from .v4l2 import apply_camera_controls
+            for cam_name, cam in robot.cameras.items():
+                if hasattr(cam, 'index_or_path') and hasattr(cam, 'backend'):
+                    if cam.backend == cv2.CAP_V4L2:
+                        device_path = None
+                        if isinstance(cam.index_or_path, str) and cam.index_or_path.startswith("/dev/video"):
+                            device_path = cam.index_or_path
+                        elif isinstance(cam.index_or_path, int):
+                            device_path = f"/dev/video{cam.index_or_path}"
+                        if device_path:
+                            apply_camera_controls(device_path, cam_name)
+        except Exception as e:
+            logger.error(f"❌ CAMERA CONNECTION: Failed to connect cameras: {e}")
+            logger.error("💡 Make sure frontend camera streams are released before recording")
+            raise
+
+        logger.info("Configuring motors...")
+        _harden_camera_reads(robot)
+        robot.configure()
+        if teleop is not None:
+            teleop.configure()
+        logger.info("✅ Devices ready")
+
+        # Expose the connected robot so /camera-feed can stream its cameras'
+        # latest frames during the session (cleared in the finally below). Set
+        # only after the cameras are connected so the feed never peeks a
+        # half-open device.
+        current_robot = robot
+
+        while saved_episodes < cfg.dataset.num_episodes:
+            # RECORDING PHASE - with dataset (matches original record.py exactly)
+            current_phase = "recording"
+            phase_start_time = time.time()
+            logger.info(f"Starting recording phase for episode {current_episode}")
+            logger.info(f"Events state at start of recording phase: {web_events}")
+            print(
+                f"🎬 STATUS CHANGE: Starting recording phase for episode {current_episode}/{cfg.dataset.num_episodes}"
+            )
+
+            log_say(f"Recording episode {current_episode}", cfg.play_sounds)
+
+            # Add a tracking flag that won't be reset by record_loop
+            web_events["_exit_early_triggered"] = False
+            logger.info(f"Recording phase - calling record_loop with events: {web_events}")
+
+            record_loop(
+                robot=robot,
+                events=web_events,
+                fps=cfg.dataset.fps,
+                teleop_action_processor=teleop_action_processor,
+                robot_action_processor=robot_action_processor,
+                robot_observation_processor=robot_observation_processor,
+                teleop=teleop,
+                dataset=dataset,
+                control_time_s=cfg.dataset.episode_time_s,
+                single_task=cfg.dataset.single_task,
+                display_data=cfg.display_data,
+            )
+
+            # The 30fps loop leaves torch tensors and numpy arrays behind; hand
+            # their pages back rather than letting them stack up across episodes.
+            _release_free_memory()
+
+            logger.info(f"Recording phase completed - events state: {web_events}")
+
+            # Check if exit_early was triggered (user pressed right arrow)
+            recording_interrupted_by_exit_early = web_events.get("_exit_early_triggered", False)
+            if recording_interrupted_by_exit_early:
+                logger.info("🟡 RECORDING PHASE INTERRUPTED BY EXIT_EARLY - proceeding to save episode")
+                print(
+                    f" STATUS CHANGE: Recording phase interrupted by user - episode {current_episode} data collected"
+                )
+                # Reset our tracking flag
+                web_events["_exit_early_triggered"] = False
+            # else: Recording completed normally due to timeout - proceed to save episode
+
+            # Handle rerecord logic first (before saving)
+            if web_events["rerecord_episode"]:
+                log_say("Re-record episode", cfg.play_sounds)
+                print(
+                    f"🔄 STATUS CHANGE: Re-recording episode {current_episode} (episode number stays the same)"
+                )
+                web_events["rerecord_episode"] = False
+                web_events["exit_early"] = False
+                dataset.clear_episode_buffer()
+
+                # Go through reset phase before re-recording (don't increment episode counters)
+                # RESET PHASE - without dataset (matches original record.py exactly)
+                current_phase = "resetting"
+                phase_start_time = time.time()
+                logger.info(f"Starting reset phase for re-record of episode {current_episode}")
+                logger.info(f"Events state at start of reset phase: {web_events}")
+                print(f"🔄 STATUS CHANGE: Starting reset phase for episode {current_episode}")
+
+                log_say("Reset the environment", cfg.play_sounds)
+
+                # Reset exit_early flag at the start of each phase
+                web_events["exit_early"] = False
+                logger.info(f"Reset phase - calling record_loop with events: {web_events}")
+
+                record_loop(
+                    robot=robot,
+                    events=web_events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    teleop=teleop,
+                    # NOTE: NO dataset parameter here - matches LeRobot CLI exactly
+                    # This means NO recording happens during reset phase
+                    control_time_s=cfg.dataset.reset_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                )
+
+                _release_free_memory()
+
+                logger.info(f"Reset phase completed - events state: {web_events}")
+
+                # Check if reset was interrupted by exit_early
+                if web_events["exit_early"]:
+                    logger.info("🟡 RESET PHASE INTERRUPTED BY EXIT_EARLY during re-record")
+                    print("🟡 STATUS CHANGE: Reset phase interrupted by user during re-record")
+                    web_events["exit_early"] = False
+
+                # Check if stop recording was requested during re-record reset phase
+                if web_events["stop_recording"]:
+                    logger.info("🛑 STOP RECORDING requested during re-record reset phase - ending session")
+                    print(
+                        "🛑 STATUS CHANGE: Stop recording requested during re-record reset - ending session"
+                    )
+                    break
+
+                # Don't increment current_episode or saved_episodes - we're re-recording the same episode
+                continue
+
+            # An episode interrupted within its first frame leaves a 1-frame
+            # buffer, and lerobot computes no video statistics for a single frame,
+            # so that episode's metadata row lacks the stats columns entirely.
+            # DatasetMetadata batches episode rows and builds the table from each
+            # row's own keys, so the missing columns hold one value fewer than the
+            # rest and the whole flush dies with "expected length 10 but got
+            # length 9" — taking every episode still in the buffer with it and
+            # leaving info.json, meta and data disagreeing. That is how 1011_4 lost
+            # 10 episodes' metadata. A 1-frame episode isn't data anyway.
+            buffered_frames = dataset.writer.episode_buffer["size"]
+            if buffered_frames < _MIN_EPISODE_FRAMES:
+                logger.warning(
+                    f"⚠️ Episode {current_episode} captured only {buffered_frames} frames — discarding "
+                    f"and re-recording (a 1-frame episode breaks lerobot's metadata flush)"
+                )
+                print(
+                    f"⚠️ STATUS CHANGE: Episode {current_episode} discarded ({buffered_frames} frames) — re-recording"
+                )
+                dataset.clear_episode_buffer()
+                if web_events["stop_recording"]:
+                    break
+                continue
+
+            # Save episode immediately after recording phase (matches expected flow)
+            logger.info(f"💾 Saving episode {current_episode}...")
+            print(f"💾 STATUS CHANGE: Saving episode {current_episode}")
+            # Disable parallel video encoding to avoid fork() memory spikes
+            # Each fork temporarily doubles process memory, causing OOM after ~8 episodes
+            dataset.save_episode(parallel_encoding=False)
+            logger.info(f"✅ Episode {current_episode} saved successfully")
+            print(f"✅ STATUS CHANGE: Episode {current_episode} saved successfully")
+
+            # Return the episode's freed pages to the OS before the next one starts;
+            # see _release_free_memory for why this is load-bearing.
+            try:
+                import os
+
+                import psutil
+
+                process = psutil.Process(os.getpid())
+                memory_before = process.memory_info().rss / 1024 / 1024
+                _release_free_memory()
+                memory_after = process.memory_info().rss / 1024 / 1024
+                logger.info(f"📊 MEMORY: Episode {current_episode} saved. {memory_before:.0f}MB → {memory_after:.0f}MB (freed {memory_before - memory_after:.0f}MB)")
+                print(f"📊 MEMORY: {memory_after:.0f}MB (freed {memory_before - memory_after:.0f}MB)")
+
+                # Check if image writer queue is building up
+                writer = getattr(dataset, "writer", None)
+                image_writer = getattr(writer, "image_writer", None) if writer is not None else None
+                if image_writer is not None and getattr(image_writer, "queue", None) is not None:
+                    queue_size = image_writer.queue.qsize()
+                    if queue_size > 100:
+                        logger.warning(f"⚠️ IMAGE WRITER QUEUE: {queue_size} items pending")
+                        print(f"⚠️ IMAGE WRITER QUEUE: {queue_size} items")
+
+                # End the session after the episode just saved rather than letting
+                # the kernel choose which one it kills mid-write. Free RAM is the
+                # limit that matters, not this process's RSS: the video encoder and
+                # the browser are competing for the same pages.
+                available_mb = psutil.virtual_memory().available / 1024 / 1024
+                if available_mb < 1500:
+                    logger.warning(f"🛑 LOW MEMORY: {available_mb:.0f}MB free — ending session before the next episode")
+                    print(f"🛑 LOW MEMORY: {available_mb:.0f}MB free — stopping after episode {current_episode}")
+                    web_events["stop_recording"] = True
+
+            except Exception as e:
+                logger.debug(f"Resource monitoring failed: {e}")
+
+            # Increment episode counters after successful save
+            saved_episodes += 1
+            current_episode += 1
+
+            # Check if we should stop recording
+            if web_events["stop_recording"]:
+                print("🛑 STATUS CHANGE: Recording manually stopped by user")
+                break
+
+            # Check if we've completed all episodes
+            if saved_episodes >= cfg.dataset.num_episodes:
+                break
+
+            # Execute reset phase to prepare for next episode
+            # Skip reset for the last episode that was just saved
+            if saved_episodes < cfg.dataset.num_episodes:
+                # RESET PHASE - without dataset (matches original record.py exactly)
+                current_phase = "resetting"
+                phase_start_time = time.time()
+                logger.info(f"Starting reset phase for next episode {current_episode}")
+                logger.info(f"Events state at start of reset phase: {web_events}")
+                print(f"🔄 STATUS CHANGE: Starting reset phase for episode {current_episode}")
+
+                log_say("Reset the environment", cfg.play_sounds)
+
+                # Reset exit_early flag at the start of each phase
+                web_events["exit_early"] = False
+                logger.info(f"Reset phase - calling record_loop with events: {web_events}")
+
+                record_loop(
+                    robot=robot,
+                    events=web_events,
+                    fps=cfg.dataset.fps,
+                    teleop_action_processor=teleop_action_processor,
+                    robot_action_processor=robot_action_processor,
+                    robot_observation_processor=robot_observation_processor,
+                    teleop=teleop,
+                    # NOTE: NO dataset parameter here - matches LeRobot CLI exactly
+                    # This means NO recording happens during reset phase
+                    control_time_s=cfg.dataset.reset_time_s,
+                    single_task=cfg.dataset.single_task,
+                    display_data=cfg.display_data,
+                )
+
+                _release_free_memory()
+
+                logger.info(f"Reset phase completed - events state: {web_events}")
+
+                # Check if reset was interrupted by exit_early
+                if web_events["exit_early"]:
+                    logger.info("🟡 RESET PHASE INTERRUPTED BY EXIT_EARLY - proceeding to next episode")
+                    print("🟡 STATUS CHANGE: Reset phase interrupted by user - proceeding to next episode")
+                    web_events["exit_early"] = False
+
+                # Check if stop recording was requested during reset phase
+                if web_events["stop_recording"]:
+                    logger.info("🛑 STOP RECORDING requested during reset phase - ending session")
+                    print("🛑 STATUS CHANGE: Stop recording requested during reset - ending session")
+                    break
+
+        # Recording completed — but don't set current_phase to "completed" yet.
+        # The caller (handle_start_recording) needs to populate last_recording_info
+        # first, otherwise the frontend's /dataset-info call races ahead and finds
+        # neither last_recording_info nor a finalized dataset on disk.
+        phase_start_time = None
+        print("🏁 Recording session finished - awaiting cleanup and metadata save")
+        log_say("Stop recording", cfg.play_sounds, blocking=True)
+
+    except BaseException:
+        session_aborted = True
+        raise
+
+    finally:
+        # Stop the camera-feed endpoint from reading before tearing the cameras
+        # down, so it can't peek a half-disconnected device.
+        current_robot = None
+        try:
+            if session_aborted:
+                # The episode in flight never reached its parquet rows, so flushing
+                # its encoder would publish footage no episode points at. Official
+                # lerobot drops the pending videos here via VideoEncodingManager;
+                # finalize() on its own would encode them.
+                writer = getattr(dataset, "writer", None)
+                if writer is not None:
+                    try:
+                        writer.cancel_pending_videos()
+                    except Exception as e:
+                        logger.warning(f"⚠️ Could not cancel pending video encoding: {e}")
+            # Writes the parquet footers for meta/episodes/. Without it the
+            # dataset is invalid on disk, so reopening it (upload,
+            # /dataset-info) misses meta/episodes and falls back to downloading
+            # from the Hub — which 404s for a dataset that was never pushed.
+            dataset.finalize()
+        finally:
+            _discard_streaming_temp_dirs(dataset.root)
+            # safe_disconnect_device force-releases the serial port / cameras if
+            # a normal disconnect fails, so a flaky teardown can't leave the
+            # device busy and block the next recording session (see issue #50).
+            # Nested so a failed finalize can't strand the hardware.
+            safe_disconnect_device(robot, logger, context="recording cleanup")
+            if teleop:
+                safe_disconnect_device(teleop, logger, context="recording cleanup")
+
+    if cfg.dataset.push_to_hub:
+        if dataset.num_episodes > 0:
+            dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+        else:
+            logger.warning("No episodes saved — skipping push to hub")
+
+    log_say("Exiting", cfg.play_sounds)
+    return dataset
