@@ -120,6 +120,28 @@ def local_python_floor() -> tuple[int, int]:
     return (3, 12)
 
 
+def local_torch_constraints() -> tuple[str, str]:
+    """lerobot's own version specifiers for torch / torchvision.
+
+    Read from the installed lerobot metadata so the remote never drifts from what
+    the pinned version actually accepts (hardcoded caps had already gone stale).
+    Returns (torch_spec, torchvision_spec), e.g. (">=2.7,<2.12.0", ">=0.22.0,<0.27.0").
+    """
+    specs = {"torch": "", "torchvision": ""}
+    with contextlib.suppress(Exception):
+        for r in importlib.metadata.requires("lerobot") or []:
+            head, _, marker = r.partition(";")
+            if "extra" in marker:
+                continue  # extras-only pins are not the core training dependency
+            head = head.strip()
+            name = re.split(r"[\[<>!=~ ]", head, 1)[0].lower()
+            if name in specs:
+                spec = head[len(name):].strip()
+                if spec:
+                    specs[name] = spec
+    return specs["torch"], specs["torchvision"]
+
+
 def detect_remote_python(client, floor: tuple[int, int] | None = None) -> str | None:
     """First remote interpreter that meets lerobot's Requires-Python floor."""
     maj, minor = floor or local_python_floor()
@@ -134,34 +156,50 @@ def detect_remote_python(client, floor: tuple[int, int] | None = None) -> str | 
     return lines[0] if code == 0 and lines else None
 
 
+def _python_meets_floor(client, python: str, floor: tuple[int, int]) -> bool:
+    """Whether a specific remote interpreter satisfies lerobot's version floor."""
+    maj, minor = floor
+    code, _out, _err = _run_cmd(
+        client,
+        f"{shlex.quote(python)} -c "
+        f"'import sys; sys.exit(0 if sys.version_info >= ({maj}, {minor}) else 1)'",
+        timeout=60,
+    )
+    return code == 0
+
+
 def effective_python(cfg, client=None) -> str:
     """The interpreter to run remote lerobot commands with.
 
     A blank `remote_python` used to mean `python3`, which on most pods is the
     distro's 3.10: the SSH test still passes (it only checks connectivity) but
-    pip then installs an ancient lerobot, or none at all. Detect once and store
-    the result so the UI and every later job agree on the same interpreter.
+    pip then installs an ancient lerobot, or none at all. An explicitly wrong
+    value is just as bad, so the configured path is *validated* too — otherwise
+    filling in `python3` beats leaving it empty, which is backwards.
     """
-    if cfg.remote_python:
-        return cfg.remote_python
-
     from .ssh_config import set_remote_python
 
+    floor = local_python_floor()
     owned = client is None
     if owned:
         client = _connect(cfg)
     try:
-        found = detect_remote_python(client)
+        if cfg.remote_python and _python_meets_floor(client, cfg.remote_python, floor):
+            return cfg.remote_python
+        found = detect_remote_python(client, floor)
     finally:
         if owned and client is not None:
             with contextlib.suppress(Exception):
                 client.close()
-    if found:
+    if found and found != cfg.remote_python:
         with contextlib.suppress(Exception):
             set_remote_python(cfg.id, found)
-        logger.info("Auto-detected remote interpreter %s for config %s", found, cfg.id)
+        logger.info(
+            "Remote interpreter %s → %s for config %s (Python >= %d.%d required)",
+            cfg.remote_python or "(unset)", found, cfg.id, floor[0], floor[1],
+        )
         return found
-    return "python3"
+    return cfg.remote_python or found or "python3"
 
 
 def _connect(cfg) -> "paramiko.SSHClient":
@@ -377,8 +415,9 @@ def diagnose_env(data: dict, *, python_used: str, floor=None, local_version=None
     if py_tuple < floor:
         add("python_too_old", "blocking",
             f"当前解释器 {python_used} 是 Python {py}，lerobot 需要 ≥{floor[0]}.{floor[1]}",
-            "pip 在这种解释器上会装到旧版 lerobot 或干脆装不上。用 conda/venv 提供一个"
-            f" ≥{floor[0]}.{floor[1]} 的 Python，并把 SSH 配置的 remote_python 指向它。",
+            "remote_python 已做过校验并会自动改用达标的解释器，仍报这条说明这台机器上"
+            f"根本没有 ≥{floor[0]}.{floor[1]} 的 Python：pip 会装到旧版 lerobot 或干脆装不上。"
+            "先装一个（conda / uv python install 3.12 / 系统包），再重跑「检查环境」。",
             False)
 
     if not data.get("lerobot_installed"):
@@ -609,6 +648,10 @@ def install_lerobot_remote_streaming(
         )
 
         # ── Step 1: Detect GPU ──────────────────────────────────────────────
+        # A GPU is required to *train*, not to install: lerobot, ffmpeg and the
+        # training deps are all GPU-independent. Only the torch build needs the
+        # driver version, so a missing/broken card degrades this step to a note
+        # instead of aborting the whole install.
         yield step_result(1, "Detecting GPU...", "running", [f"python: {python}"])
         exit_code, gpu_out, gpu_err = _run_cmd(
             client,
@@ -616,41 +659,39 @@ def install_lerobot_remote_streaming(
             timeout=30,
         )
         gpu_out = gpu_out.strip()
-        if "NO_GPU" in gpu_out:
-            yield step_result(1, "GPU detection", "failed", [gpu_out, gpu_err],
-                              "No NVIDIA GPU detected. Install drivers first.",
-                              hint="这台机器看不到 NVIDIA 卡：要么实例本身不带 GPU，要么驱动没装/容器没挂卡。"
-                                   "在平台控制台确认购买的是 GPU 实例并重启；软件层面无解。")
-            return
         first_line = gpu_out.splitlines()[0] if gpu_out else ""
         fields = [f.strip() for f in first_line.split(",")]
         driver_version = fields[-1] if len(fields) > 1 else ""
-        gpu_name = fields[0] if fields else first_line
-        # A broken driver still exits non-zero-ish with text like
-        # "Exec format error"; installing torch against a guessed CUDA tag then
-        # wastes a 3GB download and still can't see the GPU.
-        if not re.match(r"^\d+\.", driver_version):
-            detail = first_line or (gpu_err or "").strip() or f"(无输出，exit {exit_code})"
-            yield step_result(1, "GPU detection", "failed", [gpu_out, gpu_err],
-                              f"nvidia-smi 未返回驱动版本：{detail[:200]}",
-                              hint="驱动可执行文件跑不起来（常见 Exec format error / 宿主驱动与容器不匹配）。"
-                                   "请在 GPU 平台重启该实例或换新实例；现在继续只会按猜的 CUDA 版本装 torch，"
-                                   "装完仍然看不到卡。")
-            return
-        driver_major = int(driver_version.split(".")[0])
+        gpu_name = fields[0] if fields else ""
+        driver_ok = "NO_GPU" not in gpu_out and bool(re.match(r"^\d+\.", driver_version))
+        cuda_tag = None
 
-        if driver_major >= 570:
-            cuda_tag = "cu128"
-        elif driver_major >= 535:
-            cuda_tag = "cu124"
-        elif driver_major >= 520:
-            cuda_tag = "cu121"
+        if driver_ok:
+            driver_major = int(driver_version.split(".")[0])
+
+            if driver_major >= 570:
+                cuda_tag = "cu128"
+            elif driver_major >= 535:
+                cuda_tag = "cu124"
+            elif driver_major >= 520:
+                cuda_tag = "cu121"
+            else:
+                cuda_tag = "cu118"
+
+        if driver_ok:
+            yield step_result(1, "GPU detected", "done",
+                              [f"{gpu_name}", f"Driver {driver_version} → CUDA {cuda_tag}"],
+                              f"{gpu_name}, Driver {driver_version}")
         else:
-            cuda_tag = "cu118"
-
-        yield step_result(1, "GPU detected", "done",
-                          [f"{gpu_name}", f"Driver {driver_version} → CUDA {cuda_tag}"],
-                          f"{gpu_name}, Driver {driver_version}")
+            detail = first_line or (gpu_err or "").strip() or "nvidia-smi 无输出"
+            yield step_result(
+                1, "未检测到可用 GPU（继续安装）", "done",
+                [detail[:200]],
+                f"软件会照常装完，但这台机器当前看不到卡：{detail[:120]}",
+                hint="没卡不影响安装（lerobot / ffmpeg / 训练依赖都不需要 GPU）；"
+                     "只是这次**不猜 CUDA 版本装 torch**，避免装完依旧看不到卡。"
+                     "驱动类报错（如 Exec format error）通常在平台控制台重启实例后恢复，"
+                     "恢复后重跑「安装环境」即可按驱动补上匹配的 torch。")
 
         # ── Step 2: Ensure pip is available ─────────────────────────────────
         yield step_result(2, "Checking pip...", "running", [])
@@ -726,27 +767,43 @@ def install_lerobot_remote_streaming(
 
         # ── Step 4: Ensure PyTorch ──────────────────────────────────────────
         # Re-fetching the ~3GB torch wheel is the slowest part of an install, so
-        # skip it when this interpreter already has a CUDA-capable torch.
-        yield step_result(4, "Checking PyTorch...", "running", [f"CUDA {cuda_tag}"])
-        code_t, out_t, _ = _run_cmd(
+        # skip it when a CUDA-capable torch is already importable. Version pins
+        # come from lerobot's own metadata (never hardcoded), and the CUDA-specific
+        # index is only used when the driver is actually there to match against —
+        # otherwise pip resolves torch exactly like the official install does.
+        torch_spec, tv_spec = local_torch_constraints()
+        torch_reqs = f'"torch{torch_spec}" "torchvision{tv_spec}"'
+        yield step_result(4, "Checking PyTorch...", "running",
+                          [f"lerobot 要求: torch{torch_spec or '(未约束)'} "
+                           f"torchvision{tv_spec or '(未约束)'}",
+                           f"CUDA {cuda_tag}" if cuda_tag else "无可用 GPU/驱动"])
+        code_t, out_t, t_err = _run_cmd(
             client,
             f"{python} -c \"import torch, torchvision;"
             " print(torch.__version__, torch.cuda.is_available(), torchvision.__version__)\"",
             timeout=120,
         )
-        if code_t == 0 and "True" in out_t:
+        torch_present = code_t == 0 and bool(out_t.strip())
+        if torch_present and "True" in out_t:
             yield step_result(4, "PyTorch present", "done", [out_t.strip()],
                               "Skipped install: CUDA-capable torch already importable")
+        elif torch_present and not driver_ok:
+            yield step_result(
+                4, "跳过 PyTorch（无可用 GPU）", "done", [out_t.strip()[:200]],
+                "torch 已存在但看不到 CUDA：这是驱动/容器问题，不是包问题",
+                hint="在平台控制台重启实例让 nvidia-smi 正常后重跑「安装环境」；"
+                     "若版本不满足 lerobot 约束（"
+                     f"torch{torch_spec}），届时会按官方约束重装。")
         else:
-            # Cap at lerobot's current ceilings (torch<2.11.0, torchvision<0.26.0).
-            # Without the caps step 4 installs the newest torch, then step 5's
-            # resolver *downgrades* it — re-downloading the ~450MB wheel from the
-            # pypi mirror (different URL ⇒ no cache reuse from this index).
+            index_flag = f" --index-url {pytorch_index}/{cuda_tag}" if cuda_tag else ""
+            upgrade_flag = " --upgrade" if cuda_tag else ""
+            note = (f"按驱动匹配 CUDA {cuda_tag}" if cuda_tag
+                    else "无 GPU/驱动：不加 CUDA 索引，按 lerobot 官方依赖解析安装")
+            yield step_result(4, "Installing PyTorch...", "running",
+                              [note, torch_reqs.replace('"', "")])
             torch_cmd = (
-                f"{workdir_prefix}{python} -m pip install --upgrade"
-                f"{pip_mirror_flag}"
-                f' "torch<2.11.0" "torchvision<0.26.0"'
-                f" --index-url {pytorch_index}/{cuda_tag}"
+                f"{workdir_prefix}{python} -m pip install{upgrade_flag}"
+                f"{pip_mirror_flag} {torch_reqs}{index_flag}"
                 f" 2>&1 | tail -20"
             )
             exit_code = -1
@@ -760,9 +817,14 @@ def install_lerobot_remote_streaming(
                     yield step_result(4, "PyTorch install failed, retry 1/1...", "running", torch_logs)
             if exit_code != 0:
                 yield step_result(4, "PyTorch install", "failed", torch_logs,
-                                  f"PyTorch install failed (exit {exit_code})")
+                                  f"PyTorch install failed (exit {exit_code})",
+                                  hint="多为网络或磁盘：~3GB 下载容易被重置（重试或勾选国内镜像），"
+                                       "并用 df -h 确认空间。版本约束取自 lerobot 元数据"
+                                       f"（torch{torch_spec or '(未约束)'}），不要手装越界版本。")
                 return
-            yield step_result(4, "PyTorch installed", "done", torch_logs, "PyTorch + CUDA ready")
+            yield step_result(4, "PyTorch installed", "done", torch_logs,
+                              "PyTorch + CUDA ready" if cuda_tag
+                              else "PyTorch 已按 lerobot 约束安装（本机无 GPU，CUDA 未验证）")
 
         # ── Step 5: Install lerobot ─────────────────────────────────────────
         # "training" is always merged in: a policy-specific extra like "smolvla"
@@ -940,11 +1002,18 @@ def install_lerobot_remote_streaming(
             version_off = bool(target_version) and remote_lr not in (target_version, "MISSING", None)
 
             problems: list[str] = []
+            notes: list[str] = []
             if not vdata.get("cuda"):
-                problems.append(
-                    "CUDA 仍不可用：训练会退回 CPU 或直接失败。若 nvidia-smi 正常，多为 torch 构建与"
-                    "驱动不匹配，或实例刚重启没挂上卡——重启该实例后重跑本安装。"
-                )
+                if not driver_ok:
+                    notes.append(
+                        "软件装齐了，但这台机器当前看不到 GPU/驱动：可以安装，不能训练。"
+                        "重启实例让 nvidia-smi 正常后重跑「安装环境」，会按驱动补装匹配的 torch。"
+                    )
+                else:
+                    problems.append(
+                        "驱动正常但 torch 看不到 CUDA：torch 构建与驱动不匹配（或实例刚重启没挂上卡）。"
+                        "重跑本安装会按驱动重装匹配的 torch。"
+                    )
             if remote_lr == "MISSING":
                 problems.append("lerobot 没装上：看 step 5 的 pip 日志，多为镜像站缺该版本 wheel 或磁盘写满。")
             elif version_off:
@@ -969,12 +1038,14 @@ def install_lerobot_remote_streaming(
                 f"FFmpeg {'ok' if vdata.get('ffmpeg') else 'MISSING'}, "
                 f"policies ready: {len(vdata.get('policies_ready', []))}/9"
             )
+            if notes:
+                summary += f" — {notes[0]}"
             yield step_result(
                 7, "验证通过" if ok else "验证未通过",
                 "done" if ok else "failed",
-                verify_logs + [f"! {p}" for p in problems],
+                verify_logs + [f"! {p}" for p in problems] + [f"· {n}" for n in notes],
                 summary,
-                hint=" ; ".join(problems),
+                hint=" ; ".join(problems or notes),
             )
         except Exception as exc:
             yield step_result(7, "Verification", "failed", verify_logs,
