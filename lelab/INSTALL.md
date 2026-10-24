@@ -19,7 +19,7 @@ LeLab 是 LeRobot 的图形化界面，用于 SO-101 机械臂的标定、遥操
 pip install uv
 
 # 安装 LeLab
-uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 
 # 启动
 lelab
@@ -70,7 +70,7 @@ lelab
 pip install uv
 
 # 安装 LeLab
-uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 
 # 启动
 lelab
@@ -122,7 +122,7 @@ lelab
 pip install uv
 
 # 安装 LeLab
-uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 
 # 启动
 lelab

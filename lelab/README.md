@@ -21,7 +21,7 @@
 ### 最省事的上手方式
 
 ```bash
-uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 lelab
 ```
 
@@ -118,7 +118,7 @@ uv --version
 
 ```bash
 # 安装 LeLab
-uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 
 # 启动（自动打开浏览器）
 lelab
@@ -210,7 +210,7 @@ fatal: unable to access 'https://github.com/cz11001100/LeLabPro.git/': Failed to
 
 4. **重新安装**：
    ```powershell
-   uv tool install --python 3.12 "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+   uv tool install --python 3.12 --default-index https://pypi.tuna.tsinghua.edu.cn/simple "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
    ```
 
 > 提示：代理端口取决于你的代理软件（Clash/Clash Verge 常见 `7890`，其他工具可能是不同端口），把命令里的 `7897` 换成你的实际端口。
