@@ -270,21 +270,74 @@ def _run_cmd(
     return exit_code, out, err
 
 
-def _ensure_apt_cn_mirror(client, use_cn_mirror: bool) -> None:
+# Repeating these can never succeed — they are permission/lock/absent-tool
+# failures, not transient network blips. Without this the installer retried them
+# three times, burned 15 minutes and showed the user a bare "install failed".
+_NON_RETRYABLE_APT_PATTERNS = (
+    "permission denied",
+    "could not open lock file",
+    "unable to acquire the dpkg frontend lock",
+    "are you root",
+    "is not installed",
+    "e: unsupported method",
+)
+
+ROOT_FREE_WORKAROUND = (
+    "远端用户不是 root 且无免密 sudo，apt/yum 装不了。"
+    "改用无需 root 的方式：conda install -y -c conda-forge ffmpeg，"
+    "或把静态二进制放到 ~/.local/bin 并确保它在 PATH 里。"
+)
+
+
+def _is_non_retryable(text: str) -> bool:
+    lowered = text.lower()
+    return any(p in lowered for p in _NON_RETRYABLE_APT_PATTERNS)
+
+
+def _apt_privilege(client) -> tuple[str | None, str]:
+    """How to invoke the remote package manager: '' , 'sudo -n ', or give up.
+
+    GPU pods are frequently handed out as an unprivileged user, where a bare
+    apt-get dies on the dpkg lock. ``sudo -n`` cannot hang: it fails instantly
+    instead of prompting for a password nobody can type into an SSH exec channel.
+    """
+    _, uid, _ = _run_cmd(client, "id -u", timeout=10)
+    if uid.strip() == "0":
+        return "", ""
+    exit_code, _, _ = _run_cmd(client, "sudo -n true", timeout=15)
+    if exit_code == 0:
+        return "sudo -n ", ""
+    return None, ROOT_FREE_WORKAROUND
+
+
+def _ensure_apt_cn_mirror(client, use_cn_mirror: bool, priv: str = "") -> str | None:
     """Point apt at the Aliyun mirror on CN hosts.
 
     The stock archive.ubuntu.com sources are frequently unreachable from CN
     clouds; apt-get then retries silently for tens of minutes and the install
     looks hung. Idempotent — safe to call before every apt invocation.
+
+    Returns None when there is nothing to fix, otherwise the remote's own error
+    line. Silently ignoring a failed rewrite left apt pointed at the unreachable
+    official mirror, so the real cause surfaced later as an unexplained timeout.
     """
     if not use_cn_mirror:
-        return
-    _run_cmd(
+        return None
+    _, exists, _ = _run_cmd(
+        client, "test -f /etc/apt/sources.list && echo yes || echo no", timeout=15
+    )
+    if exists.strip() != "yes":
+        return None  # deb86 layout or non-Ubuntu: no legacy file to rewrite
+    exit_code, out, err = _run_cmd(
         client,
-        "sed -i -E 's|https?://(archive|security)\\.ubuntu\\.com/ubuntu"
+        f"{priv}sed -i -E 's|https?://(archive|security)\\.ubuntu\\.com/ubuntu"
         "|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list",
         timeout=30,
     )
+    if exit_code != 0:
+        lines = (out + err).strip().splitlines()
+        return lines[-1] if lines else "改写 /etc/apt/sources.list 失败"
+    return None
 
 
 def _env_probe_script() -> str:
@@ -705,16 +758,41 @@ def install_lerobot_remote_streaming(
             _, pkg_mgr, _ = _run_cmd(client, detect_pkg_mgr, timeout=10)
             pkg_mgr = pkg_mgr.strip()
 
-            if pkg_mgr == "apt":
-                _ensure_apt_cn_mirror(client, use_cn_mirror)
-                install_cmd = "apt-get update -qq && apt-get install -y -qq python3-pip python3-venv 2>&1 | tail -5"
+            priv: str | None = ""
+            if pkg_mgr in ("apt", "yum"):
+                priv, hint = _apt_privilege(client)
+            if priv is None:
+                # No root available: get-pip.py installs into the user's own
+                # interpreter and needs no privilege at all, which beats failing
+                # the whole install over a dpkg lock.
+                yield step_result(
+                    2, "Installing pip (无 root，改用 get-pip.py)...", "running",
+                    [hint, "回退到用户级安装，不需要 root"],
+                )
+                install_cmd = f"curl -sS https://bootstrap.pypa.io/get-pip.py | {python} 2>&1 | tail -5"
+            elif pkg_mgr == "apt":
+                mirror_err = _ensure_apt_cn_mirror(client, use_cn_mirror, priv)
+                if mirror_err:
+                    yield step_result(
+                        2, "pip install", "failed",
+                        [f"改写 apt 源失败: {mirror_err}",
+                         "取消勾选 Use China mirrors 后重试，或让远端管理员配置 apt 源"],
+                        "apt 源不可写",
+                    )
+                    return
+                install_cmd = (
+                    f"{priv}apt-get update -qq && "
+                    f"{priv}apt-get install -y -qq python3-pip python3-venv 2>&1 | tail -5"
+                )
             elif pkg_mgr == "yum":
-                install_cmd = "yum install -y -q python3-pip 2>&1 | tail -5"
+                install_cmd = f"{priv}yum install -y -q python3-pip 2>&1 | tail -5"
             else:
                 install_cmd = f"curl -sS https://bootstrap.pypa.io/get-pip.py | {python} 2>&1 | tail -5"
 
             exit_code, out, err = _run_cmd(client, install_cmd, timeout=300, kill_pattern="apt-get")
             pip_logs = (out + err).strip().splitlines()[-10:]
+            if exit_code != 0 and _is_non_retryable(out + err):
+                pip_logs = pip_logs + ["该错误重试无意义（权限/锁/缺工具），已停止重试"]
             if exit_code != 0:
                 yield step_result(2, "pip install", "failed", pip_logs,
                                   f"Failed to install pip (exit {exit_code})")
@@ -740,12 +818,35 @@ def install_lerobot_remote_streaming(
             _, pkg_mgr_ff, _ = _run_cmd(client, detect_pkg_mgr_ff, timeout=10)
             pkg_mgr_ff = pkg_mgr_ff.strip()
 
+            priv_ff: str | None = ""
+            if pkg_mgr_ff in ("apt", "yum"):
+                priv_ff, hint_ff = _apt_privilege(client)
+                if priv_ff is None:
+                    # Say so up front instead of failing three times against the
+                    # same dpkg lock, which read as a flaky installer.
+                    yield step_result(3, "FFmpeg install", "failed",
+                                      [hint_ff, "装好 ffmpeg 后重新点击安装环境即可，"
+                                               "本步检测到已有 ffmpeg 会直接跳过"],
+                                      "远端无 root/免密 sudo，apt 无法安装")
+                    return
+
             if pkg_mgr_ff == "apt":
-                _ensure_apt_cn_mirror(client, use_cn_mirror)
-                ffmpeg_cmd = "apt-get update -qq && apt-get install -y -qq ffmpeg 2>&1 | tail -5"
+                mirror_err = _ensure_apt_cn_mirror(client, use_cn_mirror, priv_ff)
+                if mirror_err:
+                    yield step_result(
+                        3, "FFmpeg install", "failed",
+                        [f"改写 apt 源失败: {mirror_err}",
+                         "取消勾选 Use China mirrors 后重试，或让远端管理员配置 apt 源"],
+                        "apt 源不可写",
+                    )
+                    return
+                ffmpeg_cmd = (
+                    f"{priv_ff}apt-get update -qq && "
+                    f"{priv_ff}apt-get install -y -qq ffmpeg 2>&1 | tail -5"
+                )
                 ff_kill = "apt-get"
             elif pkg_mgr_ff == "yum":
-                ffmpeg_cmd = "yum install -y -q ffmpeg 2>&1 | tail -5"
+                ffmpeg_cmd = f"{priv_ff}yum install -y -q ffmpeg 2>&1 | tail -5"
                 ff_kill = "yum"
             else:
                 ffmpeg_cmd = "echo 'Unknown package manager, please install ffmpeg manually'"
@@ -756,6 +857,12 @@ def install_lerobot_remote_streaming(
                 exit_code, ff_out, ff_err = _run_cmd(client, ffmpeg_cmd, timeout=300, kill_pattern=ff_kill)
                 ff_logs = (ff_out + ff_err).strip().splitlines()[-5:]
                 if exit_code == 0:
+                    break
+                if _is_non_retryable(ff_out + ff_err):
+                    ff_logs = ff_logs + [
+                        "该错误属于权限/锁/缺少工具，重试不可能成功，已停止",
+                        "无 root 时: conda install -y -c conda-forge ffmpeg",
+                    ]
                     break
                 if attempt < 3:
                     yield step_result(3, f"FFmpeg install failed, retry {attempt}/2...", "running", ff_logs)

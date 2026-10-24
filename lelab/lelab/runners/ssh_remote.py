@@ -177,10 +177,20 @@ class SSHJobRunner:
             self._secret = api_key
             cmd_str = f"export WANDB_API_KEY={self._shell_quote(api_key)} && {cmd_str}"
 
-        # Ensure FFmpeg is available (required by torchcodec for video decoding)
+        # Ensure FFmpeg is available (required by torchcodec for video decoding).
+        # This previously ended in `;` with stderr discarded, so a host that could
+        # not install ffmpeg launched training anyway and only surfaced later as an
+        # opaque libav decode error mid-run. Fail up front instead.
+        # `sudo -n` is used because it cannot hang: it returns immediately rather
+        # than prompting for a password nobody can type into a detached SSH session.
         cmd_str = (
             "which ffmpeg >/dev/null 2>&1 || "
-            "(apt-get update -qq && apt-get install -y -qq ffmpeg) 2>/dev/null; "
+            "(sudo -n apt-get update -qq && sudo -n apt-get install -y -qq ffmpeg) "
+            ">/dev/null 2>&1 || "
+            "{ echo 'LeLab: ffmpeg is unavailable on this host, and torchcodec cannot "
+            "decode video datasets, so training would fail mid-run. Install it first: "
+            "apt-get install -y ffmpeg with root, or without root "
+            "conda install -y -c conda-forge ffmpeg.'; exit 1; }; "
             f"{cmd_str}"
         )
 

@@ -796,7 +796,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                               className="border-slate-500"
                             />
                             <Label htmlFor="cn-mirror" className="text-xs text-slate-400 cursor-pointer">
-                              Use China mirrors (Aliyun pip + SJTU PyTorch)
+                              Use China mirrors (apt + pip: Aliyun, PyTorch: SJTU)
                             </Label>
                           </div>
                           <Button
