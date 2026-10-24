@@ -1,9 +1,15 @@
-# ---- 必须保留（不要加宽泛的 dist/ 或 lerobot/ 规则）----
-# lelab/frontend/dist/  预构建前端，一条命令安装依赖它
-# lerobot/              打过补丁的框架源码
-# *.stl                 3D 模型网格（走 LFS）
+# 规则写法约定：凡是"本地产物/环境目录"类规则，一律加前导斜杠锚定仓库根，
+# 否则 gitignore 会在任意层级匹配，会静默吃掉同名源码目录。
+# 教训：裸写 datasets/ 曾让 lerobot/src/lerobot/datasets/ 整包（17 个 .py）没能入库，
+# 克隆方 import 直接 ModuleNotFoundError，而本机构建的 tarball 因为走 rsync 不受影响，
+# 所以这个错误在装完自检里是查不出来的。
+#
+# 必须入库、不要加宽泛规则的路径：
+#   lelab/frontend/dist/   预构建前端，一条命令安装依赖它
+#   lerobot/               打过补丁的框架源码（含 lerobot/src/lerobot/datasets/）
+#   *.stl                  3D 网格，以普通 Git 对象存放（不用 LFS）
 
-# ---- Python ----
+# ---- Python 生成物（这些名字不会是源码目录，可不限层级）----
 __pycache__/
 *.py[cod]
 *.egg-info/
@@ -12,43 +18,40 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 
-# Python 构建产物（只针对 build 目录，不要写成裸 dist/，否则会误伤前端产物）
-build/
-wheels/
-sdist/
+# ---- 仓库根本地的构建/环境产物 ----
+/build/
+/wheels/
+/sdist/
+/.venv/
+/venv/
+/env/
+/ENV/
 
-# ---- 虚拟环境（安装脚本会生成名为 lerobot/ 的环境目录，但那是本地产物不是仓库内容）----
-.venv/
-venv/
-env/
-ENV/
-uv-env/
-
-# ---- 本地凭据与状态 ----
-.env
-.env.*
+# ---- 仓库根本地的凭据与状态 ----
+/.env
+/.env.*
 *.pem
 *.key
 id_rsa*
 
-# ---- 训练与本地数据产物 ----
-outputs/
-wandb/
-datasets/
-media/
+# ---- 仓库根本地的训练与数据产物 ----
+/outputs/
+/wandb/
+/datasets/
+/media/
+/models/
 *.log
-tmp*.json
-package-lock.json.bak
+/tmp*.json
 
-# 模型权重不入库（太大）
+# ---- 模型权重不入库（太大）----
 *.safetensors
 *.pt
 *.ckpt
 *.onnx
 
 # ---- IDE / 系统 ----
-.vscode/
-.idea/
+/.vscode/
+/.idea/
 *.swp
 *.swo
 .DS_Store
@@ -59,4 +62,4 @@ ehthumbs.db
 node_modules/
 *.tsbuildinfo
 .eslintcache
-coverage/
+/coverage/
