@@ -66,3 +66,6 @@ node_modules/
 
 # 指向开发机现有虚拟环境的软链（带斜杠的规则不匹配软链接，故单列）
 /venv
+
+# install.sh 建的环境目录（必须忽略，否则会把整个 venv 提交进仓库）
+/lerobot-env/

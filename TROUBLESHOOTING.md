@@ -243,3 +243,37 @@ id -nG; ls /dev/ttyUSB* /dev/ttyACM* /dev/video* 2>&1
 
 # 3. 完整报错（不要只截最后一行）
 ```
+
+---
+
+## torchcodec 找不到 FFmpeg 共享库
+
+**现象**：从 git 装好后报
+
+```
+Could not load libtorchcodec. Likely causes:
+  1. Couldn't load FFmpeg shared libraries ...
+FFmpeg version 7: libavcodec.so.61: cannot open shared object file
+FFmpeg version 6: libavutil.so.58: ...
+```
+
+**原因**：torchcodec 按 7→6→5→4 顺序加载 `libtorchcodec_coreN.so`，每个都要求对应 FFmpeg 大版本的**普通 soname**（如 `libavcodec.so.61`）。新机器上没有系统 FFmpeg 就全失败。
+
+**已自动处理**：`install.sh` 会调用 `python -m lelab.utils.ffmpeg_shim --ensure`，把 **PyAV 自带的 FFmpeg 7**（`site-packages/av.libs/`）接上。做法是建一个 shim 目录，同时链两种名字 —— 普通 soname 给 torchcodec 用，hash 名（`libdrm-b0291a67.so.2.4.0`）给这批库互相引用用。`lelab-run.sh` 与 `lelab` 命令会在启动前把它注入 `LD_LIBRARY_PATH`（必须启动前设，运行时改无效）。
+
+**手动处理**（三选一）：
+
+```bash
+sudo apt install ffmpeg                     # 有 root 时最干净
+conda install -y -c conda-forge ffmpeg      # 无 root；需把 $CONDA_PREFIX/lib 加进 LD_LIBRARY_PATH
+python -m lelab.utils.ffmpeg_shim --ensure  # 无 root 无 conda，用 PyAV 自带的库
+```
+
+**不修也能用**：`lelab.utils.video_backend` 会探测到 torchcodec 不可用并自动退回 **pyav** 解码，训练/回放照常，只是慢一些。
+
+**验证修好了**：
+
+```bash
+python -c "import json;from torchcodec._core.ops import _get_json_ffmpeg_library_versions as j;print(json.loads(j())['ffmpeg_version'])"
+```
+

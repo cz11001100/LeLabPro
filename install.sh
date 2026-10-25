@@ -133,14 +133,36 @@ UV_INDEX_URL="$MIRROR" uv pip install --python "$VENV_PY" \
 info "安装 LeLab..."
 uv pip install --python "$VENV_PY" --no-deps -e "$ROOT/lelab"
 
+# ---------- 修复 torchcodec 缺 FFmpeg 共享库 ----------
+FAILED_STEP="步骤5b torchcodec 的 FFmpeg 共享库"
+info "检查 torchcodec 能否加载 FFmpeg 共享库..."
+if "$VENV_PY" -m lelab.utils.ffmpeg_shim --ensure 2>&1 | tail -2 | sed 's/^/  /'; then
+    :
+else
+    warn "  未能自动修复 —— 视频解码会退回 pyav，训练/回放仍可用"
+    warn "  要拿回 torchcodec：装系统 FFmpeg（sudo apt install ffmpeg），"
+    warn "  或 conda install -c conda-forge ffmpeg 后把 \$CONDA_PREFIX/lib 加进 LD_LIBRARY_PATH"
+fi
+
 # ---------- 启动脚本 ----------
 FAILED_STEP="生成启动脚本"
 cat > "$ROOT/lelab-run.sh" << 'WRAPPER'
 #!/usr/bin/env bash
+# 启动 LeLab（代码与环境均来自本仓库）
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-[[ -d "$DIR/lerobot-env" ]] || { echo "[ERROR] 未找到环境，先跑 install.sh"; exit 1; }
+VENV="$DIR/venv"; [[ -d "$VENV" ]] || VENV="$DIR/lerobot-env"
+[[ -d "$VENV" ]] || { echo "[ERROR] 未找到环境，先跑 install.sh"; exit 1; }
+
 if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then conda deactivate 2>/dev/null || true; fi
-source "$DIR/lerobot-env/bin/activate"
+
+# torchcodec 在 import 前就要看到 FFmpeg 的 soname，运行时改 LD_LIBRARY_PATH 无效，
+# 所以在这里注入 install.sh 按需建好的 shim（没有系统 FFmpeg 时由 PyAV 自带库提供）。
+SHIM="$("$VENV/bin/python" -c 'from lelab.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
+if [[ -n "${SHIM:-}" && -d "$SHIM" ]]; then
+    export LD_LIBRARY_PATH="$SHIM${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+
+source "$VENV/bin/activate"
 exec lelab "$@"
 WRAPPER
 chmod +x "$ROOT/lelab-run.sh"
@@ -163,6 +185,11 @@ check "lerobot 采集与数据集模块"        "from lerobot.scripts.lerobot_re
 check "SO-101 机械臂配置"              "from lerobot.robots.so_follower import SO101FollowerConfig"
 check "rewards（RA-BC 打分）"          "from lerobot.rewards.robometer import compute_rabc_weights"
 check "LeLab 后端（启动入口）"          "import lelab.server"
+if "$VENV_PY" -c "from torchcodec.decoders import VideoDecoder" >/dev/null 2>&1; then
+    echo "  [OK] torchcodec（FFmpeg 硬解，$("$VENV_PY" -c 'import json;from torchcodec._core.ops import _get_json_ffmpeg_library_versions as j;print(json.loads(j())["ffmpeg_version"])' 2>/dev/null)）"
+else
+    warn "  [!] torchcodec 不可用 —— 视频解码退回 pyav，功能不受影响但更慢"
+fi
 
 # ---------- 收尾 ----------
 echo ""
