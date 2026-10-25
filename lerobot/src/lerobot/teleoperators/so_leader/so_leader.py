@@ -16,7 +16,6 @@
 
 import logging
 import time
-from typing import TypeAlias
 
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.feetech import (
@@ -60,7 +59,7 @@ class SOLeader(Teleoperator):
 
     @property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        return self.action_features
 
     @property
     def is_connected(self) -> bool:
@@ -131,6 +130,12 @@ class SOLeader(Teleoperator):
         for motor in self.bus.motors:
             self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
 
+    def enable_torque(self) -> None:
+        self.bus.enable_torque()
+
+    def disable_torque(self) -> None:
+        self.bus.disable_torque()
+
     def setup_motors(self) -> None:
         for motor in reversed(self.bus.motors):
             input(f"Connect the controller board to the '{motor}' motor only and press enter.")
@@ -140,15 +145,30 @@ class SOLeader(Teleoperator):
     @check_if_not_connected
     def get_action(self) -> dict[str, float]:
         start = time.perf_counter()
-        action = self.bus.sync_read("Present_Position")
+        action = None
+        last_error = None
+        for attempt in range(3):
+            try:
+                action = self.bus.sync_read("Present_Position")
+                break
+            except ConnectionError as e:
+                last_error = e
+                if attempt < 2:
+                    time.sleep(0.01)
+                    continue
+                raise
+        if action is None:
+            raise last_error
         action = {f"{motor}.pos": val for motor, val in action.items()}
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action
 
+    @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        goals = {k.removesuffix(".pos"): v for k, v in feedback.items() if k.endswith(".pos")}
+        if goals:
+            self.bus.sync_write("Goal_Position", goals)
 
     @check_if_not_connected
     def disconnect(self) -> None:
@@ -156,5 +176,5 @@ class SOLeader(Teleoperator):
         logger.info(f"{self} disconnected.")
 
 
-SO100Leader: TypeAlias = SOLeader
-SO101Leader: TypeAlias = SOLeader
+SO100Leader = SOLeader
+SO101Leader = SOLeader

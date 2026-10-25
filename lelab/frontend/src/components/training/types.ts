@@ -50,6 +50,12 @@ export interface TrainingConfig {
   scheduler_warmup_steps?: number;
   scheduler_decay_steps?: number;
   scheduler_decay_lr?: number;
+  // RA-BC: per-frame loss weights from a progress model's output.
+  sample_weighting_enable?: boolean;
+  sample_weighting_type?: string;
+  sample_weighting_progress_path?: string;
+  sample_weighting_kappa?: number;
+  sample_weighting_head_mode?: string;
 
   // Advanced configuration
   use_policy_training_preset: boolean;

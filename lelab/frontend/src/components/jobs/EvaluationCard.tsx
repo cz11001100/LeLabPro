@@ -11,13 +11,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { FlaskConical, Loader2, ShieldAlert, ShieldCheck } from "lucide-react";
+import { FlaskConical, Loader2, ShieldAlert, ShieldCheck, Square } from "lucide-react";
 import { useApi } from "@/contexts/ApiContext";
 import { useToast } from "@/hooks/use-toast";
 import {
   evaluationChartUrl,
   getJobValidation,
   startJobValidation,
+  stopJobValidation,
   JobRecord,
   ValidationResults,
   ValidationState,
@@ -77,21 +78,71 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
   </div>
 );
 
+const EVAL_CONFIG_KEY = "lelab.eval.config";
+
+interface EvalConfig {
+  numBatches: number;
+  batchSize: number;
+  seed: number;
+  holdout: number;
+  framesPerEpisode: number;
+  probe: boolean;
+  saliencyFrames: number;
+  aimFrames: number;
+  device: string;
+}
+
+const DEFAULT_EVAL_CONFIG: EvalConfig = {
+  numBatches: 20,
+  batchSize: 8,
+  seed: 0,
+  holdout: 20,
+  framesPerEpisode: 8,
+  probe: true,
+  saliencyFrames: 2,
+  aimFrames: 4,
+  device: "cuda",
+};
+
+const loadEvalConfig = (): EvalConfig => {
+  try {
+    const raw = localStorage.getItem(EVAL_CONFIG_KEY);
+    if (!raw) return DEFAULT_EVAL_CONFIG;
+    const parsed = JSON.parse(raw);
+    return { ...DEFAULT_EVAL_CONFIG, ...parsed };
+  } catch {
+    return DEFAULT_EVAL_CONFIG;
+  }
+};
+
+const saveEvalConfig = (config: Partial<EvalConfig>) => {
+  try {
+    const existing = loadEvalConfig();
+    localStorage.setItem(EVAL_CONFIG_KEY, JSON.stringify({ ...existing, ...config }));
+  } catch {
+    // Storage may be unavailable — ignore
+  }
+};
+
 const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
   const { baseUrl, fetchWithHeaders } = useApi();
   const { toast } = useToast();
   const [checkpoints, setCheckpoints] = useState<JobCheckpoint[]>([]);
   const [step, setStep] = useState<string>("");
-  const [numBatches, setNumBatches] = useState(20);
-  const [batchSize, setBatchSize] = useState(8);
-  const [seed, setSeed] = useState(0);
-  const [holdout, setHoldout] = useState(20);
-  const [framesPerEpisode, setFramesPerEpisode] = useState(8);
-  const [probe, setProbe] = useState(true);
-  const [saliencyFrames, setSaliencyFrames] = useState(2);
-  const [aimFrames, setAimFrames] = useState(4);
-  const [device, setDevice] = useState("cuda");
+  
+  // Load saved config from localStorage
+  const savedConfig = loadEvalConfig();
+  const [numBatches, setNumBatches] = useState(savedConfig.numBatches);
+  const [batchSize, setBatchSize] = useState(savedConfig.batchSize);
+  const [seed, setSeed] = useState(savedConfig.seed);
+  const [holdout, setHoldout] = useState(savedConfig.holdout);
+  const [framesPerEpisode, setFramesPerEpisode] = useState(savedConfig.framesPerEpisode);
+  const [probe, setProbe] = useState(savedConfig.probe);
+  const [saliencyFrames, setSaliencyFrames] = useState(savedConfig.saliencyFrames);
+  const [aimFrames, setAimFrames] = useState(savedConfig.aimFrames);
+  const [device, setDevice] = useState(savedConfig.device);
   const [starting, setStarting] = useState(false);
+  const [stopping, setStopping] = useState(false);
   const [datasets, setDatasets] = useState<DatasetItem[]>([]);
   const [valDataset, setValDataset] = useState("");
   const [state, setState] = useState<ValidationState>(job.validation_state ?? "none");
@@ -142,6 +193,19 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
   }, [state, baseUrl, fetchWithHeaders, job.id]);
 
   const run = async () => {
+    // Save current config to localStorage before running
+    saveEvalConfig({
+      numBatches,
+      batchSize,
+      seed,
+      holdout,
+      framesPerEpisode,
+      probe,
+      saliencyFrames,
+      aimFrames,
+      device,
+    });
+
     setStarting(true);
     setState("running");
     setResults(null);
@@ -169,6 +233,23 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
       });
     } finally {
       setStarting(false);
+    }
+  };
+
+  const stop = async () => {
+    if (stopping) return;
+    setStopping(true);
+    try {
+      await stopJobValidation(baseUrl, fetchWithHeaders, job.id);
+      toast({ title: "正在停止评测…" });
+    } catch (e) {
+      toast({
+        title: "停止失败",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setStopping(false);
     }
   };
 
@@ -276,18 +357,33 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
               感知探针
             </Label>
           </div>
-          <Button
-            onClick={run}
-            disabled={running || starting}
-            className="bg-purple-500 hover:bg-purple-600 text-white ml-auto"
-          >
-            {running || starting ? (
-              <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-            ) : (
-              <FlaskConical className="w-4 h-4 mr-2" />
-            )}
-            {results ? "重新评测" : "开始评测"}
-          </Button>
+          {running ? (
+            <Button
+              onClick={stop}
+              disabled={stopping}
+              className="bg-red-500 hover:bg-red-600 text-white ml-auto"
+            >
+              {stopping ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <Square className="w-4 h-4 mr-2" />
+              )}
+              {stopping ? "停止中…" : "停止评测"}
+            </Button>
+          ) : (
+            <Button
+              onClick={run}
+              disabled={starting}
+              className="bg-purple-500 hover:bg-purple-600 text-white ml-auto"
+            >
+              {starting ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <FlaskConical className="w-4 h-4 mr-2" />
+              )}
+              {results ? "重新评测" : "开始评测"}
+            </Button>
+          )}
         </div>
 
         {running ? (

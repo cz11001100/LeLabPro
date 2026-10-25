@@ -333,6 +333,74 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
 
           <Separator className="bg-slate-700" />
 
+          {/* RA-BC sample weighting */}
+          <section className="space-y-4">
+            <SectionHeading>RA-BC 样本加权</SectionHeading>
+            <div className="flex items-center justify-between gap-4">
+              <Label htmlFor="sample_weighting_enable" className="text-slate-300">
+                按任务进度加权
+              </Label>
+              <Switch
+                id="sample_weighting_enable"
+                checked={!!config.sample_weighting_enable}
+                onCheckedChange={(v) => updateConfig('sample_weighting_enable', v)}
+              />
+            </div>
+            {config.sample_weighting_enable && (
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div>
+                  <Label htmlFor="sample_weighting_kappa" className="text-slate-300">
+                    Kappa（进度增益阈值）
+                  </Label>
+                  <NumberInput
+                    id="sample_weighting_kappa"
+                    integer={false}
+                    step="0.001"
+                    value={config.sample_weighting_kappa}
+                    onChange={(v) => updateConfig('sample_weighting_kappa', v)}
+                    placeholder="0.01"
+                    className="bg-slate-900 border-slate-600 text-white rounded-lg"
+                  />
+                </div>
+                <div>
+                  <Label htmlFor="sample_weighting_head_mode" className="text-slate-300">
+                    进度头
+                  </Label>
+                  <Select
+                    value={config.sample_weighting_head_mode ?? 'sparse'}
+                    onValueChange={(v) => updateConfig('sample_weighting_head_mode', v)}
+                  >
+                    <SelectTrigger className="bg-slate-900 border-slate-600 text-white">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent className="bg-slate-900 border-slate-700 text-white">
+                      <SelectItem value="sparse">sparse</SelectItem>
+                      <SelectItem value="dense">dense</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="md:col-span-2">
+                  <Label htmlFor="sample_weighting_progress_path" className="text-slate-300">
+                    进度文件
+                  </Label>
+                  <Input
+                    id="sample_weighting_progress_path"
+                    value={config.sample_weighting_progress_path ?? ''}
+                    onChange={(e) => updateConfig('sample_weighting_progress_path', e.target.value)}
+                    placeholder="留空 = 数据集目录下的 sarm_progress.parquet"
+                    className="bg-slate-900 border-slate-600 text-white rounded-lg"
+                  />
+                </div>
+                <p className="text-xs text-slate-500 md:col-span-2">
+                  需先在评测的「真机成功率」里给该数据集打分。逐样本加权目前只有
+                  SmolVLA / pi0 / pi0.5 支持，ACT 与 Diffusion 开了会报错。
+                </p>
+              </div>
+            )}
+          </section>
+
+          <Separator className="bg-slate-700" />
+
           {/* Logging & Checkpointing */}
           <section className="space-y-4">
             <SectionHeading>Logging & Checkpointing</SectionHeading>

@@ -544,6 +544,174 @@ def diagnose_env(data: dict, *, python_used: str, floor=None, local_version=None
     return issues
 
 
+# The progress model that scores rollout episodes (see lelab.rollout_eval) and
+# the VLM backbone its config names. ~8.9 GB each; a 4B model does not fit the
+# laptop GPU, so the download happens on the pod.
+REWARD_MODEL_REPOS = ("lerobot/Robometer-4B", "Qwen/Qwen3-VL-4B-Instruct")
+_REWARD_LOG = "/tmp/lelab_reward_download.log"
+_SARM_TRAIN_LOG = "/tmp/lelab_sarm_train.log"
+
+
+def _repo_cache_dir(repo: str) -> str:
+    org, _, name = repo.partition("/")
+    return f"~/.cache/huggingface/hub/models--{org}--{name}"
+
+
+def reward_model_status(config_id: str) -> dict:
+    """What of the scoring model is already on the pod, and is a pull running."""
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+
+    try:
+        models = []
+        for repo in REWARD_MODEL_REPOS:
+            path = _repo_cache_dir(repo)
+            code, size, _ = _run_cmd(
+                client, f"du -sh {path} 2>/dev/null | cut -f1", timeout=30
+            )
+            models.append(
+                {
+                    "repo_id": repo,
+                    "present": code == 0 and bool(size.strip()),
+                    "size": size.strip(),
+                }
+            )
+        _, running, _ = _run_cmd(
+            client, "pgrep -f 'hf download' | head -3", timeout=20
+        )
+        _, log_tail, _ = _run_cmd(client, f"tail -3 {_REWARD_LOG} 2>/dev/null", timeout=20)
+        return {
+            "success": True,
+            "models": models,
+            "ready": all(m["present"] for m in models),
+            "downloading": bool(running.strip()),
+            "log_path": _REWARD_LOG,
+            "log_tail": log_tail.strip()[-400:],
+        }
+    finally:
+        client.close()
+
+
+def start_reward_model_download(config_id: str, *, use_cn_mirror: bool = True) -> dict:
+    """Pull the scoring model onto the pod in the background (nohup + log).
+
+    Detached on purpose: 18 GB takes longer than any sane HTTP request, and a
+    dropped SSH channel must not kill the download mid-file."""
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    endpoint = "https://hf-mirror.com" if use_cn_mirror else "https://huggingface.co"
+    pulls = " && ".join(f'hf download {repo}' for repo in REWARD_MODEL_REPOS)
+    script = (
+        f"export HF_ENDPOINT={endpoint}; "
+        f"command -v hf >/dev/null 2>&1 || python3 -m pip install -q -U huggingface_hub; "
+        f"{pulls}; echo REWARD_DOWNLOAD_DONE=$?"
+    )
+    cmd = f"nohup bash -c {shlex.quote(script)} > {_REWARD_LOG} 2>&1 < /dev/null &"
+
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        code, _, err = _run_cmd(client, cmd, timeout=30)
+        if code != 0:
+            return {"success": False, "message": f"启动下载失败: {err[-300:]}"}
+        return {
+            "success": True,
+            "message": "已在 pod 上开始下载打分模型",
+            "log_path": _REWARD_LOG,
+            "endpoint": endpoint,
+            "repos": list(REWARD_MODEL_REPOS),
+        }
+    finally:
+        client.close()
+
+
+def start_sarm_training_remote(
+    config_id: str,
+    dataset_repo_id: str,
+    *,
+    image_key: str = "observation.images.up",
+    steps: int = 5000,
+    batch_size: int = 32,
+    push_repo_id: str = "",
+    use_cn_mirror: bool = True,
+) -> dict:
+    """Train a task-specific SARM scorer on the pod, detached.
+
+    SARM is the small, trainable scorer (single_stage mode needs no subtask
+    annotations: linear 0→1 progress is the label). Its output is the second
+    backend in the scoring comparison — the one that has actually seen this rig.
+    """
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    endpoint = "https://hf-mirror.com" if use_cn_mirror else "https://huggingface.co"
+    push = f"--policy.repo_id={push_repo_id} --policy.push_to_hub=true" if push_repo_id else ""
+    script = (
+        f"export HF_ENDPOINT={endpoint}; "
+        f"python3 -m lerobot.scripts.lerobot_train "
+        f"--dataset.repo_id={dataset_repo_id} --policy.type=sarm "
+        f"--policy.annotation_mode=single_stage --policy.image_key={image_key} "
+        f"--steps={steps} --batch_size={batch_size} --output_dir=outputs/sarm {push}; "
+        "echo SARM_TRAIN_DONE=$?"
+    )
+    cmd = f"nohup bash -c {shlex.quote(script)} > {_SARM_TRAIN_LOG} 2>&1 < /dev/null &"
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        code, _, err = _run_cmd(client, cmd, timeout=30)
+        if code != 0:
+            return {"success": False, "message": f"启动 SARM 训练失败: {err[-300:]}"}
+        return {
+            "success": True,
+            "message": "已在 pod 上开始训练 SARM 打分模型",
+            "log_path": _SARM_TRAIN_LOG,
+            "command": script,
+        }
+    finally:
+        client.close()
+
+
+def sarm_training_status(config_id: str) -> dict:
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        _, running, _ = _run_cmd(client, "pgrep -f lerobot_train | head -3", timeout=20)
+        _, tail, _ = _run_cmd(client, f"tail -4 {_SARM_TRAIN_LOG} 2>/dev/null", timeout=20)
+        _, done, _ = _run_cmd(client, f"grep -c 'SARM_TRAIN_DONE=0' {_SARM_TRAIN_LOG} 2>/dev/null", timeout=20)
+        return {
+            "success": True,
+            "training": bool(running.strip()),
+            "finished_ok": done.strip() not in ("", "0"),
+            "log_path": _SARM_TRAIN_LOG,
+            "log_tail": tail.strip()[-400:],
+        }
+    finally:
+        client.close()
+
+
 def check_remote_environment(config_id: str) -> dict:
     """Inspect the remote machine: Python version, lerobot, CUDA, disk space.
 

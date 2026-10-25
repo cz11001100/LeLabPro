@@ -314,6 +314,53 @@ def test_classify_outcome_ok_warns_and_fails() -> None:
     assert _classify_outcome(1, True, "DeviceNotConnectedError: follower is not connected") == "failed"
 
 
+def _write_policy_config(tmp_path, config: dict) -> str:
+    policy_dir = tmp_path / "pretrained_model"
+    policy_dir.mkdir()
+    (policy_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return str(policy_dir)
+
+
+def test_hf_offline_env_pins_subprocess_when_base_is_cached(tmp_path, monkeypatch) -> None:
+    """The hub HEAD-probes transformers makes while building the SmolVLM
+    processor cost ~22s of a ~50s setup, so a cached base must go offline."""
+    from lelab.rollout import _hf_offline_env
+
+    seen: list[dict] = []
+
+    def fake_snapshot_download(**kwargs):
+        seen.append(kwargs)
+        return str(tmp_path / "snapshot")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    path = _write_policy_config(tmp_path, {"type": "smolvla", "vlm_model_name": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct"})
+
+    assert _hf_offline_env(path) == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+    assert seen == [{"repo_id": "HuggingFaceTB/SmolVLM2-500M-Video-Instruct", "local_files_only": True}]
+
+
+def test_hf_offline_env_stays_online_when_base_missing(tmp_path, monkeypatch) -> None:
+    from lelab.rollout import _hf_offline_env
+
+    def uncached(**kwargs):
+        raise OSError("no cached files")
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", uncached)
+
+    path = _write_policy_config(tmp_path, {"type": "smolvla", "vlm_model_name": "someone/NotCached"})
+
+    assert _hf_offline_env(path) == {}
+
+
+def test_hf_offline_env_allows_policies_without_hub_refs(tmp_path) -> None:
+    from lelab.rollout import _hf_offline_env
+
+    path = _write_policy_config(tmp_path, {"type": "diffusion", "device": "cuda", "n_action_steps": 16})
+
+    assert _hf_offline_env(path) == {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+
+
 def test_rollout_inference_args_uses_rtc_for_relative_action_policies(tmp_path) -> None:
     from lelab.rollout import _rollout_inference_args
 

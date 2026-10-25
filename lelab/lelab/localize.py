@@ -60,12 +60,30 @@ def read_robot_config(name: str) -> dict:
 
 
 def camera_arg(cameras: list[dict]) -> dict[str, dict]:
-    """LeLab's stored camera list → lerobot's ``--robot.cameras`` mapping."""
+    """LeLab's stored camera list → lerobot's ``--robot.cameras`` mapping.
+
+    A stream URL goes out as ``type: network``, whose config types ``index_or_path``
+    as a string; the ``opencv`` config would coerce a URL into a Path and drop the
+    ``//`` after the scheme.
+    """
+    from .network_camera import camera_source, install_camera_factory_hook
+
     out: dict[str, dict] = {}
     for cam in cameras:
+        kind, source = camera_source(cam)
+        if kind == "network":
+            install_camera_factory_hook()
+            out[cam["name"]] = {
+                "type": "network",
+                "index_or_path": str(source),
+                "width": cam.get("width", 640),
+                "height": cam.get("height", 480),
+                "fps": cam.get("fps", 30),
+            }
+            continue
         out[cam["name"]] = {
-            "type": cam.get("type", "opencv"),
-            "index_or_path": cam.get("camera_index", 0),
+            "type": kind,
+            "index_or_path": source if source is not None else 0,
             "width": cam.get("width", 640),
             "height": cam.get("height", 480),
             "fps": cam.get("fps", 30),

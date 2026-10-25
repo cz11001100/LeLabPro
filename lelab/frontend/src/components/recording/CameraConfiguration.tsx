@@ -19,12 +19,14 @@ import {
 import { useToast } from "@/hooks/use-toast";
 import { useAvailableCameras } from "@/hooks/useAvailableCameras";
 import { useCameraStream } from "@/hooks/useCameraStream";
+import { useNetworkCameraSource } from "@/hooks/useNetworkCameraSource";
 
 // Sentinels distinguish "leave unset" (auto-detect / platform default) from an
 // explicit choice. Radix Select disallows an empty-string value, so we map these
 // to `undefined` on the CameraConfig.
 const FOURCC_AUTO = "__auto__";
 const BACKEND_DEFAULT = "__default__";
+const NETWORK_SOURCE = "__network__";
 const FOURCC_OPTIONS = ["MJPG", "YUYV", "I420", "NV12", "H264", "MP4V"];
 // Mirrors lerobot's Cv2Backends enum names.
 const BACKEND_OPTIONS = [
@@ -51,7 +53,8 @@ export interface CameraConfig {
   name: string;
   type: string;
   camera_index?: number; // cv2 index — what the recorder opens
-  device_id: string; // Browser deviceId matched to the cv2 index by AVFoundation localizedName
+  url?: string; // Stream source (rtsp/http); replaces camera_index when set
+  device_id?: string; // Browser deviceId matched to the cv2 index by AVFoundation localizedName
   width: number;
   height: number;
   fps?: number;
@@ -84,9 +87,21 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
   } = useAvailableCameras();
   const [selectedCameraIndex, setSelectedCameraIndex] = useState<string>("");
   const [cameraName, setCameraName] = useState("");
+  const [cameraUrl, setCameraUrl] = useState("");
   // Which entry the name dropdown shows: a preset name, CUSTOM_NAME (reveal the
   // free-text input), or "" (nothing picked yet).
   const [nameMode, setNameMode] = useState<string>("");
+
+  const isNetworkSource = selectedCameraIndex === NETWORK_SOURCE;
+  // The backend has to open the stream before this camera can be added: an
+  // IP camera refuses a resolution it wasn't configured to encode, and the size
+  // and frame rate it does send become the dataset's image features.
+  const {
+    probe: streamProbe,
+    error: streamError,
+    isChecking: streamChecking,
+    feedUrl: streamFeedUrl,
+  } = useNetworkCameraSource(isNetworkSource ? cameraUrl : undefined);
 
   // Names already taken by configured cameras — presets matching these are
   // disabled in the dropdown so the same orientation name can't be reused.
@@ -138,13 +153,66 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [availableCameras]);
 
-  const addCamera = () => {
-    if (!selectedCameraIndex || !cameraName.trim()) {
+  const trimmedName = () => cameraName.trim();
+
+  const nameTaken = (candidate: string) =>
+    cameras.some((cam) => cam.name.trim().toLowerCase() === candidate.toLowerCase());
+
+  const commitCamera = (newCamera: CameraConfig) => {
+    onCamerasChange([...cameras, newCamera]);
+    setSelectedCameraIndex("");
+    setCameraName("");
+    setCameraUrl("");
+    setNameMode("");
+    toast({
+      title: "摄像头已添加",
+      description: `${newCamera.name} 已加入相机配置。`,
+    });
+  };
+
+  const addNetworkCamera = () => {
+    if (!streamProbe) return;
+    const url = cameraUrl.trim();
+    if (cameras.some((cam) => (cam.url || "").trim().toLowerCase() === url.toLowerCase())) {
       toast({
-        title: "Missing Information",
-        description: "Please select a camera and provide a name.",
+        title: "相机重复",
+        description: "这个 URL 已经在配置里了。",
         variant: "destructive",
       });
+      return;
+    }
+    commitCamera({
+      id: `camera_${Date.now()}`,
+      name: trimmedName(),
+      type: "network",
+      url,
+      width: streamProbe.width,
+      height: streamProbe.height,
+      fps: streamProbe.fps ?? 30,
+    });
+  };
+
+  const addCamera = () => {
+    if (!selectedCameraIndex || !trimmedName()) {
+      toast({
+        title: "信息不完整",
+        description: "请选择相机来源并填写名称。",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (nameTaken(trimmedName())) {
+      toast({
+        title: "名称重复",
+        description: "每个相机需要唯一的名称，它会作为数据集与策略的图像键。",
+        variant: "destructive",
+      });
+      return;
+    }
+
+    if (isNetworkSource) {
+      addNetworkCamera();
       return;
     }
 
@@ -155,8 +223,8 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
 
     if (!selectedCamera) {
       toast({
-        title: "Invalid Camera",
-        description: "Selected camera is not available.",
+        title: "相机无效",
+        description: "选中的相机当前不可用。",
         variant: "destructive",
       });
       return;
@@ -172,45 +240,22 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     );
     if (isDuplicate) {
       toast({
-        title: "Camera Already Added",
-        description: "This camera is already in the configuration.",
+        title: "相机已添加",
+        description: "这个相机已在配置中。",
         variant: "destructive",
       });
       return;
     }
 
-    // Guard duplicate names too — two cameras sharing a name would collide as
-    // dataset/policy image keys and make the orientation mapping ambiguous.
-    const trimmedName = cameraName.trim();
-    if (cameras.some((cam) => cam.name.trim().toLowerCase() === trimmedName.toLowerCase())) {
-      toast({
-        title: "Name Already Used",
-        description: "Each camera needs a unique name.",
-        variant: "destructive",
-      });
-      return;
-    }
-
-    const newCamera: CameraConfig = {
+    commitCamera({
       id: `camera_${Date.now()}`,
-      name: trimmedName,
+      name: trimmedName(),
       type: "opencv",
       camera_index: selectedCamera.index,
       device_id: selectedCamera.deviceId,
       width: 640,
       height: 480,
       fps: 30,
-    };
-
-    onCamerasChange([...cameras, newCamera]);
-
-    setSelectedCameraIndex("");
-    setCameraName("");
-    setNameMode("");
-
-    toast({
-      title: "Camera Added",
-      description: `${newCamera.name} has been added to the configuration.`,
     });
   };
 
@@ -314,8 +359,25 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
                     </SelectItem>
                   );
                 })}
+                <SelectItem
+                  value={NETWORK_SOURCE}
+                  className="text-white hover:bg-gray-700"
+                >
+                  <div className="flex flex-col">
+                    <span className="font-medium">Network Camera</span>
+                    <span className="text-xs text-gray-400">RTSP / URL</span>
+                  </div>
+                </SelectItem>
               </SelectContent>
             </Select>
+            {isNetworkSource && (
+              <Input
+                value={cameraUrl}
+                onChange={(e) => setCameraUrl(e.target.value)}
+                placeholder="rtsp://user:pass@192.168.1.20:554/stream1"
+                className="bg-gray-800 border-gray-700 text-white font-mono text-xs"
+              />
+            )}
           </div>
 
           <div className="space-y-2">
@@ -363,13 +425,41 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
             <Button
               onClick={addCamera}
               className="bg-blue-500 hover:bg-blue-600 text-white"
-              disabled={!selectedCameraIndex || !cameraName.trim()}
+              disabled={
+                !selectedCameraIndex ||
+                !cameraName.trim() ||
+                (isNetworkSource && !streamProbe)
+              }
             >
               <Plus className="w-4 h-4 mr-2" />
               Add Camera
             </Button>
           </div>
         </div>
+
+        {isNetworkSource && cameraUrl.trim() !== "" && (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-xs">
+              {streamChecking && <span className="text-gray-400">连接中…</span>}
+              {streamProbe && (
+                <span className="text-green-400">
+                  {streamProbe.width}×{streamProbe.height}
+                  {streamProbe.fps ? ` · ${streamProbe.fps} fps` : ""}
+                </span>
+              )}
+              {streamError && !streamChecking && (
+                <span className="text-amber-400">{streamError}</span>
+              )}
+            </div>
+            {streamFeedUrl && (
+              <img
+                src={streamFeedUrl}
+                alt={`${cameraName || "Network Camera"} preview`}
+                className="w-full max-w-md aspect-[4/3] rounded-lg border border-gray-700 bg-black object-cover"
+              />
+            )}
+          </div>
+        )}
       </div>
       )}
 
@@ -426,11 +516,22 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
   onRemove,
   onUpdate,
 }) => {
+  const isNetwork = camera.type === "network" || !!camera.url;
+  // A stream has no browser representation, so its preview comes from the
+  // backend's own copy of the feed — RTSP takes a second client session, unlike
+  // a UVC device, which the recorder must hold alone.
+  const {
+    probe: streamProbe,
+    error: streamError2,
+    isChecking: streamChecking,
+    feedUrl: streamFeedUrl,
+  } = useNetworkCameraSource(isNetwork && !paused ? camera.url : undefined);
   const { videoRef, hasError: streamError } = useCameraStream(
-    camera.device_id,
+    isNetwork ? undefined : camera.device_id,
     paused
   );
-  const showVideo = !paused && camera.device_id && !streamError;
+  const showVideo = !paused && !isNetwork && camera.device_id && !streamError;
+  const showFeed = !paused && isNetwork && !!streamFeedUrl;
   return (
     <div className="bg-gray-900 rounded-lg border border-gray-700 overflow-hidden">
       <div className="aspect-[4/3] bg-gray-800 relative">
@@ -442,12 +543,22 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
             playsInline
             className="w-full h-full object-cover"
           />
+        ) : showFeed ? (
+          <img
+            src={streamFeedUrl}
+            alt={`${camera.name} 预览`}
+            className="w-full h-full object-cover"
+          />
         ) : (
           <div className="w-full h-full flex flex-col items-center justify-center">
             <VideoOff className="w-8 h-8 text-gray-500 mb-2" />
             <span className="text-gray-500 text-sm">
               {paused
                 ? "Preview paused"
+                : isNetwork
+                ? streamChecking
+                  ? "连接中…"
+                  : streamError2 || "No preview"
                 : camera.device_id
                 ? "Preview failed"
                 : "No browser match"}
@@ -484,6 +595,33 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
             Configuration
           </CollapsibleTrigger>
           <CollapsibleContent className="pt-2 space-y-2">
+            {isNetwork && (
+              <div className="space-y-2 text-xs text-gray-400">
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0">URL:</span>
+                  <Input
+                    value={camera.url ?? ""}
+                    onChange={(e) =>
+                      onUpdate({ url: e.target.value, type: "network" })
+                    }
+                    className="bg-gray-800 border-gray-700 text-white text-[11px] font-mono h-6"
+                  />
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="w-16 shrink-0">Stream:</span>
+                  <span className={streamError2 ? "text-amber-400" : "text-gray-300"}>
+                    {streamProbe
+                      ? `${streamProbe.width}×${streamProbe.height}${
+                          streamProbe.fps ? ` · ${streamProbe.fps} fps` : ""
+                        }`
+                      : streamChecking
+                      ? "探测中…"
+                      : streamError2 || "未连接"}
+                  </span>
+                </div>
+              </div>
+            )}
+            {!isNetwork && (
             <div className="grid grid-cols-1 gap-2 text-xs text-gray-400">
               <div className="flex items-center gap-2">
                 <span className="w-16">Resolution:</span>
@@ -585,9 +723,14 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                 Overriding the backend can reorder camera indices on macOS.
               </p>
             </div>
-            <div className="text-xs text-gray-500">
-              Type: {camera.type} | Device:{" "}
-              {camera.device_id?.substring(0, 10)}...
+            )}
+            <div className="text-xs text-gray-500 break-all">
+              {isNetwork
+                ? `Type: network | URL: ${camera.url}`
+                : `Type: ${camera.type} | Device: ${camera.device_id?.substring(
+                    0,
+                    10
+                  )}...`}
             </div>
           </CollapsibleContent>
         </Collapsible>

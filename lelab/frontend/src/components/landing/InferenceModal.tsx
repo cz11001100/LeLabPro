@@ -30,7 +30,7 @@ import {
   getCheckpointPolicyConfig,
   listJobCheckpoints,
 } from "@/lib/checkpointsApi";
-import { startInference } from "@/lib/inferenceApi";
+import { CaptureMode, startInference } from "@/lib/inferenceApi";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 import { useAvailableCameras } from "@/hooks/useAvailableCameras";
 import { useCameraStream } from "@/hooks/useCameraStream";
@@ -72,6 +72,21 @@ interface Props {
 const DEFAULT_FPS = 30;
 const CUSTOM_TASK = "__custom__";
 
+const CAPTURE_MODES: { value: CaptureMode; label: string }[] = [
+  { value: "base", label: "纯执行（不录数据）" },
+  { value: "dagger", label: "纠正采集（主臂接管）" },
+  { value: "highlight", label: "抢救片段（含最近 15 秒）" },
+  { value: "sentry", label: "全自动录制" },
+];
+
+// Mirrors the backend's day-stable auto name so the placeholder tells the truth.
+const autoDatasetTail = () => {
+  const d = new Date();
+  return `${String(d.getMonth() + 1).padStart(2, "0")}${String(d.getDate()).padStart(2, "0")}`;
+};
+// Prefix on a camera-binding value that carries a stream URL instead of a cv2 index.
+const URL_BINDING = "url:";
+
 const InferenceModal: React.FC<Props> = ({
   open,
   onOpenChange,
@@ -92,15 +107,29 @@ const InferenceModal: React.FC<Props> = ({
   const [chunkSmooth, setChunkSmooth] = useState(false);
   const [smoothStrength, setSmoothStrength] = useState(50);
   const [rtc, setRtc] = useState(false);
+  // Data collection during rollout. 'base' just runs the policy; the other
+  // modes are lerobot rollout strategies that write episodes as it drives.
+  const [captureMode, setCaptureMode] = useState<CaptureMode>("base");
+  const [datasetName, setDatasetName] = useState("");
+  const [numEpisodes, setNumEpisodes] = useState(20);
+  const [recordAutonomous, setRecordAutonomous] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const [policyConfig, setPolicyConfig] = useState<PolicyConfigSummary | null>(null);
   const [policyConfigLoading, setPolicyConfigLoading] = useState(false);
   const [policyConfigError, setPolicyConfigError] = useState<string | null>(null);
 
-  // Per expected camera name → user-selected physical camera index (or null).
-  const [cameraBindings, setCameraBindings] = useState<Record<string, number | null>>({});
+  // Per expected camera name → the source to read it from: a cv2 index for a USB
+  // camera, or a stream URL for a network one (null = not bound yet).
+  const [cameraBindings, setCameraBindings] = useState<
+    Record<string, number | string | null>
+  >({});
   const { cameras: availableCameras } = useAvailableCameras({ enabled: open });
+  // The robot's own network cameras are the only stream sources the modal can
+  // offer; USB cameras come from the live cv2 enumeration instead.
+  const networkCameras = (robot?.cameras ?? []).filter(
+    (c) => c.type === "network" || !!c.url,
+  );
 
   // Load checkpoints when modal opens.
   useEffect(() => {
@@ -149,7 +178,7 @@ const InferenceModal: React.FC<Props> = ({
         // Reset camera bindings to one entry per expected camera name.
         // Preserve any prior selection that's still relevant.
         setCameraBindings((prev) => {
-          const next: Record<string, number | null> = {};
+          const next: Record<string, number | string | null> = {};
           for (const name of Object.keys(cfg.image_features)) {
             next[name] = prev[name] ?? null;
           }
@@ -170,12 +199,13 @@ const InferenceModal: React.FC<Props> = ({
   }, [open, baseUrl, fetchWithHeaders, jobId, selectedStep]);
 
   // If the selected robot has cameras whose names match a policy-expected
-  // camera, auto-bind them. Prefer matching by browser device_id (stable
-  // across cv2 index drift); fall back to the saved camera_index.
+  // camera, auto-bind them. A saved stream URL binds directly; for a USB camera
+  // prefer matching by browser device_id (stable across cv2 index drift) and
+  // fall back to the saved camera_index.
   useEffect(() => {
     if (!policyConfig) return;
     const robotCams = robot?.cameras ?? [];
-    if (robotCams.length === 0 || availableCameras.length === 0) return;
+    if (robotCams.length === 0) return;
     setCameraBindings((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -185,6 +215,11 @@ const InferenceModal: React.FC<Props> = ({
           (c) => c.name.toLowerCase() === policyName.toLowerCase(),
         );
         if (!robotCam) continue;
+        if (robotCam.type === "network" || robotCam.url) {
+          next[policyName] = robotCam.url!;
+          changed = true;
+          continue;
+        }
         const live =
           (robotCam.device_id &&
             availableCameras.find((c) => c.deviceId === robotCam.device_id)) ||
@@ -227,18 +262,34 @@ const InferenceModal: React.FC<Props> = ({
     setSubmitting(true);
     await new Promise((r) => setTimeout(r, 300));
     const cameraDict: Record<string, {
-      type: string; camera_index?: number; width: number; height: number; fps?: number;
+      type: string; camera_index?: number; url?: string; width: number; height: number; fps?: number;
     }> = {};
     for (const [name, dims] of Object.entries(policyConfig.image_features)) {
-      const idx = cameraBindings[name];
-      if (idx == null) continue;
-      cameraDict[name] = {
-        type: "opencv",
-        camera_index: idx,
-        width: dims.width,
-        height: dims.height,
-        fps: DEFAULT_FPS,
-      };
+      const binding = cameraBindings[name];
+      if (binding == null) continue;
+      if (typeof binding === "string") {
+        // A stream source sends the size it was configured for; the policy's own
+        // transform resizes it, so keep the saved probe values rather than
+        // pretending it can serve the checkpoint's resolution.
+        const saved = robot.cameras.find(
+          (c) => c.name.toLowerCase() === name.toLowerCase(),
+        );
+        cameraDict[name] = {
+          type: "network",
+          url: binding,
+          width: saved?.width ?? dims.width,
+          height: saved?.height ?? dims.height,
+          fps: saved?.fps ?? DEFAULT_FPS,
+        };
+      } else {
+        cameraDict[name] = {
+          type: "opencv",
+          camera_index: binding,
+          width: dims.width,
+          height: dims.height,
+          fps: DEFAULT_FPS,
+        };
+      }
     }
     try {
       await startInference(baseUrl, fetchWithHeaders, {
@@ -252,6 +303,10 @@ const InferenceModal: React.FC<Props> = ({
         chunk_smooth: chunkSmooth,
         chunk_smooth_strength: smoothStrength / 100,
         rtc,
+        capture_mode: captureMode,
+        dataset_repo_id: datasetName,
+        num_episodes: numEpisodes,
+        record_autonomous: recordAutonomous,
       });
       onOpenChange(false);
       navigate("/inference");
@@ -267,8 +322,12 @@ const InferenceModal: React.FC<Props> = ({
   };
 
   const onCameraBindingChange = (name: string, value: string) => {
-    const idx = Number(value);
-    setCameraBindings((prev) => ({ ...prev, [name]: idx }));
+    // A binding is either a cv2 index or a stream URL; both share one Select, so
+    // the URL options carry a prefix that a numeric index can't collide with.
+    const bound = value.startsWith(URL_BINDING)
+      ? value.slice(URL_BINDING.length)
+      : Number(value);
+    setCameraBindings((prev) => ({ ...prev, [name]: bound }));
   };
 
   return (
@@ -503,6 +562,75 @@ const InferenceModal: React.FC<Props> = ({
 
           <div className="space-y-4">
             <h3 className="text-lg font-semibold text-white border-b border-gray-700 pb-2">
+              数据采集
+            </h3>
+            <div className="space-y-2">
+              <Label className="text-sm font-medium text-gray-300">模式</Label>
+              <Select
+                value={captureMode}
+                onValueChange={(v) => setCaptureMode(v as CaptureMode)}
+              >
+                <SelectTrigger className="bg-gray-800 border-gray-700 text-white">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent className="bg-gray-900 border-gray-700 text-white">
+                  {CAPTURE_MODES.map((m) => (
+                    <SelectItem key={m.value} value={m.value}>
+                      {m.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
+            {captureMode !== "base" && (
+              <>
+                <div className="space-y-2">
+                  <Label htmlFor="capture-dataset" className="text-sm font-medium text-gray-300">
+                    纠正数据集
+                  </Label>
+                  <Input
+                    id="capture-dataset"
+                    value={datasetName}
+                    onChange={(e) => setDatasetName(e.target.value)}
+                    placeholder={`留空自动新建 rollout_${autoDatasetTail()}`}
+                    className="bg-gray-800 border-gray-700 text-white"
+                  />
+                  <p className="text-xs text-gray-500">
+                    新建 rollout_* 集，不写遥操录的数据集；同一天多轮落进同一个集。
+                  </p>
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="capture-episodes" className="text-sm font-medium text-gray-300">
+                    纠正段数上限
+                  </Label>
+                  <NumberInput
+                    id="capture-episodes"
+                    min={1}
+                    value={numEpisodes}
+                    onChange={(v) => {
+                      if (v !== undefined) setNumEpisodes(v);
+                    }}
+                    className="bg-gray-800 border-gray-700 text-white"
+                  />
+                </div>
+                {captureMode === "dagger" && (
+                  <div className="flex items-center justify-between gap-4">
+                    <Label htmlFor="hybrid-episode" className="text-sm font-medium text-gray-200">
+                      混合集（策略段一起录进同一集）
+                    </Label>
+                    <Switch
+                      id="hybrid-episode"
+                      checked={recordAutonomous}
+                      onCheckedChange={setRecordAutonomous}
+                    />
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          <div className="space-y-4">
+            <h3 className="text-lg font-semibold text-white border-b border-gray-700 pb-2">
               Cameras
             </h3>
             {policyConfigLoading ? (
@@ -524,14 +652,13 @@ const InferenceModal: React.FC<Props> = ({
             ) : (
               <div className="space-y-3">
                 <p className="text-xs text-gray-500">
-                  Bind a physical camera to each name the policy was trained
-                  with. Resolution comes from the checkpoint.
+                  为策略训练时的每个相机名选择来源（USB 摄像头或网络 RTSP/URL）。
                 </p>
                 {expectedCameraNames.map((name) => {
                   const dims = policyConfig.image_features[name];
                   const value = cameraBindings[name];
                   const bound =
-                    value != null
+                    typeof value === "number"
                       ? availableCameras.find((c) => c.index === value)
                       : undefined;
                   return (
@@ -552,19 +679,35 @@ const InferenceModal: React.FC<Props> = ({
                           <SelectValue placeholder="Select a camera" />
                         </SelectTrigger>
                         <SelectContent className="bg-gray-900 border-gray-700 text-white">
-                          {availableCameras.length === 0 ? (
+                          {availableCameras.length === 0 &&
+                          networkCameras.length === 0 ? (
                             <div className="px-2 py-1.5 text-xs text-gray-500">
                               No cameras detected
                             </div>
                           ) : (
-                            availableCameras.map((cam) => (
-                              <SelectItem
-                                key={cam.index}
-                                value={String(cam.index)}
-                              >
-                                #{cam.index} — {cam.name}
-                              </SelectItem>
-                            ))
+                            <>
+                              {availableCameras.map((cam) => (
+                                <SelectItem
+                                  key={cam.index}
+                                  value={String(cam.index)}
+                                >
+                                  #{cam.index} — {cam.name}
+                                </SelectItem>
+                              ))}
+                              {networkCameras.map((cam) => (
+                                <SelectItem
+                                  key={cam.url}
+                                  value={`${URL_BINDING}${cam.url}`}
+                                >
+                                  <div className="flex flex-col">
+                                    <span>{cam.name} · Network</span>
+                                    <span className="text-xs text-gray-400 break-all">
+                                      {cam.url}
+                                    </span>
+                                  </div>
+                                </SelectItem>
+                              ))}
+                            </>
                           )}
                         </SelectContent>
                       </Select>
@@ -583,7 +726,11 @@ const InferenceModal: React.FC<Props> = ({
               className="w-full sm:w-auto bg-green-500 hover:bg-green-600 text-white px-10 py-6 text-lg disabled:opacity-40 disabled:cursor-not-allowed"
             >
               <Play className="w-5 h-5 mr-2" />
-              {submitting ? "Starting…" : "Start Inference"}
+              {submitting
+                ? "Starting…"
+                : captureMode === "base"
+                  ? "Start Inference"
+                  : "Start Collecting"}
             </Button>
             <Button
               onClick={() => onOpenChange(false)}

@@ -131,6 +131,20 @@ export async function getExportProgress(
   );
 }
 
+export async function cancelJobExport(
+  baseUrl: string,
+  fetcher: Fetcher,
+  jobId: string,
+  step: number,
+): Promise<{ cancelled: boolean; message: string }> {
+  return apiRequest<{ cancelled: boolean; message: string }>(
+    baseUrl,
+    fetcher,
+    `/jobs/${jobId}/export-cancel/${step}`,
+    { method: "POST", action: "Cancel export" },
+  );
+}
+
 export async function resumeJob(
   baseUrl: string,
   fetcher: Fetcher,

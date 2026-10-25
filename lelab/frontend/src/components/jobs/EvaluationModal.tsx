@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/dialog";
 import { JobRecord } from "@/lib/jobsApi";
 import EvaluationCard from "@/components/jobs/EvaluationCard";
+import RolloutScoreCard from "@/components/jobs/RolloutScoreCard";
 
 interface Props {
   open: boolean;
@@ -22,7 +23,12 @@ const EvaluationModal: React.FC<Props> = ({ open, onOpenChange, job }) => (
           模型评测{job ? ` · ${job.name}` : ""}
         </DialogTitle>
       </DialogHeader>
-      {job ? <EvaluationCard job={job} /> : null}
+      {job ? (
+        <div className="space-y-4">
+          <EvaluationCard job={job} />
+          <RolloutScoreCard />
+        </div>
+      ) : null}
     </DialogContent>
   </Dialog>
 );

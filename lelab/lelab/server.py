@@ -69,12 +69,27 @@ from .record import (
 )
 from .rollout import (
     InferenceRequest,
+    TakeoverRequest,
     handle_inference_snapshot,
     handle_inference_status,
+    handle_inference_takeover,
     handle_start_inference,
     handle_stop_inference,
     inference_camera_frames,
 )
+from .rollout_eval import (
+    RolloutScoreRequest,
+    apply_intervention_exemption,
+    handle_compare_progress,
+    handle_rollout_score,
+    handle_rollout_score_status,
+    handle_rollout_summary,
+    list_capture_datasets,
+    promote_progress,
+)
+from .dataset_merge import MergeRequest, handle_merge, handle_merge_status, inspect_merge_sources
+from .ssh_remote_env import sarm_training_status as _sarm_training_status
+from .ssh_remote_env import start_sarm_training_remote as _start_sarm_training
 
 # Import our custom teleoperation functionality
 from .teleoperate import (
@@ -133,6 +148,8 @@ from .ssh_config import (
 from .ssh_remote_env import check_remote_environment as _check_remote_env
 from .ssh_remote_env import install_lerobot_remote as _install_lerobot
 from .ssh_remote_env import install_lerobot_remote_streaming as _install_lerobot_stream
+from .ssh_remote_env import reward_model_status as _reward_model_status
+from .ssh_remote_env import start_reward_model_download as _start_reward_model_download
 from .task_tracker import task_tracker
 from .training_monitor import analyze_training_health
 
@@ -394,12 +411,126 @@ def inference_snapshot():
     return result
 
 
+@app.post("/inference-takeover")
+def inference_takeover(request: TakeoverRequest):
+    """Drive the running data-collection strategy (pause / correct / stop)."""
+    result = handle_inference_takeover(request.action)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Takeover failed"),
+        )
+    return result
+
+
+@app.get("/rollout-datasets")
+def rollout_datasets():
+    """Local datasets holding policy rollouts, with scoring status."""
+    return {"datasets": list_capture_datasets()}
+
+
+@app.get("/rollout-summary")
+def rollout_summary(repo_id: str):
+    """Closed-loop success rate and per-episode progress for a rollout dataset."""
+    return handle_rollout_summary(repo_id)
+
+
+@app.post("/rollout-score")
+def rollout_score(request: RolloutScoreRequest):
+    """Score a rollout dataset with the progress model (writes sarm_progress.parquet)."""
+    result = handle_rollout_score(request)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Scoring failed"),
+        )
+    return result
+
+
+@app.get("/rollout-score-status")
+def rollout_score_status():
+    return handle_rollout_score_status()
+
+
+class RolloutRepoBody(BaseModel):
+    repo_id: str
+
+
+class RolloutBackendBody(BaseModel):
+    repo_id: str
+    backend: str = "robometer"
+
+
+class SSHConfigIdBody(BaseModel):
+    config_id: str
+
+
+class SarmTrainBody(BaseModel):
+    config_id: str
+    dataset_repo_id: str
+    image_key: str = "observation.images.up"
+    steps: int = 5000
+    batch_size: int = 32
+    push_repo_id: str = ""
+    use_cn_mirror: bool = True
+
+
+@app.get("/rollout-compare")
+def rollout_compare(repo_id: str):
+    """Agreement between the two scoring backends on the same episodes."""
+    return handle_compare_progress(repo_id)
+
+
+@app.post("/rollout-promote-progress")
+def rollout_promote_progress(body: RolloutBackendBody):
+    """Pick which backend's progress file training and the summary use."""
+    result = promote_progress(body.repo_id, body.backend)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Promote failed"),
+        )
+    return result
+
+
+@app.post("/ssh-configs/sarm-train")
+def ssh_sarm_train(body: SarmTrainBody):
+    """Train a task-specific SARM scorer on the pod (the second scoring backend)."""
+    return _start_sarm_training(
+        body.config_id,
+        body.dataset_repo_id,
+        image_key=body.image_key,
+        steps=body.steps,
+        batch_size=body.batch_size,
+        push_repo_id=body.push_repo_id,
+        use_cn_mirror=body.use_cn_mirror,
+    )
+
+
+@app.post("/ssh-configs/sarm-train-status")
+def ssh_sarm_train_status(body: SSHConfigIdBody):
+    return _sarm_training_status(body.config_id)
+
+
+@app.post("/rollout-exempt-interventions")
+def rollout_exempt_interventions(body: RolloutRepoBody):
+    """Lift correction windows in the progress file so RA-BC doesn't zero them."""
+    result = apply_intervention_exemption(body.repo_id)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Exemption failed"),
+        )
+    return result
+
+
 @app.get("/inference-camera-feed/{cam_key}")
 def inference_camera_feed(cam_key: str):
     """Live MJPEG preview of one camera during an active inference run.
 
-    Opens cameras independently via cv2 (secondary to the subprocess's primary
-    access). If V4L2 doesn't allow shared access, the preview silently fails.
+    Frames come from the preview files the rollout subprocess publishes; the
+    server only opens the cameras itself if those files go silent, since a
+    second open steals the device from the rollout on this machine.
     """
     from . import rollout as _rollout
 
@@ -552,6 +683,74 @@ def camera_feed(cam_key: str):
     )
 
 
+# A stream URL carries `user:password@`. Registering it once and addressing the
+# preview by token keeps those credentials out of `<img src>`, access logs and
+# browser history.
+_network_preview_sources: dict[str, tuple[str, float]] = {}
+_NETWORK_PREVIEW_TTL_S = 1800.0
+
+
+class NetworkCameraSource(BaseModel):
+    url: str
+
+
+def _remember_preview_source(url: str) -> str:
+    key = os.urandom(8).hex()
+    now = time.time()
+    for stale, (_, seen) in list(_network_preview_sources.items()):
+        if now - seen > _NETWORK_PREVIEW_TTL_S:
+            _network_preview_sources.pop(stale, None)
+    _network_preview_sources[key] = (url, now)
+    return key
+
+
+@app.post("/network-camera-source")
+def register_network_camera_source(body: NetworkCameraSource):
+    """Validate a stream URL and report what it sends, for the camera picker.
+
+    The resolution and frame rate are the *stream's*, not whatever was typed into
+    the form: they become the dataset's image features, and an IP camera won't
+    switch to a resolution it wasn't configured to encode.
+    """
+    from .network_camera import NetworkCameraError, normalize_url, probe, redact
+
+    try:
+        url = normalize_url(body.url)
+    except NetworkCameraError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    try:
+        stream = probe(url)
+    except NetworkCameraError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "status": "success",
+        "key": _remember_preview_source(url),
+        "url": redact(url),
+        **stream,
+    }
+
+
+@app.get("/network-camera-feed")
+def network_camera_feed(key: str):
+    """Live MJPEG preview of a registered stream URL.
+
+    Independent of any session: RTSP takes several client sessions, so the picker
+    can watch a camera while a recording or inference run holds its own copy.
+    """
+    from .network_camera import preview_frames
+
+    source = _network_preview_sources.get(key)
+    if source is None:
+        raise HTTPException(status_code=404, detail="Unknown preview key — re-register the camera URL")
+    _network_preview_sources[key] = (source[0], time.time())
+    return StreamingResponse(
+        preview_frames(source[0]),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
 @app.post("/recording-exit-early")
 def recording_exit_early():
     """Skip to next episode (replaces right arrow key)"""
@@ -625,6 +824,33 @@ def delete_dataset(request: DatasetInfoRequest):
 def delete_episode(request: DeleteEpisodeRequest):
     """Remove a single episode from a local dataset."""
     return handle_delete_episode(request)
+
+
+class MergeCheckBody(BaseModel):
+    sources: list[str]
+
+
+@app.post("/dataset-merge-check")
+def dataset_merge_check(body: MergeCheckBody):
+    """Report each source's facts and what would block merging them."""
+    return inspect_merge_sources(body.sources)
+
+
+@app.post("/dataset-merge")
+def dataset_merge(request: MergeRequest):
+    """Merge local datasets into one training set (lerobot can't train on many)."""
+    result = handle_merge(request)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Merge failed"),
+        )
+    return result
+
+
+@app.get("/dataset-merge-status")
+def dataset_merge_status():
+    return handle_merge_status()
 
 
 @app.post("/check-dataset-health")
@@ -931,6 +1157,12 @@ def get_export_progress(job_id: str, step: int):
     return job_registry.get_export_progress(job_id, step)
 
 
+@app.post("/jobs/{job_id}/export-cancel/{step}")
+def cancel_export_checkpoint(job_id: str, step: int):
+    """Request cancellation of an in-flight checkpoint download."""
+    return job_registry.cancel_export(job_id, step)
+
+
 class ValidationOptions(BaseModel):
     """Sampling knobs for the offline evaluator. Omit the body for the defaults."""
 
@@ -961,6 +1193,20 @@ def start_job_validation(job_id: str, options: ValidationOptions | None = None):
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/jobs/{job_id}/validate/stop")
+def stop_job_validation(job_id: str):
+    """Cancel a running offline evaluation for a job.
+
+    Sets the worker's cancel flag; the evaluation aborts at its next batch
+    boundary (SSH runs also kill the remote process) and the job returns to the
+    idle ``none`` validation state.
+    """
+    try:
+        return job_registry.stop_validation(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
 
 
 @app.get("/jobs/{job_id}/evaluation/artifact")
@@ -1174,6 +1420,24 @@ def ssh_configs_test(body: SSHTestBody):
 def ssh_check_env(body: SSHRemoteEnvBody):
     """Check remote environment: lerobot, CUDA, Python version, disk space."""
     return _check_remote_env(body.config_id)
+
+
+class SSHRewardModelBody(BaseModel):
+    config_id: str
+    # The scoring model is ~18 GB; domestic links usually need the mirror.
+    use_cn_mirror: bool = True
+
+
+@app.post("/ssh-configs/reward-model-status")
+def ssh_reward_model_status(body: SSHRewardModelBody):
+    """Whether the rollout-scoring model is already on the pod."""
+    return _reward_model_status(body.config_id)
+
+
+@app.post("/ssh-configs/download-reward-model")
+def ssh_download_reward_model(body: SSHRewardModelBody):
+    """Start the scoring-model download on the pod (detached, polled via status)."""
+    return _start_reward_model_download(body.config_id, use_cn_mirror=body.use_cn_mirror)
 
 
 @app.post("/ssh-configs/install-lerobot")

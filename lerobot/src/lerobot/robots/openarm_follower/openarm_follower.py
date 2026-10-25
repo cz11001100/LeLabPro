@@ -19,11 +19,11 @@ import time
 from functools import cached_property
 from typing import Any
 
-from lerobot.cameras.utils import make_cameras_from_configs
+from lerobot.cameras import make_cameras_from_configs
 from lerobot.motors import Motor, MotorCalibration, MotorNormMode
 from lerobot.motors.damiao import DamiaoMotorsBus
-from lerobot.processor import RobotAction, RobotObservation
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.types import RobotAction, RobotObservation
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
 from ..utils import ensure_safe_goal_position
@@ -93,16 +93,22 @@ class OpenArmFollower(Robot):
         features: dict[str, type] = {}
         for motor in self.bus.motors:
             features[f"{motor}.pos"] = float
-            features[f"{motor}.vel"] = float  # Add this
-            features[f"{motor}.torque"] = float  # Add this
+            if self.config.use_velocity_and_torque:
+                features[f"{motor}.vel"] = float
+                features[f"{motor}.torque"] = float
         return features
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
         """Camera features for observation space."""
-        return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
-        }
+        features: dict[str, tuple] = {}
+        for cam in self.cameras:
+            cfg = self.config.cameras[cam]
+            if getattr(cfg, "use_rgb", True):
+                features[cam] = (cfg.height, cfg.width, 3)
+            if getattr(cfg, "use_depth", False):
+                features[f"{cam}_depth"] = (cfg.height, cfg.width, 1)
+        return features
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
@@ -119,6 +125,7 @@ class OpenArmFollower(Robot):
         """Check if robot is connected."""
         return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
+    @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
         """
         Connect to the robot and optionally calibrate.
@@ -126,8 +133,6 @@ class OpenArmFollower(Robot):
         We assume that at connection time, the arms are in a safe rest position,
         and torque can be safely disabled to run calibration if needed.
         """
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} already connected")
 
         # Connect to CAN bus
         logger.info(f"Connecting arm on {self.config.port}...")
@@ -219,6 +224,7 @@ class OpenArmFollower(Robot):
             "Motor ID configuration is typically done via manufacturer tools for CAN motors."
         )
 
+    @check_if_not_connected
     def get_observation(self) -> RobotObservation:
         """
         Get current observation from robot including position, velocity, and torque.
@@ -228,9 +234,6 @@ class OpenArmFollower(Robot):
         """
         start = time.perf_counter()
 
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
-
         obs_dict: dict[str, Any] = {}
 
         states = self.bus.sync_read_all_states()
@@ -238,21 +241,30 @@ class OpenArmFollower(Robot):
         for motor in self.bus.motors:
             state = states.get(motor, {})
             obs_dict[f"{motor}.pos"] = state.get("position", 0.0)
-            obs_dict[f"{motor}.vel"] = state.get("velocity", 0.0)
-            obs_dict[f"{motor}.torque"] = state.get("torque", 0.0)
+            if self.config.use_velocity_and_torque:
+                obs_dict[f"{motor}.vel"] = state.get("velocity", 0.0)
+                obs_dict[f"{motor}.torque"] = state.get("torque", 0.0)
 
         # Capture images from cameras
         for cam_key, cam in self.cameras.items():
-            start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
-            dt_ms = (time.perf_counter() - start) * 1e3
-            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+            if getattr(cam, "use_rgb", True):
+                start = time.perf_counter()
+                obs_dict[cam_key] = cam.read_latest()
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
+
+            if getattr(cam, "use_depth", False):
+                start = time.perf_counter()
+                obs_dict[f"{cam_key}_depth"] = cam.read_latest_depth()
+                dt_ms = (time.perf_counter() - start) * 1e3
+                logger.debug(f"{self} read {cam_key} depth: {dt_ms:.1f}ms")
 
         dt_ms = (time.perf_counter() - start) * 1e3
         logger.debug(f"{self} get_observation took: {dt_ms:.1f}ms")
 
         return obs_dict
 
+    @check_if_not_connected
     def send_action(
         self,
         action: RobotAction,
@@ -272,8 +284,6 @@ class OpenArmFollower(Robot):
         Returns:
             The action actually sent (potentially clipped)
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         goal_pos = {key.removesuffix(".pos"): val for key, val in action.items() if key.endswith(".pos")}
 
@@ -333,10 +343,9 @@ class OpenArmFollower(Robot):
 
         return {f"{motor}.pos": val for motor, val in goal_pos.items()}
 
+    @check_if_not_connected
     def disconnect(self):
         """Disconnect from robot."""
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         # Disconnect CAN bus
         self.bus.disconnect(self.config.disable_torque_on_disconnect)

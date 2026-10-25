@@ -108,6 +108,10 @@ class JobRecord(BaseModel):
     # evidence the training stopped, so the watchdog keeps re-attaching the job.
     remote_unconfirmed: bool = False
     reconcile_attempts: int = 0
+    # SSH/cloud only: steps whose checkpoint has been downloaded to local via
+    # export_checkpoint. Persisted so the job card can keep showing a
+    # "已下载到本地" status across reloads and server restarts.
+    exported_steps: list[int] = []
 
 
 class JobCheckpoint(BaseModel):
@@ -854,6 +858,10 @@ class JobNotRunningError(Exception):
     """Raised when stop() is called on a non-running job."""
 
 
+class _ExportCancelled(Exception):
+    """Internal signal: an in-flight SFTP checkpoint download was cancelled."""
+
+
 class JobRegistry:
     """Owns the registry of training jobs and their persistence.
 
@@ -891,6 +899,14 @@ class JobRegistry:
         # The export POST does not return until the download finishes, so the
         # UI polls get_export_progress() while that request is in flight.
         self._export_progress: dict[str, dict] = {}
+
+        # Cancellation signals for in-flight background work, keyed by:
+        #   "validate:{job_id}"            -> offline evaluation thread
+        #   "export:{job_id}:{step}"       -> blocking SFTP checkpoint download
+        # A stop request sets the event; the running worker notices it at its
+        # next checkpoint boundary and aborts (SSH validation also kills the
+        # remote process).
+        self._cancel_events: dict[str, threading.Event] = {}
 
         # Fired (best-effort) on every state change: new job, stop initiated,
         # watchdog finalisation, delete. Server wires this to a WebSocket
@@ -1572,8 +1588,13 @@ class JobRegistry:
         local_dir = _job_dir(self._output_root, import_id) / "model"
         local_dir.mkdir(parents=True, exist_ok=True)
 
+        cancel_event = threading.Event()
+        with self._lock:
+            self._cancel_events[key] = cancel_event
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        cancelled = False
         try:
             connect_kwargs: dict = {
                 "hostname": cfg.host,
@@ -1588,22 +1609,46 @@ class JobRegistry:
             client.connect(**connect_kwargs)
             sftp = client.open_sftp()
             try:
-                self._sftp_download_dir(sftp, remote_ckpt_dir, str(local_dir), key)
+                self._sftp_download_dir(sftp, remote_ckpt_dir, str(local_dir), key, cancel_event)
             finally:
                 sftp.close()
+        except _ExportCancelled:
+            cancelled = True
+            self._set_export_progress(key, state="failed", error="下载已取消")
+            with contextlib.suppress(Exception):
+                shutil.rmtree(local_dir.parent, ignore_errors=True)
         except Exception as exc:
             self._set_export_progress(key, state="failed", error=str(exc))
             raise
         finally:
             client.close()
+            with self._lock:
+                self._cancel_events.pop(key, None)
+
+        if cancelled:
+            # Return the source record unchanged; nothing was registered.
+            return record
 
         self._set_export_progress(key, state="done", current_file="")
         # Register as imported job
         imported = self.register_imported(str(local_dir), name=f"{record.name} (step {step})")
+        # Record the download on the source (SSH/cloud) job so its card keeps a
+        # persistent "已下载到本地" status even after the progress bar clears.
+        with self._lock:
+            fresh = self._records.get(job_id)
+            if fresh is not None and step not in fresh.exported_steps:
+                fresh.exported_steps = sorted([*fresh.exported_steps, step])
+                self._persist(fresh, force=True)
         return imported
 
-    def _sftp_download_dir(self, sftp, remote_dir: str, local_dir: str, key: str) -> None:
-        """Recursively download a directory via SFTP, publishing byte progress."""
+    def _sftp_download_dir(
+        self, sftp, remote_dir: str, local_dir: str, key: str, cancel_event: threading.Event
+    ) -> None:
+        """Recursively download a directory via SFTP, publishing byte progress.
+
+        Checks ``cancel_event`` between files (a single in-flight ``sftp.get``
+        is not interruptible) and raises ``_ExportCancelled`` when set.
+        """
         files = self._sftp_collect_files(sftp, remote_dir)
         self._set_export_progress(
             key, state="downloading", total_bytes=sum(size for _, _, size in files)
@@ -1614,6 +1659,8 @@ class JobRegistry:
         done = 0
         Path(local_dir).mkdir(parents=True, exist_ok=True)
         for remote_path, rel, size in files:
+            if cancel_event.is_set():
+                raise _ExportCancelled()
             local_path = Path(local_dir) / rel
             local_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1628,6 +1675,17 @@ class JobRegistry:
             sftp.get(remote_path, str(local_path), callback=on_bytes)
             done += size
             self._set_export_progress(key, transferred_bytes=done, current_file=rel)
+
+    def cancel_export(self, job_id: str, step: int) -> dict:
+        """Request cancellation of an in-flight checkpoint download."""
+        key = self._export_key(job_id, step)
+        with self._lock:
+            evt = self._cancel_events.get(key)
+            if evt is not None:
+                evt.set()
+        if evt is None:
+            return {"cancelled": False, "message": "没有正在进行的下载"}
+        return {"cancelled": True, "message": "正在取消下载…"}
 
     @staticmethod
     def _sftp_collect_files(sftp, remote_dir: str, prefix: str = "") -> list[tuple[str, str, int]]:
@@ -1722,6 +1780,8 @@ class JobRegistry:
             record.validation_state = "running"
             record.validation_results = None
             self._persist(record, force=True)
+            cancel_event = threading.Event()
+            self._cancel_events[f"validate:{job_id}"] = cancel_event
 
         self._notify_change()
         dataset_repo_id = record.config.dataset_repo_id
@@ -1762,6 +1822,7 @@ class JobRegistry:
             dataset_repo_id = str(opts["dataset_repo_id"])
 
         def _finalize(results: dict) -> None:
+            cancelled = bool(results.get("cancelled"))
             # Charts come back as bare filenames inside chart_dir; store them
             # relative to the job directory so the serving route stays inside it.
             charts = results.pop("charts", None)
@@ -1773,8 +1834,13 @@ class JobRegistry:
             with self._lock:
                 rec = self._records.get(job_id)
                 if rec is not None:
-                    rec.validation_state = "done" if results.get("success") else "failed"
-                    rec.validation_results = results
+                    if cancelled:
+                        # A stop request: return the job to idle with no results.
+                        rec.validation_state = "none"
+                        rec.validation_results = None
+                    else:
+                        rec.validation_state = "done" if results.get("success") else "failed"
+                        rec.validation_results = results
                     self._persist(rec, force=True)
             self._notify_change()
 
@@ -1786,6 +1852,7 @@ class JobRegistry:
                         remote_checkpoint=latest.ref,
                         dataset_repo_id=dataset_repo_id,
                         job_id=job_id,
+                        cancel_event=cancel_event,
                         **eval_kwargs,
                     )
                 else:
@@ -1795,6 +1862,7 @@ class JobRegistry:
                         checkpoint_path=latest.ref,
                         dataset_repo_id=dataset_repo_id,
                         output_dir=str(chart_dir),
+                        cancel_event=cancel_event,
                         **eval_kwargs,
                     )
                 _finalize(results)
@@ -1803,9 +1871,33 @@ class JobRegistry:
                 error_details = f"{str(e)}\n\n{traceback.format_exc()}"
                 logger.error("Validation failed for job %s:\n%s", job_id, error_details)
                 _finalize({"error": str(e), "traceback": traceback.format_exc()})
+            finally:
+                with self._lock:
+                    self._cancel_events.pop(f"validate:{job_id}", None)
 
         threading.Thread(target=_run, daemon=True, name=f"validate-{job_id}").start()
         return {"validation_state": "running", "message": "Validation started"}
+
+    def stop_validation(self, job_id: str) -> dict:
+        """Request cancellation of a running offline evaluation for ``job_id``.
+
+        Sets the cancel event so the worker aborts at its next batch boundary
+        (SSH runs additionally kill the remote process). Returns immediately;
+        the state flips to "none" once the worker notices.
+        """
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            if record.validation_state != "running":
+                return {
+                    "validation_state": record.validation_state,
+                    "message": "没有正在进行的评测",
+                }
+            evt = self._cancel_events.get(f"validate:{job_id}")
+            if evt is not None:
+                evt.set()
+        return {"validation_state": "running", "message": "正在停止评测…"}
 
     def _run_ssh_validation(
         self,
@@ -1822,6 +1914,7 @@ class JobRegistry:
         device: str = "cuda",
         saliency_frames: int = 0,
         aim_frames: int = 0,
+        cancel_event: threading.Event | None = None,
     ) -> dict:
         """Run validate.py on the remote SSH machine and stream back the result.
 
@@ -1910,6 +2003,20 @@ class JobRegistry:
             result_json: dict | None = None
             while time.time() < deadline:
                 time.sleep(5)
+                if cancel_event is not None and cancel_event.is_set():
+                    # Stop requested: kill the remote validate process (the
+                    # nohup'd bash plus its python child, matched by script path)
+                    # and report cancellation.
+                    with contextlib.suppress(Exception):
+                        if client.get_transport() is None or not client.get_transport().is_active():
+                            client.close()
+                            client = _connect()
+                        kill_cmd = f"pkill -f {remote_script}; "
+                        if pid_out.isdigit():
+                            kill_cmd += f"kill {pid_out} 2>/dev/null; "
+                        kill_cmd += "true"
+                        client.exec_command(kill_cmd, timeout=15)
+                    return {"success": False, "cancelled": True, "error": "评测已取消"}
                 try:
                     if client.get_transport() is None or not client.get_transport().is_active():
                         with contextlib.suppress(Exception):

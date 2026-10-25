@@ -176,6 +176,17 @@ class TrainingRequest(BaseModel):
     augmentation_sharpness: bool = True
     augmentation_affine: bool = True
 
+    # RA-BC sample weighting: per-frame loss weights derived from task progress
+    # (delta = progress[t+chunk] - progress[t]), so frames where the recorded
+    # action moved the task backwards contribute nothing. Needs a progress
+    # parquet next to the dataset (see lelab.rollout_eval); lerobot auto-finds
+    # `<dataset root>/sarm_progress.parquet` when no path is given.
+    sample_weighting_enable: bool = False
+    sample_weighting_type: str = "rabc"
+    sample_weighting_progress_path: str | None = None
+    sample_weighting_kappa: float | None = None
+    sample_weighting_head_mode: str | None = None
+
     # Optimizer — None = defer to the policy's training preset (e.g. SmolVLA
     # uses AdamW lr=1e-4/betas=(0.9,0.95)). lerobot applies the preset only on
     # fresh runs; on a *resume* an explicit flag here would win, so always
@@ -386,6 +397,18 @@ def build_training_command(
         cmd.extend(["--scheduler.num_decay_steps", str(request.scheduler_decay_steps)])
     if request.scheduler_decay_lr is not None:
         cmd.extend(["--scheduler.decay_lr", str(request.scheduler_decay_lr)])
+
+    # RA-BC weighting (off unless asked for: it silently changes the objective).
+    # `sample_weighting` is Optional on lerobot's side and has no `enable`
+    # field — the config object exists exactly when we pass one of its fields.
+    if request.sample_weighting_enable:
+        cmd.extend(["--training.sample_weighting.type", request.sample_weighting_type])
+        if request.sample_weighting_progress_path:
+            cmd.extend(["--training.sample_weighting.progress_path", request.sample_weighting_progress_path])
+        if request.sample_weighting_kappa is not None:
+            cmd.extend(["--training.sample_weighting.kappa", str(request.sample_weighting_kappa)])
+        if request.sample_weighting_head_mode:
+            cmd.extend(["--training.sample_weighting.head_mode", request.sample_weighting_head_mode])
 
     # Advanced
     cmd.extend(["--use_policy_training_preset", "true" if request.use_policy_training_preset else "false"])

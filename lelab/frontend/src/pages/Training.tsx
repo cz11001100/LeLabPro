@@ -144,6 +144,12 @@ function configToRequest(c: TrainingConfig): TrainingRequest {
     augmentation_hue: c.augmentation_hue,
     augmentation_sharpness: c.augmentation_sharpness,
     augmentation_affine: c.augmentation_affine,
+    // RA-BC sample weighting
+    sample_weighting_enable: c.sample_weighting_enable,
+    sample_weighting_type: "rabc",
+    sample_weighting_progress_path: c.sample_weighting_progress_path || undefined,
+    sample_weighting_kappa: c.sample_weighting_kappa,
+    sample_weighting_head_mode: c.sample_weighting_head_mode,
     // GR00T-specific. Only forward the policy_* fields for groot so other
     // policies never receive flags their config doesn't define.
     dataset_image_transforms_enable: c.dataset_image_transforms_enable,
@@ -201,6 +207,8 @@ const ConfigurationMode: React.FC = () => {
     augmentation_hue: true,
     augmentation_sharpness: true,
     augmentation_affine: true,
+    sample_weighting_enable: false,
+    sample_weighting_head_mode: "sparse",
   });
 
   const [datasets, setDatasets] = useState<DatasetItem[]>([]);

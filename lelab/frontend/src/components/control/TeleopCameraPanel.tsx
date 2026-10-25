@@ -6,7 +6,7 @@ import { Switch } from "@/components/ui/switch";
 import { useRobots } from "@/hooks/useRobots";
 import { useBrowserCameras } from "@/hooks/useBrowserCameras";
 import { useCameraStream } from "@/hooks/useCameraStream";
-import CameraFeed from "./CameraFeed";
+import CameraFeed, { StreamCameraFeed } from "./CameraFeed";
 
 /**
  * Optional live camera panel for the teleoperation page. Off by default so we
@@ -65,12 +65,19 @@ const TeleopCameraPanel: React.FC = () => {
       if (!deviceId && manualAssignments[c.id]) {
         deviceId = manualAssignments[c.id];
       }
-      return { key: c.id, name: c.name, deviceId };
+      return {
+        key: c.id,
+        name: c.name,
+        deviceId,
+        // A stream source previews through the backend instead of getUserMedia.
+        url: c.type === "network" || c.url ? c.url : undefined,
+      };
     });
   }, [configured, manualAssignments]);
 
   const permissionDenied = permissionState === "denied" || browserPermissionDenied;
-  const unassignedFeeds = feeds.filter((f) => !f.deviceId);
+  const unassignedFeeds = feeds.filter((f) => !f.deviceId && !f.url);
+  const hasBrowserFeeds = feeds.some((f) => !!f.deviceId);
 
   // Browser cameras not yet assigned to any robot camera — these are the
   // candidates shown in the visual picker grid.
@@ -162,7 +169,7 @@ const TeleopCameraPanel: React.FC = () => {
       </div>
 
       {enabled ? (
-        permissionDenied ? (
+        permissionDenied && hasBrowserFeeds ? (
           <div className="flex flex-col items-center gap-3 py-6 text-center">
             <CameraOff className="w-10 h-10 text-amber-500" />
             <div className="space-y-1">
@@ -186,6 +193,16 @@ const TeleopCameraPanel: React.FC = () => {
           </div>
         ) : feeds.length > 0 ? (
           <div className="flex flex-col gap-3 overflow-y-auto">
+            {feeds
+              .filter((f) => f.url)
+              .map((feed) => (
+                <StreamCameraFeed
+                  key={`stream:${feed.key}:${reloadKey}`}
+                  url={feed.url!}
+                  label={feed.name}
+                />
+              ))}
+
             {feeds.filter((f) => f.deviceId).map((feed) => (
               <CameraFeed
                 key={`${feed.key}:${reloadKey}`}

@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { JobRecord, startJobValidation, ValidationState } from "@/lib/jobsApi";
+import { JobRecord, startJobValidation, stopJobValidation, ValidationState } from "@/lib/jobsApi";
 import {
   Square,
   X,
@@ -25,6 +25,7 @@ import {
   listJobCheckpoints,
   getExportProgress,
   ExportProgress,
+  cancelJobExport,
 } from "@/lib/checkpointsApi";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 
@@ -236,9 +237,45 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
     }
   };
 
+  const handleStopValidate = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setValidating(true);
+    try {
+      await stopJobValidation(baseUrl, fetchWithHeaders, job.id);
+      toast({ title: "正在停止评测…" });
+    } catch (err) {
+      toast({
+        title: "停止失败",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    } finally {
+      setValidating(false);
+    }
+  };
+
+  const handleCancelExport = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (selectedStep == null) return;
+    try {
+      await cancelJobExport(baseUrl, fetchWithHeaders, job.id, selectedStep);
+      toast({ title: "正在取消下载…" });
+    } catch (err) {
+      toast({
+        title: "取消失败",
+        description: err instanceof Error ? err.message : String(err),
+        variant: "destructive",
+      });
+    }
+  };
+
   const showProgressBar = isRunning;
   const showInferenceRow = checkpoints.length > 0 && selectedStep != null;
   const isSSH = job.runner === "ssh";
+  // Persistent "downloaded to local" state for the selected checkpoint, read
+  // from the source job record so it survives reloads and server restarts.
+  const isDownloaded =
+    isSSH && selectedStep != null && (job.exported_steps ?? []).includes(selectedStep);
   const exportPct =
     !exportProgress || exportProgress.state === "failed"
       ? 0
@@ -377,19 +414,42 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
               </Button>
             ) : null}
             {isSSH && onExport ? (
-              <Button
-                size="icon"
-                onClick={handleExport}
-                disabled={exporting}
-                className="h-8 w-8 bg-blue-500 hover:bg-blue-600 text-white"
-                aria-label="Export checkpoint to local"
-              >
-                {exporting ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Download className="w-4 h-4" />
-                )}
-              </Button>
+              <>
+                <Button
+                  size="icon"
+                  onClick={handleExport}
+                  disabled={exporting}
+                  className={`h-8 w-8 text-white ${
+                    isDownloaded
+                      ? "bg-green-600 hover:bg-green-500"
+                      : "bg-blue-500 hover:bg-blue-600"
+                  }`}
+                  aria-label={isDownloaded ? "重新下载到本地" : "下载 checkpoint 到本地"}
+                  title={isDownloaded ? "已下载到本地（点击重新下载）" : "下载到本地"}
+                >
+                  {exporting ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : isDownloaded ? (
+                    <CheckCircle2 className="w-4 h-4" />
+                  ) : (
+                    <Download className="w-4 h-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  onClick={exporting ? handleCancelExport : undefined}
+                  disabled={!exporting}
+                  className={`h-8 w-8 ${
+                    exporting
+                      ? "bg-red-500 hover:bg-red-600 text-white"
+                      : "bg-slate-700 text-slate-500 cursor-not-allowed"
+                  }`}
+                  aria-label="取消下载"
+                  title={exporting ? "正在下载，点击取消" : "无进行中的下载"}
+                >
+                  <Square className="w-4 h-4" />
+                </Button>
+              </>
             ) : null}
             {showInferenceRow ? (
               <Button
@@ -402,19 +462,39 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
               </Button>
             ) : null}
             {canValidate ? (
-              <Button
-                size="icon"
-                onClick={handleValidate}
-                disabled={validating || vState === "running"}
-                className="h-8 w-8 bg-purple-500 hover:bg-purple-600 text-white"
-                aria-label="Validate model"
-              >
-                {validating || vState === "running" ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <FlaskConical className="w-4 h-4" />
-                )}
-              </Button>
+              <>
+                <Button
+                  size="icon"
+                  onClick={handleValidate}
+                  disabled={validating || vState === "running"}
+                  className="h-8 w-8 bg-purple-500 hover:bg-purple-600 text-white"
+                  aria-label="Validate model"
+                >
+                  {validating || vState === "running" ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <FlaskConical className="w-4 h-4" />
+                  )}
+                </Button>
+                <Button
+                  size="icon"
+                  onClick={vState === "running" ? handleStopValidate : undefined}
+                  disabled={vState !== "running" || validating}
+                  className={`h-8 w-8 ${
+                    vState === "running"
+                      ? "bg-red-500 hover:bg-red-600 text-white"
+                      : "bg-slate-700 text-slate-500 cursor-not-allowed"
+                  }`}
+                  aria-label="停止评测"
+                  title={vState === "running" ? "正在评测，点击停止" : "无进行中的评测"}
+                >
+                  {validating ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <Square className="w-4 h-4" />
+                  )}
+                </Button>
+              </>
             ) : null}
           </div>
         ) : null}

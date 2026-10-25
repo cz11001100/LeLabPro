@@ -16,6 +16,9 @@ import logging
 from copy import deepcopy
 from enum import Enum
 from pprint import pformat
+from typing import TYPE_CHECKING
+
+from lerobot.utils.import_utils import _feetech_sdk_available, require_package
 
 from ..encoding_utils import decode_sign_magnitude, encode_sign_magnitude
 from ..motors_bus import Motor, MotorCalibration, NameOrID, SerialMotorsBus, Value, get_address
@@ -32,9 +35,14 @@ from .tables import (
     SCAN_BAUDRATES,
 )
 
+if TYPE_CHECKING or _feetech_sdk_available:
+    import scservo_sdk as scs
+else:
+    scs = None
+
 DEFAULT_PROTOCOL_VERSION = 0
 DEFAULT_BAUDRATE = 1_000_000
-DEFAULT_TIMEOUT_MS = 2000  # Increased from 1000ms to handle communication delays
+DEFAULT_TIMEOUT_MS = 1000
 
 NORMALIZED_DATA = ["Goal_Position", "Present_Position"]
 
@@ -63,23 +71,6 @@ class DriveMode(Enum):
 class TorqueMode(Enum):
     ENABLED = 1
     DISABLED = 0
-
-
-def _split_into_byte_chunks(value: int, length: int) -> list[int]:
-    import scservo_sdk as scs
-
-    if length == 1:
-        data = [value]
-    elif length == 2:
-        data = [scs.SCS_LOBYTE(value), scs.SCS_HIBYTE(value)]
-    elif length == 4:
-        data = [
-            scs.SCS_LOBYTE(scs.SCS_LOWORD(value)),
-            scs.SCS_HIBYTE(scs.SCS_LOWORD(value)),
-            scs.SCS_LOBYTE(scs.SCS_HIWORD(value)),
-            scs.SCS_HIBYTE(scs.SCS_HIWORD(value)),
-        ]
-    return data
 
 
 def patch_setPacketTimeout(self, packet_length):  # noqa: N802
@@ -119,14 +110,13 @@ class FeetechMotorsBus(SerialMotorsBus):
         calibration: dict[str, MotorCalibration] | None = None,
         protocol_version: int = DEFAULT_PROTOCOL_VERSION,
     ):
+        require_package("feetech-servo-sdk", extra="feetech", import_name="scservo_sdk")
         super().__init__(port, motors, calibration)
         self.protocol_version = protocol_version
         self._assert_same_protocol()
-        import scservo_sdk as scs
-
         self.port_handler = scs.PortHandler(self.port)
         # HACK: monkeypatch
-        self.port_handler.setPacketTimeout = patch_setPacketTimeout.__get__(
+        self.port_handler.setPacketTimeout = patch_setPacketTimeout.__get__(  # type: ignore[method-assign]
             self.port_handler, scs.PortHandler
         )
         self.packet_handler = scs.PacketHandler(protocol_version)
@@ -195,8 +185,6 @@ class FeetechMotorsBus(SerialMotorsBus):
         raise RuntimeError(f"Motor '{motor}' (model '{model}') was not found. Make sure it is connected.")
 
     def _find_single_motor_p1(self, motor: str, initial_baudrate: int | None = None) -> tuple[int, int]:
-        import scservo_sdk as scs
-
         model = self.motors[motor].model
         search_baudrates = (
             [initial_baudrate] if initial_baudrate is not None else self.model_baudrate_table[model]
@@ -228,29 +216,33 @@ class FeetechMotorsBus(SerialMotorsBus):
                 self.write("Maximum_Acceleration", motor, maximum_acceleration)
             self.write("Acceleration", motor, acceleration)
 
+            # Clear bit 4 (0x10) of the Phase register (0x12) to set angle feedback mode to 0.
+            # This forces position readings to be in the range [0, resolution - 1] and prevents overflow or negative values.
+            # Only known to be necessary for the STS3215.
+            if self.motors[motor].model == "sts3215":
+                phase = self.read("Phase", motor, normalize=False)
+                if phase & 0x10:
+                    self.write("Phase", motor, phase & ~0x10)
+
     @property
     def is_calibrated(self) -> bool:
-        try:
-            motors_calibration = self.read_calibration()
-            if set(motors_calibration) != set(self.calibration):
-                return False
+        motors_calibration = self.read_calibration()
+        if set(motors_calibration) != set(self.calibration):
+            return False
 
-            same_ranges = all(
-                self.calibration[motor].range_min == cal.range_min
-                and self.calibration[motor].range_max == cal.range_max
-                for motor, cal in motors_calibration.items()
-            )
-            if self.protocol_version == 1:
-                return same_ranges
+        same_ranges = all(
+            self.calibration[motor].range_min == cal.range_min
+            and self.calibration[motor].range_max == cal.range_max
+            for motor, cal in motors_calibration.items()
+        )
+        if self.protocol_version == 1:
+            return same_ranges
 
-            same_offsets = all(
-                self.calibration[motor].homing_offset == cal.homing_offset
-                for motor, cal in motors_calibration.items()
-            )
-            return same_ranges and same_offsets
-        except ConnectionError as e:
-            logger.warning(f"Failed to read calibration from motors: {e}. Assuming calibrated.")
-            return True
+        same_offsets = all(
+            self.calibration[motor].homing_offset == cal.homing_offset
+            for motor, cal in motors_calibration.items()
+        )
+        return same_ranges and same_offsets
 
     def read_calibration(self) -> dict[str, MotorCalibration]:
         offsets, mins, maxes = {}, {}, {}
@@ -266,9 +258,9 @@ class FeetechMotorsBus(SerialMotorsBus):
             calibration[motor] = MotorCalibration(
                 id=m.id,
                 drive_mode=0,
-                homing_offset=offsets[motor],
-                range_min=mins[motor],
-                range_max=maxes[motor],
+                homing_offset=int(offsets[motor]),
+                range_min=int(mins[motor]),
+                range_max=int(maxes[motor]),
             )
 
         return calibration
@@ -288,7 +280,7 @@ class FeetechMotorsBus(SerialMotorsBus):
         On Feetech Motors:
         Present_Position = Actual_Position - Homing_Offset
         """
-        half_turn_homings = {}
+        half_turn_homings: dict[NameOrID, Value] = {}
         for motor, pos in positions.items():
             model = self._get_motor_model(motor)
             max_res = self.model_resolution_table[model] - 1
@@ -296,7 +288,7 @@ class FeetechMotorsBus(SerialMotorsBus):
 
         return half_turn_homings
 
-    def disable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def disable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.DISABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 0, num_retry=num_retry)
@@ -307,7 +299,7 @@ class FeetechMotorsBus(SerialMotorsBus):
         addr, length = get_address(self.model_ctrl_table, model, "Lock")
         self._write(addr, length, motor, 0, num_retry=num_retry)
 
-    def enable_torque(self, motors: str | list[str] | None = None, num_retry: int = 0) -> None:
+    def enable_torque(self, motors: int | str | list[str] | None = None, num_retry: int = 0) -> None:
         for motor in self._get_motors_list(motors):
             self.write("Torque_Enable", motor, TorqueMode.ENABLED.value, num_retry=num_retry)
             self.write("Lock", motor, 1, num_retry=num_retry)
@@ -333,12 +325,21 @@ class FeetechMotorsBus(SerialMotorsBus):
         return ids_values
 
     def _split_into_byte_chunks(self, value: int, length: int) -> list[int]:
-        return _split_into_byte_chunks(value, length)
+        if length == 1:
+            data = [value]
+        elif length == 2:
+            data = [scs.SCS_LOBYTE(value), scs.SCS_HIBYTE(value)]
+        elif length == 4:
+            data = [
+                scs.SCS_LOBYTE(scs.SCS_LOWORD(value)),
+                scs.SCS_HIBYTE(scs.SCS_LOWORD(value)),
+                scs.SCS_LOBYTE(scs.SCS_HIWORD(value)),
+                scs.SCS_HIBYTE(scs.SCS_HIWORD(value)),
+            ]
+        return data
 
     def _broadcast_ping(self) -> tuple[dict[int, int], int]:
-        import scservo_sdk as scs
-
-        data_list = {}
+        data_list: dict[int, int] = {}
 
         status_length = 6
 
@@ -418,7 +419,7 @@ class FeetechMotorsBus(SerialMotorsBus):
         if not self._is_comm_success(comm):
             if raise_on_error:
                 raise ConnectionError(self.packet_handler.getTxRxResult(comm))
-            return
+            return None
 
         ids_errors = {id_: status for id_, status in ids_status.items() if self._is_error(status)}
         if ids_errors:

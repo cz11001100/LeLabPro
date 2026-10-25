@@ -314,6 +314,7 @@ def run_validation(
     aim_frames: int = 0,
     output_dir: str | None = None,
     charts: bool = True,
+    cancel_event: "threading.Event | None" = None,
 ) -> dict:
     """Evaluate a checkpoint offline.
 
@@ -424,7 +425,12 @@ def run_validation(
     sample_eps: list[int] = []
     sigs: list = []
 
+    def _cancelled() -> bool:
+        return cancel_event is not None and cancel_event.is_set()
+
     for batch_indices in batches:
+        if _cancelled():
+            return {"success": False, "cancelled": True, "error": "评测已取消"}
         try:
             batch = _collate([dataset[i] for i in batch_indices])
         except Exception as exc:
@@ -537,6 +543,8 @@ def run_validation(
         probe_rows = []
         signed: dict[str, list] = {}
         for kind in ("black", "shift_right", "shift_left", "swap_views", "task_swap"):
+            if _cancelled():
+                return {"success": False, "cancelled": True, "error": "评测已取消"}
             other_idx = None
             deltas = []
             signed_rows = []
@@ -629,6 +637,8 @@ def run_validation(
             logger.warning("Chart generation failed: %s", exc)
 
     if saliency_frames and output_dir:
+        if _cancelled():
+            return {"success": False, "cancelled": True, "error": "评测已取消"}
         try:
             from .saliency import attach_saliency
 
@@ -674,6 +684,8 @@ def run_validation(
             results["charts_error"] = str(exc)
 
     if aim_frames and output_dir:
+        if _cancelled():
+            return {"success": False, "cancelled": True, "error": "评测已取消"}
         try:
             from .aim import fit as fit_aim
             from .aim import probe as probe_aim

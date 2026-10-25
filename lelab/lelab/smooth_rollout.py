@@ -93,6 +93,108 @@ class SnapshotBuffer:
         return len(snapshot)
 
 
+# ---------------------------------------------------------------------------
+# Data-collection bridge (dagger / highlight strategies)
+# ---------------------------------------------------------------------------
+
+_TAKEOVER_KEY_FILE = _PREVIEW_DIR / "takeover_key"
+_TAKEOVER_STATE_FILE = _PREVIEW_DIR / "takeover_state.json"
+_TAKEOVER_POLL_S = 0.1
+_STATE_WRITE_S = 0.3
+
+
+class _LeLabKeyListener:
+    """Drop-in replacement for lerobot's ``create_key_listener``, driven by LeLab.
+
+    The rollout subprocess is spawned by the web server: no TTY, and pynput's
+    global hook is unavailable on a Wayland session, so lerobot's own keyboard
+    backends both come back ``None`` and a UI-driven strategy would be
+    uncontrollable. The server writes canonical key names ('space', 'tab',
+    'esc', 's', 'h') into a trigger file; we dispatch them here, which keeps
+    every strategy's own key→event table untouched.
+    """
+
+    def __init__(self, dispatch):
+        self._dispatch = dispatch
+        self._stop = threading.Event()
+
+    def start(self) -> None:
+        threading.Thread(target=self._loop, name="lelab-takeover-keys", daemon=True).start()
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            time.sleep(_TAKEOVER_POLL_S)
+            try:
+                if not _TAKEOVER_KEY_FILE.exists():
+                    continue
+                name = _TAKEOVER_KEY_FILE.read_text().strip()
+                _TAKEOVER_KEY_FILE.unlink(missing_ok=True)
+            except OSError:
+                continue
+            if not name:
+                continue
+            try:
+                self._dispatch(name)
+                logger.info("Takeover key dispatched: %s", name)
+            except Exception as exc:
+                logger.warning("Takeover key '%s' failed: %s", name, exc)
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
+def _install_takeover_input() -> None:
+    """Point the recording strategies at the file bridge instead of a keyboard.
+
+    lerobot's factory returns an *already started* listener, so the strategies
+    never call ``start()`` themselves — the replacement has to do it here.
+    """
+    from lerobot.rollout.strategies import dagger, highlight
+
+    def listener(dispatch, *, controls_help: str = "") -> _LeLabKeyListener:
+        bridge = _LeLabKeyListener(dispatch)
+        bridge.start()
+        logger.info("LeLab takeover bridge active%s", f" ({controls_help})" if controls_help else "")
+        return bridge
+
+    for module in (dagger, highlight):
+        module.create_key_listener = listener
+
+
+def _start_state_writer(strategy, ctx) -> None:
+    """Publish the strategy phase and episode counter for the UI to poll."""
+
+    def writer() -> None:
+        while True:
+            time.sleep(_STATE_WRITE_S)
+            state: dict = {"mode": getattr(getattr(strategy, "config", None), "type", "")}
+            phase = getattr(getattr(strategy, "_events", None), "phase", None)
+            if phase is not None:
+                state["phase"] = getattr(phase, "value", str(phase))
+            # Highlight has no phase machine: it is either recording or not.
+            live = getattr(strategy, "_recording_live", None)
+            if live is not None:
+                state["phase"] = "recording" if live.is_set() else "idle"
+            dataset = getattr(getattr(ctx, "data", None), "dataset", None)
+            if dataset is not None:
+                try:
+                    state["episodes"] = int(dataset.num_episodes)
+                    # Creating a dataset stamps a timestamp onto its name, so
+                    # this is the only place the real target repo is known.
+                    state["repo_id"] = dataset.repo_id
+                except Exception:
+                    pass
+            try:
+                tmp = _PREVIEW_DIR / ".takeover_state.tmp"
+                tmp.write_text(json.dumps(state))
+                tmp.replace(_TAKEOVER_STATE_FILE)
+            except OSError as exc:
+                logger.debug("Takeover state write failed: %s", exc)
+
+    _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=writer, name="lelab-takeover-state", daemon=True).start()
+
+
 def _start_snapshot_watcher(buffer: SnapshotBuffer) -> None:
     """Watch for trigger files and dump the snapshot buffer when one appears.
 
@@ -290,9 +392,11 @@ def main() -> None:
     orig_build = lr.build_rollout_context
     snapshot_buffer = SnapshotBuffer()
     _start_snapshot_watcher(snapshot_buffer)
+    ctx_holder: dict = {}
 
     def build_with_smoothing(cfg, shutdown_event):
         ctx = orig_build(cfg, shutdown_event)
+        ctx_holder["ctx"] = ctx
         keys = list(ctx.data.ordered_action_keys)
         passthrough = [i for i, k in enumerate(keys) if "gripper" in k.lower()]
         if alpha < 1.0:
@@ -311,7 +415,30 @@ def main() -> None:
         _start_preview_publisher(ctx)
         return ctx
 
+    orig_create_strategy = lr.create_strategy
+
+    def create_strategy_with_bridge(strategy_cfg):
+        strategy = orig_create_strategy(strategy_cfg)
+        # Recording strategies take their cues from a keyboard listener, which a
+        # server-spawned subprocess has no access to; route them to the UI instead.
+        if getattr(strategy_cfg, "type", "base") != "base":
+            _install_takeover_input()
+            _start_state_writer(strategy, ctx_holder.get("ctx"))
+            # Sentry/Highlight call `_background_push` on their own without
+            # consulting `dataset.push_to_hub`, which would upload every few
+            # episodes even though LeLab keeps capture sessions local.
+            dataset_cfg = getattr(ctx_holder.get("ctx").runtime.cfg, "dataset", None)
+            if dataset_cfg is not None and not dataset_cfg.push_to_hub:
+                strategy._background_push = lambda dataset, cfg: None
+        return strategy
+
     lr.build_rollout_context = build_with_smoothing
+    lr.create_strategy = create_strategy_with_bridge
+    # A `type: network` camera needs its config class registered and the camera
+    # factory taught to build it before lerobot parses argv below.
+    from .network_camera import install_camera_factory_hook
+
+    install_camera_factory_hook()
     lr.main()
 
 

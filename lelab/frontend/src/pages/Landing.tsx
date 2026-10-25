@@ -257,6 +257,7 @@ const Landing = () => {
         acc[cam.name] = {
           type: cam.type,
           camera_index: cam.camera_index,
+          url: cam.url,
           width: cam.width,
           height: cam.height,
           fps: cam.fps,
@@ -270,6 +271,7 @@ const Landing = () => {
         {
           type: string;
           camera_index?: number;
+          url?: string;
           width: number;
           height: number;
           fps?: number;

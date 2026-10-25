@@ -32,7 +32,8 @@ if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"
 import cv2  # type: ignore  # TODO: add type stubs for OpenCV
 import numpy as np  # type: ignore  # TODO: add type stubs for numpy
 
-from lerobot.utils.import_utils import _reachy2_sdk_available
+from lerobot.utils.decorators import check_if_not_connected
+from lerobot.utils.import_utils import _reachy2_sdk_available, require_package
 
 if TYPE_CHECKING or _reachy2_sdk_available:
     from reachy2_sdk.media.camera import CameraView
@@ -75,6 +76,7 @@ class Reachy2Camera(Camera):
         Args:
             config: The configuration settings for the camera.
         """
+        require_package("reachy2_sdk", extra="reachy2")
         super().__init__(config)
 
         self.config = config
@@ -123,6 +125,7 @@ class Reachy2Camera(Camera):
         """
         raise NotImplementedError("Camera detection is not implemented for Reachy2 cameras.")
 
+    @check_if_not_connected
     def read(self, color_mode: ColorMode | None = None) -> NDArray[Any]:
         """
         Reads a single frame synchronously from the camera.
@@ -135,9 +138,6 @@ class Reachy2Camera(Camera):
                        color mode and applying any configured rotation.
         """
         start_time = time.perf_counter()
-
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.cam_manager is None:
             raise DeviceNotConnectedError(f"{self} is not connected.")
@@ -184,6 +184,7 @@ class Reachy2Camera(Camera):
 
         return frame
 
+    @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
         """
         Same as read()
@@ -197,12 +198,11 @@ class Reachy2Camera(Camera):
             TimeoutError: If no frame becomes available within the specified timeout.
             RuntimeError: If an unexpected error occurs.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         return self.read()
 
-    def read_latest(self, max_age_ms: int = 1000) -> NDArray[Any]:
+    @check_if_not_connected
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
         """Return the most recent frame captured immediately (Peeking).
 
         This method is non-blocking and returns whatever is currently in the
@@ -219,8 +219,6 @@ class Reachy2Camera(Camera):
             DeviceNotConnectedError: If the camera is not connected.
             RuntimeError: If the camera is connected but has not captured any frames yet.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.latest_frame is None or self.latest_timestamp is None:
             raise RuntimeError(f"{self} has not captured any frames yet.")
@@ -233,6 +231,7 @@ class Reachy2Camera(Camera):
 
         return self.latest_frame
 
+    @check_if_not_connected
     def disconnect(self) -> None:
         """
         Stops the background read thread (if running).
@@ -240,8 +239,6 @@ class Reachy2Camera(Camera):
         Raises:
             DeviceNotConnectedError: If the camera is already disconnected.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} not connected.")
 
         if self.cam_manager is not None:
             self.cam_manager.disconnect()

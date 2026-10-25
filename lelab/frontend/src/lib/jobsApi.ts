@@ -66,6 +66,14 @@ export interface TrainingRequest {
   augmentation_hue?: boolean;
   augmentation_sharpness?: boolean;
   augmentation_affine?: boolean;
+  // RA-BC sample weighting: per-frame loss weights from a progress model. The
+  // dataset needs `sarm_progress.parquet` (see the rollout scoring card), and
+  // only SmolVLA / pi0 / pi0.5 accept per-sample weights today.
+  sample_weighting_enable?: boolean;
+  sample_weighting_type?: string;
+  sample_weighting_progress_path?: string;
+  sample_weighting_kappa?: number;
+  sample_weighting_head_mode?: string;
   // GR00T-specific (only sent when policy_type === "groot"); backend ignores
   // the policy_* ones for other policies.
   dataset_image_transforms_enable?: boolean;
@@ -192,6 +200,8 @@ export interface JobRecord {
   checkpoint_count: number;
   validation_state: ValidationState;
   validation_results: ValidationResults | null;
+  // SSH/cloud only: steps already downloaded to local via export.
+  exported_steps: number[];
 }
 
 // Per-running-job snapshot pushed by the watchdog over WS at ~1Hz. Subset
@@ -684,6 +694,17 @@ export async function startJobValidation(
     method: "POST",
     body: options,
     action: "Start validation",
+  });
+}
+
+export async function stopJobValidation(
+  baseUrl: string,
+  fetcher: Fetcher,
+  id: string,
+): Promise<{ validation_state: ValidationState; message: string }> {
+  return apiRequest(baseUrl, fetcher, `/jobs/${id}/validate/stop`, {
+    method: "POST",
+    action: "Stop validation",
   });
 }
 

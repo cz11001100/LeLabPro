@@ -1,5 +1,7 @@
 import { Fetcher, apiRequest } from "./apiClient";
 
+export type CaptureMode = "base" | "dagger" | "highlight" | "sentry";
+
 export interface StartInferenceRequest {
   follower_port: string;
   follower_config: string;
@@ -8,6 +10,7 @@ export interface StartInferenceRequest {
   cameras: Record<string, {
     type: string;
     camera_index?: number;
+    url?: string;
     width: number;
     height: number;
     fps?: number;
@@ -17,6 +20,20 @@ export interface StartInferenceRequest {
   chunk_smooth?: boolean;
   chunk_smooth_strength?: number;
   rtc?: boolean;
+  capture_mode?: CaptureMode;
+  dataset_repo_id?: string;
+  dataset_fps?: number;
+  num_episodes?: number;
+  record_autonomous?: boolean;
+  leader_port?: string;
+  leader_config?: string;
+}
+
+export interface TakeoverState {
+  mode?: string;
+  phase?: "autonomous" | "paused" | "correcting" | string;
+  episodes?: number;
+  repo_id?: string;
 }
 
 export interface InferenceStatus {
@@ -33,6 +50,9 @@ export interface InferenceStatus {
   current_run?: number;
   total_runs?: number;
   camera_names?: string[];
+  capture_mode?: CaptureMode;
+  dataset_repo_id?: string | null;
+  takeover?: TakeoverState;
 }
 
 export async function startInference(
@@ -76,5 +96,17 @@ export async function captureInferenceSnapshot(
   return apiRequest(baseUrl, fetcher, "/inference-snapshot", {
     method: "POST",
     action: "Capture inference snapshot",
+  });
+}
+
+export async function sendInferenceTakeover(
+  baseUrl: string,
+  fetcher: Fetcher,
+  action: "pause" | "correct" | "save" | "stop",
+): Promise<{ message: string; key: string }> {
+  return apiRequest(baseUrl, fetcher, "/inference-takeover", {
+    method: "POST",
+    body: { action },
+    action: "Take over",
   });
 }

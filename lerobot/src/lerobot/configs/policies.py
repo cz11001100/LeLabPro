@@ -26,12 +26,12 @@ from huggingface_hub import hf_hub_download
 from huggingface_hub.constants import CONFIG_NAME
 from huggingface_hub.errors import HfHubHTTPError
 
-from lerobot.configs.types import FeatureType, PolicyFeature
-from lerobot.optim.optimizers import OptimizerConfig
-from lerobot.optim.schedulers import LRSchedulerConfig
+from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.constants import ACTION, OBS_STATE
+from lerobot.utils.device_utils import auto_select_torch_device, is_amp_available, is_torch_device_available
 from lerobot.utils.hub import HubMixin
-from lerobot.utils.utils import auto_select_torch_device, is_amp_available, is_torch_device_available
+
+from .types import FeatureType, PolicyFeature
 
 T = TypeVar("T", bound="PreTrainedConfig")
 logger = getLogger(__name__)
@@ -79,6 +79,8 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
     # Either the repo ID of a model hosted on the Hub or a path to a directory containing weights
     # saved using `Policy.save_pretrained`. If not provided, the policy is initialized from scratch.
     pretrained_path: Path | None = None
+    # Optional Hub revision (commit hash, branch, or tag) to pin the pretrained model version.
+    pretrained_revision: str | None = None
 
     def __post_init__(self) -> None:
         if not self.device or not is_torch_device_available(self.device):
@@ -202,9 +204,6 @@ class PreTrainedConfig(draccus.ChoiceRegistry, HubMixin, abc.ABC):  # type: igno
                 raise FileNotFoundError(
                     f"{CONFIG_NAME} not found on the HuggingFace Hub in {model_id}"
                 ) from e
-
-        # Ensure all policy types are registered before draccus needs them
-        import lerobot.policies  # noqa: F401
 
         # HACK: Parse the original config to get the config subclass, so that we can
         # apply cli overrides.

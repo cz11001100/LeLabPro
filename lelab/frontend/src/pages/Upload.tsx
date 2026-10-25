@@ -54,6 +54,8 @@ interface UploadConfig {
   private: boolean;
 }
 
+import MergeSection from "@/components/dataset/MergeSection";
+
 const Upload = () => {
   const location = useLocation();
   const navigate = useNavigate();
@@ -96,12 +98,9 @@ const Upload = () => {
 
   const loadDatasetInfo = React.useCallback(async () => {
     if (!initialDatasetInfo?.dataset_repo_id) {
-      toast({
-        title: "No Dataset Information",
-        description: "Please complete a recording session first.",
-        variant: "destructive",
-      });
-      navigate("/");
+      // Arrived without a dataset in hand (deep link, or just here to merge
+      // datasets): render the page with the dataset-independent sections.
+      setIsLoadingDatasetInfo(false);
       return;
     }
 
@@ -466,12 +465,35 @@ const Upload = () => {
   };
 
   // Show loading state while fetching dataset info
-  if (isLoadingDatasetInfo || !datasetInfo) {
+  if (isLoadingDatasetInfo) {
     return (
       <div className="min-h-screen bg-black text-white flex items-center justify-center">
         <div className="text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500 mx-auto mb-4"></div>
           <p className="text-lg">Loading dataset information...</p>
+        </div>
+      </div>
+    );
+  }
+
+  // No dataset picked (deep link, or arrived just to merge): merging works on a
+  // selection of its own, so don't hold it behind a dataset detail view.
+  if (!datasetInfo) {
+    return (
+      <div className="min-h-screen bg-black text-white p-8">
+        <div className="max-w-4xl mx-auto">
+          <div className="flex items-center gap-4 mb-6">
+            <Button
+              onClick={() => navigate("/")}
+              variant="outline"
+              className="border-gray-500 text-gray-300 hover:text-white"
+            >
+              <ArrowLeft className="w-4 h-4 mr-2" />
+              Back to Home
+            </Button>
+            <h1 className="text-3xl font-bold">Dataset</h1>
+          </div>
+          <MergeSection />
         </div>
       </div>
     );
@@ -512,7 +534,7 @@ const Upload = () => {
               <Database className="w-8 h-8 text-blue-500" />
             )}
             <h1 className="text-3xl font-bold">
-              {uploadSuccess ? "Upload Complete" : "Dataset Upload"}
+              {uploadSuccess ? "Upload Complete" : "Dataset"}
             </h1>
           </div>
         </div>
@@ -917,6 +939,8 @@ const Upload = () => {
             )}
           </>
         )}
+
+        <MergeSection />
       </div>
 
       <AlertDialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>

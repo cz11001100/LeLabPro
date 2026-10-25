@@ -37,7 +37,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .utils.config import setup_follower_calibration_file
+from .utils.config import setup_calibration_files, setup_follower_calibration_file
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,21 @@ class InferenceRequest(BaseModel):
     # inside the policy instead of post-filtering. Mutually exclusive with
     # chunk_smooth — when rtc is on we force alpha 1.0 (no double smoothing).
     rtc: bool = False
+    # Data collection during rollout. 'base' runs the policy without recording;
+    # the others select a lerobot rollout strategy that writes episodes.
+    capture_mode: str = "base"  # base | dagger | highlight | sentry
+    dataset_repo_id: str = ""  # 'user/rollout_name'; empty = auto-name
+    dataset_fps: int = 30
+    num_episodes: int = 20
+    # dagger only: record the policy frames too, so one episode holds both the
+    # model's attempt and the human correction (hybrid episode).
+    record_autonomous: bool = False
+    leader_port: str = ""
+    leader_config: str = ""
+
+
+class TakeoverRequest(BaseModel):
+    action: str  # dagger: pause | correct | stop;  highlight: save | push | stop
 
 
 inference_active: bool = False
@@ -87,6 +102,9 @@ _inference_cam_thread: threading.Thread | None = None
 # 0.2s. Reading files avoids a secondary V4L2 open, which is single-opener on
 # this machine and races/kills the subprocess when attempted.
 _PREVIEW_DIR = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_preview"
+# How long the rollout's preview publisher may stay quiet before the server
+# risks opening the cameras itself (see inference_camera_frames).
+_PREVIEW_STALL_S = 8.0
 _SNAPSHOT_DIR = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_snapshots"
 _HUB_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$")
 _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
@@ -186,6 +204,49 @@ def _read_policy_config(policy_path: str) -> dict[str, Any]:
         return {}
 
 
+_HUB_REPO_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _hub_repo_ids_in(obj: Any) -> set[str]:
+    """Collect every ``org/name`` string anywhere in a policy config."""
+    found: set[str] = set()
+    if isinstance(obj, dict):
+        for value in obj.values():
+            found |= _hub_repo_ids_in(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            found |= _hub_repo_ids_in(value)
+    elif isinstance(obj, str) and _HUB_REPO_ID_RE.match(obj):
+        found.add(obj)
+    return found
+
+
+def _hf_offline_env(policy_path: str) -> dict[str, str]:
+    """Env vars pinning the rollout subprocess to the local HF cache.
+
+    While building the SmolVLM processor, transformers HEAD-probes
+    huggingface.co once per config file it resolves — 31 requests, ~22s of the
+    ~50s setup wall, and minutes when the hub is unreachable from the robot's
+    network. Offline mode drops the probes entirely.
+
+    Only applied when every repo the policy config names is already cached:
+    an uncached base would then be a hard failure rather than a download, so
+    we leave those policies online.
+    """
+    repos = _hub_repo_ids_in(_read_policy_config(policy_path))
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        return {}
+    for repo in sorted(repos):
+        try:
+            snapshot_download(repo_id=repo, local_files_only=True)
+        except Exception:
+            logger.info("HF repo '%s' not cached; inference subprocess stays online", repo)
+            return {}
+    return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
+
+
 def _rollout_inference_args(policy_path: str, force_rtc: bool = False) -> list[str]:
     """Return extra lerobot-rollout flags for policies that reject sync inference.
 
@@ -227,17 +288,243 @@ def _rollout_inference_args(policy_path: str, force_rtc: bool = False) -> list[s
 
 
 def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
-    """Convert {name: {type, camera_index, width, height, fps}} into
-    lerobot's CLI dict syntax. The frontend key `camera_index` is
-    remapped to lerobot's `index_or_path`."""
+    """Convert {name: {type, camera_index|url, width, height, fps}} into
+    lerobot's CLI dict syntax.
+
+    Two things differ from a plain key copy. The frontend key `camera_index` is
+    remapped to lerobot's `index_or_path`, and a stream URL has to go out as
+    `type: network`: the `opencv` config types that field `int | Path`, so draccus
+    coerces the URL into a Path and silently collapses `rtsp://host/live` to
+    `rtsp:/host/live`.
+    """
+    from .network_camera import camera_source
+
     parts = []
     for name, cfg in cameras.items():
+        kind, source = camera_source(cfg)
+        if kind == "network":
+            fields = {"type": "network", "index_or_path": f'"{source}"'}
+            for key in ("width", "height", "fps"):
+                if cfg.get(key) is not None:
+                    fields[key] = cfg[key]
+            body = ", ".join(f"{k}: {v}" for k, v in fields.items())
+            parts.append(f"{name}: {{{body}}}")
+            continue
+
         remapped = {
-            ("index_or_path" if k == "camera_index" else k): v for k, v in cfg.items() if v is not None
+            ("index_or_path" if k == "camera_index" else k): v
+            for k, v in cfg.items()
+            if v is not None and k != "url"
         }
         body = ", ".join(f"{k}: {v}" for k, v in remapped.items())
         parts.append(f"{name}: {{{body}}}")
     return "{" + ", ".join(parts) + "}"
+
+
+# ---------------------------------------------------------------------------
+# Rollout data collection (lerobot rollout strategies)
+# ---------------------------------------------------------------------------
+
+_CAPTURE_MODES = ("base", "dagger", "highlight", "sentry")
+# UI verbs mapped to the canonical key names each strategy's listener expects.
+# The keys travel to the subprocess through a trigger file because a Popen'd
+# rollout has neither a TTY nor a global keyboard hook.
+_MODE_KEYS: dict[str, dict[str, str]] = {
+    "dagger": {"pause": "space", "correct": "tab", "stop": "esc"},
+    "highlight": {"save": "s", "stop": "esc"},
+}
+_TAKEOVER_KEY_FILE = "takeover_key"
+_TAKEOVER_STATE_FILE = "takeover_state.json"
+
+
+def _read_takeover_state() -> dict[str, Any]:
+    """Return the phase/episode counters the rollout subprocess publishes."""
+    try:
+        state = json.loads((_PREVIEW_DIR / _TAKEOVER_STATE_FILE).read_text())
+    except (OSError, ValueError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def _hf_default_user() -> str | None:
+    from .utils.hf_auth import cached_whoami
+
+    info = cached_whoami()
+    return info.get("name") if info else None
+
+
+def _read_dataset_info(root: Path) -> dict[str, Any] | None:
+    """Existing dataset's meta/info.json, or None when the dataset is new."""
+    try:
+        info = json.loads((root / "meta" / "info.json").read_text())
+    except (OSError, ValueError):
+        return None
+    return info if isinstance(info, dict) else None
+
+
+def _detect_leader(request: "InferenceRequest") -> tuple[str, str]:
+    """Resolve the leader arm for takeover from the saved robot records.
+
+    The inference dialog only picks the follower (the policy drives it), but a
+    correction session needs the leader as well. Both ports live in the robot
+    record the follower came from, so asking again would only duplicate it.
+    """
+    if request.leader_port and request.leader_config:
+        return request.leader_port, request.leader_config
+    from .utils.config import list_robot_records
+
+    try:
+        records = list_robot_records()
+    except Exception as exc:
+        logger.warning("Leader autodetection failed: %s", exc)
+        return request.leader_port, request.leader_config
+    match = next((r for r in records if r.get("follower_port") == request.follower_port), None)
+    if match is None and len(records) == 1:
+        match = records[0]
+    if match is None:
+        return request.leader_port, request.leader_config
+    return str(match.get("leader_port") or ""), str(match.get("leader_config") or "")
+
+
+def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[str, Any], str | None]:
+    """Translate the capture request into ``lerobot-rollout`` flags.
+
+    Returns (flags, session meta, error). lerobot's rollout engine only records
+    through a strategy, so a capture mode always carries ``--dataset.*``; the
+    'base' strategy rejects a dataset, hence base mode stays flag-free.
+    """
+    mode = (request.capture_mode or "base").strip().lower()
+    if mode not in _CAPTURE_MODES:
+        return [], {}, f"Unknown capture mode '{mode}'."
+    if mode == "base":
+        return [], {"capture_mode": "base"}, None
+
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+
+    name = request.dataset_repo_id.strip()
+    user = _hf_default_user()
+    if not name:
+        if not user:
+            return [], {}, "No HF account detected, so the dataset can't be auto-named. Type a dataset repo id."
+        # Day-stable, so repeated rounds of one collection session land in the
+        # same dataset instead of forking a new one per launch.
+        name = f"{user}/rollout_{time.strftime('%m%d')}"
+    if "/" not in name:
+        if not user:
+            return [], {}, f"Dataset '{name}' needs a user/org prefix."
+        name = f"{user}/{name}"
+    org, _, tail = name.partition("/")
+    root = Path(HF_LEROBOT_HOME) / name
+    existing = _read_dataset_info(root)
+    # A dataset already on disk keeps its name — lerobot only enforces the
+    # rollout_* prefix when creating (and stamps a timestamp onto new names).
+    if existing is None and not tail.startswith("rollout_"):
+        name = f"{org}/rollout_{tail}"
+        root = Path(HF_LEROBOT_HOME) / name
+        existing = _read_dataset_info(root)
+
+    args = [
+        f"--dataset.repo_id={name}",
+        f"--dataset.root={root}",
+        f"--dataset.single_task={request.task}",
+        "--dataset.push_to_hub=false",
+        f"--dataset.num_episodes={request.num_episodes}",
+    ]
+    resolved_leader = ""
+    if existing is not None:
+        # Appending to a dataset already on disk. Its fps wins: one fps per
+        # dataset, and add_frame derives timestamps from it.
+        args.append(f"--dataset.fps={existing.get('fps') or request.dataset_fps}")
+        args.append("--resume=true")
+        if mode == "dagger" and "intervention" not in (existing.get("features") or {}):
+            return [], {}, (
+                f"'{name}' was recorded with plain teleop and has no 'intervention' column, "
+                "which correction episodes need. Pick a new dataset name (it gets created with "
+                "that column) or convert the old one first."
+            )
+        if mode != "dagger" and "intervention" in (existing.get("features") or {}):
+            # The other strategies never write that column, and validate_frame
+            # rejects a declared feature missing from a frame.
+            return [], {}, (
+                f"'{name}' 是纠正采集建的（带 intervention 列），"
+                f"{mode} 模式不写这一列，逐帧校验会失败。请换一个新的数据集名。"
+            )
+    else:
+        args.append(f"--dataset.fps={request.dataset_fps}")
+
+    if mode == "dagger":
+        resolved_leader, leader_config = _detect_leader(request)
+        if not resolved_leader or not leader_config:
+            return [], {}, "纠正采集需要主臂：在机器人配置里保存 leader 端口与标定后重试。"
+        try:
+            leader_id, _ = setup_calibration_files(leader_config, request.follower_config)
+        except (FileNotFoundError, OSError) as exc:
+            return [], {}, f"Leader calibration unavailable: {exc}"
+        args += [
+            "--teleop.type=so101_leader",
+            f"--teleop.port={resolved_leader}",
+            f"--teleop.id={leader_id}",
+            "--strategy.type=dagger",
+            f"--strategy.num_episodes={request.num_episodes}",
+            f"--strategy.record_autonomous={'true' if request.record_autonomous else 'false'}",
+        ]
+        if request.record_autonomous:
+            args += ["--dataset.streaming_encoding=true", "--dataset.encoder_threads=2"]
+    elif mode == "highlight":
+        args += ["--strategy.type=highlight", "--strategy.ring_buffer_seconds=15"]
+    else:
+        args += ["--strategy.type=sentry", "--strategy.upload_every_n_episodes=5"]
+
+    return (
+        args,
+        {
+            "capture_mode": mode,
+            "dataset_repo_id": name,
+            "dataset_root": str(root),
+            "appending": existing is not None,
+            "num_episodes": request.num_episodes,
+            "record_autonomous": bool(request.record_autonomous),
+            "leader_port": resolved_leader,
+        },
+        None,
+    )
+
+
+def handle_inference_takeover(action: str) -> dict[str, Any]:
+    """Hand a control action to the running rollout's data-collection strategy.
+
+    'action' is a mode-specific verb (dagger: pause/correct/stop; highlight:
+    save/push/stop); it becomes a canonical key name in the trigger file the
+    subprocess polls."""
+    if not inference_active:
+        return {"success": False, "status_code": 409, "message": "No inference is active"}
+
+    mode = str(_inference_meta.get("capture_mode") or "base")
+    verbs = _MODE_KEYS.get(mode)
+    if not verbs:
+        return {
+            "success": False,
+            "status_code": 409,
+            "message": f"Capture mode '{mode}' has no takeover controls.",
+        }
+    key = verbs.get(action)
+    if key is None:
+        return {"success": False, "status_code": 400, "message": f"Unknown action '{action}' for '{mode}'."}
+
+    try:
+        _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        (_PREVIEW_DIR / _TAKEOVER_KEY_FILE).write_text(key)
+    except OSError as exc:
+        return {"success": False, "status_code": 500, "message": f"Failed to write takeover trigger: {exc}"}
+
+    # Taking over is precisely the moment the policy went wrong, and the ring
+    # buffer still holds what it *saw* and what it *chose* to do — the one piece
+    # a correction episode doesn't record. Archive it automatically so the
+    # divergence point survives without the operator remembering a second button.
+    if action == "pause":
+        threading.Thread(target=handle_inference_snapshot, daemon=True).start()
+
+    return {"success": True, "message": f"Sent '{key}' to the {mode} strategy", "key": key}
 
 
 # Exception lines at the tail of a Python traceback look like
@@ -347,6 +634,8 @@ def _inference_camera_capture(cameras: dict[str, dict[str, Any]]) -> None:
     Runs only while inference is active. Opens each camera independently
     (secondary to the subprocess's primary open). If V4L2 doesn't allow
     shared access, the open fails silently and no preview is available.
+    Stream sources are the exception — RTSP takes several client sessions, so
+    their preview always works and reopens itself after a dropped frame.
     """
     global _inference_cam_thread
     try:
@@ -355,8 +644,16 @@ def _inference_camera_capture(cameras: dict[str, dict[str, Any]]) -> None:
         logger.warning("cv2 not available; inference camera preview disabled")
         return
 
+    from .network_camera import camera_source, preview_stream, redact
+
     for cam_key, cam_cfg in cameras.items():
-        cam_idx = cam_cfg.get("camera_index", 0)
+        kind, source = camera_source(cam_cfg)
+        if kind == "network":
+            _inference_cams[cam_key] = preview_stream(str(source))
+            logger.info("🌐 Preview stream opened for %s (%s)", cam_key, redact(source))
+            continue
+
+        cam_idx = source if source is not None else 0
         cap = cv2.VideoCapture(cam_idx, cv2.CAP_V4L2)
         if not cap.isOpened():
             logger.warning("Failed to open camera %s (index %s) for preview", cam_key, cam_idx)
@@ -379,54 +676,78 @@ def _inference_camera_capture(cameras: dict[str, dict[str, Any]]) -> None:
         time.sleep(0.2)
 
 
+def _start_inference_camera_capture() -> None:
+    """Launch the secondary cv2 capture thread (fallback preview source).
+
+    Only ever called when the rollout subprocess stopped publishing preview
+    files: UVC devices here are single-opener, so grabbing the camera away from
+    a healthy subprocess makes the rollout itself drop frames.
+    """
+    global _inference_cam_thread
+    if _inference_cam_thread is not None:
+        return
+    from . import rollout as _self
+
+    _inference_cam_thread = threading.Thread(
+        target=_self._inference_camera_capture,
+        args=(_inference_meta.get("cameras", {}),),
+        name="inference-camera-capture",
+        daemon=True,
+    )
+    _inference_cam_thread.start()
+
+
 def inference_camera_frames(cam_key: str, fps: float = 5.0):
     """Yield multipart-MJPEG chunks of inference camera frames.
 
-    The capture thread starts once the current run is past its setup grace
-    period (the subprocess must connect to the cameras first). The check lives
-    inside the loop so previews also recover after an auto-restart between
-    consecutive runs.
+    Primary source is the preview file the rollout subprocess publishes from its
+    own observation frames. Once a frame has arrived it keeps being re-sent, so
+    a brief pause in the writer shows as a still image instead of a blank tile —
+    a silent stream is indistinguishable from a dead one in the browser.
+
+    The secondary cv2 open (which loses on this machine, but is the only option
+    when the subprocess never publishes) is deliberately delayed: the cameras
+    must stay owned by the rollout while it is producing frames.
     """
-    global _inference_cam_thread
-
     interval = 1.0 / fps
+    preview_file = _PREVIEW_DIR / f"{cam_key}.jpg"
     last_mtime = 0.0
-    while inference_active:
-        if (
-            _inference_cam_thread is None
-            and _inference_rollout_started_at is not None
-        ):
-            # Only try to open the cameras once the inference subprocess has
-            # connected them. UVC devices are single-opener: opening earlier
-            # makes the preview thread hold the device and the subprocess
-            # dies with EBUSY. After the subprocess owns the device our open
-            # fails harmlessly and the preview simply stays blank.
-            from . import rollout as _self
+    last_frame: bytes | None = None
+    last_new_frame_at = 0.0
 
-            _inference_cam_thread = threading.Thread(
-                target=_self._inference_camera_capture,
-                args=(_inference_meta.get("cameras", {}),),
-                name="inference-camera-capture",
-                daemon=True,
-            )
-            _inference_cam_thread.start()
-        frame = None
-        preview_file = _PREVIEW_DIR / f"{cam_key}.jpg"
+    while inference_active:
+        frame: bytes | None = None
         try:
             mtime = preview_file.stat().st_mtime
-            if mtime > last_mtime and mtime >= (_inference_started_at or 0.0) - 1.0:
-                frame = preview_file.read_bytes()
+            if mtime >= (_inference_started_at or 0.0) - 1.0 and mtime > last_mtime:
+                last_frame = preview_file.read_bytes()
                 last_mtime = mtime
+                last_new_frame_at = time.time()
         except OSError:
-            frame = None
+            pass
+        frame = last_frame
+
         if frame is None:
             with _inference_cam_lock:
                 frame = _inference_cam_frames.get(cam_key)
+
         if frame is None:
+            started = _inference_rollout_started_at or 0.0
+            if started and time.time() - started > _PREVIEW_STALL_S:
+                _start_inference_camera_capture()
             time.sleep(interval)
             continue
+
         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         time.sleep(interval)
+        # The writer went quiet: we are replaying a still image, so try the
+        # secondary open to get a live picture back.
+        if (
+            _inference_cam_thread is None
+            and last_new_frame_at
+            and time.time() - last_new_frame_at > _PREVIEW_STALL_S
+        ):
+            _start_inference_camera_capture()
 
 
 def _stop_inference_cameras() -> None:
@@ -488,6 +809,17 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         follower_id = setup_follower_calibration_file(request.follower_config)
         policy_path = _resolve_policy_path(request.policy_ref)
 
+        capture_args, capture_meta, capture_error = _build_capture_args(request)
+        if capture_error:
+            with _state_lock:
+                inference_active = False
+            return {"success": False, "status_code": 400, "message": capture_error}
+
+        # Setting up the leader bus and the writer threads collides with the
+        # run-restart loop below, so a capture session is always a single run.
+        if capture_meta.get("capture_mode", "base") != "base":
+            request.n_runs = 1
+
         # Launch through lelab.smooth_rollout rather than lerobot's rollout
         # directly: the wrapper publishes the control loop's observation frames
         # to _PREVIEW_DIR (the web preview's only frame source — V4L2 is
@@ -505,7 +837,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "-m",
             "lelab.smooth_rollout",
             f"--lelab.smooth_alpha={smooth_alpha}",
-            "--strategy.type=base",
+            f"--strategy.type={capture_meta.get('capture_mode', 'base')}",
             f"--policy.path={policy_path}",
             f"--policy.device={_detect_device()}",
             "--robot.type=so101_follower",
@@ -514,6 +846,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             f"--task={request.task}",
             f"--duration={request.duration_s}",
             *_rollout_inference_args(policy_path, force_rtc=request.rtc),
+            *capture_args,
         ]
         if request.cameras:
             cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
@@ -523,8 +856,16 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         log_path = log_dir / f"{int(time.time())}.log"
         log_handle = log_path.open("w", buffering=1)
 
+        # Stale bridge files from a previous run would make the subprocess act
+        # on an old button press or report an old phase.
+        with contextlib.suppress(OSError):
+            _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+            for stale in (_TAKEOVER_KEY_FILE, _TAKEOVER_STATE_FILE):
+                (_PREVIEW_DIR / stale).unlink(missing_ok=True)
+
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
+        env.update(_hf_offline_env(policy_path))
         # Feed a single newline into stdin so SOFollower.calibrate()'s
         # `input("Press ENTER to use the calibration file ...")` returns "" and
         # writes the existing calibration to the motors instead of hanging
@@ -572,6 +913,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "duration_s": request.duration_s,
             "log_path": str(log_path),
             "cameras": dict(request.cameras),
+            **capture_meta,
         }
         _inference_current_run = 1
         _inference_remaining_runs = max(0, request.n_runs - 1)
@@ -585,6 +927,13 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "chunk_smooth": request.chunk_smooth,
             "chunk_smooth_strength": request.chunk_smooth_strength,
             "rtc": request.rtc,
+            "capture_mode": request.capture_mode,
+            "dataset_repo_id": request.dataset_repo_id,
+            "dataset_fps": request.dataset_fps,
+            "num_episodes": request.num_episodes,
+            "record_autonomous": request.record_autonomous,
+            "leader_port": request.leader_port,
+            "leader_config": request.leader_config,
         }
     logger.info("Inference started: pid=%s policy=%s runs=%d", proc.pid, policy_path, request.n_runs)
     return {"success": True, "message": "Inference started", "log_path": str(log_path)}
@@ -623,6 +972,16 @@ def handle_stop_inference() -> dict[str, Any]:
         _inference_current_run = 0
     _stop_inference_cameras()
     return {"success": True, "message": "Inference stopped"}
+
+
+def _capture_status_fields(meta: dict[str, Any]) -> dict[str, Any]:
+    """Capture-session fields every status response carries, so the UI can show
+    which dataset is being written and which strategy phase we're in."""
+    return {
+        "capture_mode": meta.get("capture_mode", "base"),
+        "dataset_repo_id": meta.get("dataset_repo_id"),
+        "takeover": _read_takeover_state(),
+    }
 
 
 def handle_inference_status() -> dict[str, Any]:
@@ -682,6 +1041,7 @@ def handle_inference_status() -> dict[str, Any]:
                         "current_run": next_current,
                         "total_runs": total_runs,
                         "camera_names": list(restart_req.cameras.keys()),
+                        **_capture_status_fields(_inference_meta),
                     }
                 logger.warning("Auto-restart failed: %s", result.get("message"))
 
@@ -707,6 +1067,7 @@ def handle_inference_status() -> dict[str, Any]:
                 "current_run": 0,
                 "total_runs": total_runs,
                 "camera_names": list(finished_meta.get("cameras", {}).keys()),
+                **_capture_status_fields(finished_meta),
             }
         elapsed = (time.time() - _inference_started_at) if _inference_started_at else 0
         rollout_elapsed = time.time() - _inference_rollout_started_at if _inference_rollout_started_at else 0
@@ -722,6 +1083,7 @@ def handle_inference_status() -> dict[str, Any]:
             "current_run": _inference_current_run,
             "total_runs": total_runs,
             "camera_names": list(_inference_meta.get("cameras", {}).keys()),
+            **_capture_status_fields(_inference_meta),
         }
 
 

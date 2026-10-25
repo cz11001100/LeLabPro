@@ -32,10 +32,11 @@ if platform.system() == "Windows" and "OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"
     os.environ["OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS"] = "0"
 import cv2  # type: ignore  # TODO: add type stubs for OpenCV
 
-from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
+from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
+from lerobot.utils.errors import DeviceNotConnectedError
 
 from ..camera import Camera
-from ..utils import get_cv2_backend, get_cv2_rotation
+from ..utils import get_cv2_rotation
 from .configuration_opencv import ColorMode, OpenCVCameraConfig
 
 # NOTE(Steven): The maximum opencv device index depends on your operating system. For instance,
@@ -117,7 +118,7 @@ class OpenCVCamera(Camera):
         self.new_frame_event: Event = Event()
 
         self.rotation: int | None = get_cv2_rotation(config.rotation)
-        self.backend: int = get_cv2_backend()
+        self.backend: int = config.backend
 
         if self.height and self.width:
             self.capture_width, self.capture_height = self.width, self.height
@@ -132,6 +133,7 @@ class OpenCVCamera(Camera):
         """Checks if the camera is currently connected and opened."""
         return isinstance(self.videocapture, cv2.VideoCapture) and self.videocapture.isOpened()
 
+    @check_if_already_connected
     def connect(self, warmup: bool = True) -> None:
         """
         Connects to the OpenCV camera specified in the configuration.
@@ -148,8 +150,6 @@ class OpenCVCamera(Camera):
             ConnectionError: If the specified camera index/path is not found or fails to open.
             RuntimeError: If the camera opens but fails to apply requested settings.
         """
-        if self.is_connected:
-            raise DeviceAlreadyConnectedError(f"{self} is already connected.")
 
         # Use 1 thread for OpenCV operations to avoid potential conflicts or
         # blocking in multi-threaded applications, especially during data collection.
@@ -165,7 +165,6 @@ class OpenCVCamera(Camera):
             )
 
         self._configure_capture_settings()
-        self._apply_v4l2_settings()
         self._start_read_thread()
 
         if warmup and self.warmup_s > 0:
@@ -179,6 +178,7 @@ class OpenCVCamera(Camera):
 
         logger.info(f"{self} connected.")
 
+    @check_if_not_connected
     def _configure_capture_settings(self) -> None:
         """
         Applies the specified FOURCC, FPS, width, and height settings to the connected camera.
@@ -198,14 +198,13 @@ class OpenCVCamera(Camera):
                           to the requested value.
             DeviceNotConnectedError: If the camera is not connected.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"Cannot configure settings for {self} as it is not connected.")
 
-        # Set FOURCC first (if specified) as it can affect available FPS/resolution options
-        if self.config.fourcc is not None:
-            self._validate_fourcc()
         if self.videocapture is None:
             raise DeviceNotConnectedError(f"{self} videocapture is not initialized")
+
+        set_fourcc_after_size_and_fps = platform.system() == "Windows"
+        if self.config.fourcc is not None and not set_fourcc_after_size_and_fps:
+            self._validate_fourcc()
 
         default_width = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_WIDTH)))
         default_height = int(round(self.videocapture.get(cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -224,83 +223,10 @@ class OpenCVCamera(Camera):
         else:
             self._validate_fps()
 
-    def _apply_v4l2_settings(self) -> None:
-        """Apply v4l2-ctl settings for V4L2 cameras.
-
-        - All cameras: enable auto white balance for proper color
-        - Cameras with exposure controls (e.g., wrist): also set manual exposure to prevent flickering
-        """
-        import subprocess
-
-        if self.videocapture is None:
-            return
-
-        # Only apply to V4L2 cameras
-        if self.backend != cv2.CAP_V4L2:
-            return
-
-        # Get device path - could be a string path or an integer index
-        device_path = None
-        if isinstance(self.index_or_path, str) and self.index_or_path.startswith("/dev/video"):
-            device_path = self.index_or_path
-        elif isinstance(self.index_or_path, int):
-            device_path = f"/dev/video{self.index_or_path}"
-
-        if not device_path:
-            logger.info(f"{self}: skipping v4l2 settings (no device path)")
-            return
-
-        # Enable auto white balance for all cameras (prevents green tint)
-        try:
-            result = subprocess.run(
-                ["v4l2-ctl", "-d", device_path, "--set-ctrl=white_balance_automatic=1"],
-                check=False, capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                logger.info(f"{self}: set white_balance_automatic=1 successfully")
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"{self}: failed to set white_balance_automatic: {e}")
-
-        # Check if this camera supports auto_exposure control
-        try:
-            result = subprocess.run(
-                ["v4l2-ctl", "-d", device_path, "--list-ctrls"],
-                check=False, capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                output = result.stdout.decode()
-                if "auto_exposure" not in output:
-                    logger.info(f"{self}: camera {device_path} does not support auto_exposure, skipping exposure settings")
-                    return
-        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-            logger.warning(f"{self}: failed to check v4l2 controls: {e}")
-            return
-
-        # Only apply exposure settings to cameras that support them
-        # Disable auto-exposure and set manual exposure to reduce flickering.
-        # For 50Hz AC power (China/Europe), exposure_time_absolute should be a multiple of 100 (10ms).
-        # 100 = 10ms = 1/100s is ideal for 50Hz power at 30fps.
-        v4l2_controls = [
-            "auto_exposure=1",  # 1=manual, 3=aperture priority (auto)
-            "exposure_time_absolute=100",  # 10ms for 50Hz power at 30fps
-        ]
-
-        logger.info(f"{self}: applying v4l2-ctl exposure settings to {device_path}: {v4l2_controls}")
-        for ctrl in v4l2_controls:
-            try:
-                result = subprocess.run(
-                    ["v4l2-ctl", "-d", device_path, f"--set-ctrl={ctrl}"],
-                    check=False,
-                    capture_output=True,
-                    timeout=5,
-                )
-                if result.returncode == 0:
-                    logger.info(f"{self}: set {ctrl} successfully")
-                else:
-                    stderr = result.stderr.decode()[:100] if result.stderr else 'none'
-                    logger.warning(f"{self}: failed to set {ctrl}: {stderr}")
-            except (subprocess.TimeoutExpired, FileNotFoundError) as e:
-                logger.warning(f"{self}: v4l2-ctl failed for {ctrl}: {e}")
+        if self.config.fourcc is not None and set_fourcc_after_size_and_fps:
+            # On Windows with DSHOW, changing the resolution can silently override the FOURCC setting.
+            # Set FOURCC last to make sure the requested pixel format is actually enforced.
+            self._validate_fourcc()
 
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
@@ -363,33 +289,12 @@ class OpenCVCamera(Camera):
             )
 
     @staticmethod
-    def _has_video_capture_cap(path: str) -> bool:
-        """Check if a /dev/videoN device supports Video Capture (not metadata-only)."""
-        import fcntl
-        import struct
-
-        VIDIOC_QUERYCAP = 0x80685600
-        V4L2_CAP_VIDEO_CAPTURE = 0x1
-        try:
-            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
-            try:
-                buf = bytearray(200)
-                fcntl.ioctl(fd, VIDIOC_QUERYCAP, buf)
-                device_caps = struct.unpack_from("I", buf, offset=0x58)[0]
-                return bool(device_caps & V4L2_CAP_VIDEO_CAPTURE)
-            finally:
-                os.close(fd)
-        except OSError:
-            return False
-
-    @staticmethod
     def find_cameras() -> list[dict[str, Any]]:
         """
         Detects available OpenCV cameras connected to the system.
 
-        On Linux, it scans '/dev/video*' paths, filtering out metadata-only devices.
-        On other systems (like macOS, Windows), it checks indices from 0 up to
-        `MAX_OPENCV_INDEX`.
+        On Linux, it scans '/dev/video*' paths. On other systems (like macOS, Windows),
+        it checks indices from 0 up to `MAX_OPENCV_INDEX`.
 
         Returns:
             List[Dict[str, Any]]: A list of dictionaries,
@@ -406,26 +311,8 @@ class OpenCVCamera(Camera):
             targets_to_scan = [int(i) for i in range(MAX_OPENCV_INDEX)]
 
         for target in targets_to_scan:
-            if platform.system() == "Linux" and isinstance(target, str):
-                if not OpenCVCamera._has_video_capture_cap(target):
-                    continue
-
             camera = cv2.VideoCapture(target)
             if camera.isOpened():
-                # Verify the camera can actually produce frames (not just open).
-                # Some devices enumerate but fail to stream (e.g., USB bandwidth
-                # issues, firmware bugs). Try a few times before giving up.
-                can_read = False
-                for _ in range(5):
-                    ret, frame = camera.read()
-                    if ret and frame is not None and frame.size > 0:
-                        can_read = True
-                        break
-                if not can_read:
-                    logger.debug(f"Skipping {target}: opened but cannot read frames")
-                    camera.release()
-                    continue
-
                 default_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
                 default_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
                 default_fps = camera.get(cv2.CAP_PROP_FPS)
@@ -466,6 +353,7 @@ class OpenCVCamera(Camera):
 
         return frame
 
+    @check_if_not_connected
     def read(self, color_mode: ColorMode | None = None) -> NDArray[Any]:
         """
         Reads a single frame synchronously from the camera.
@@ -491,9 +379,6 @@ class OpenCVCamera(Camera):
             logger.warning(
                 f"{self} read() color_mode parameter is deprecated and will be removed in future versions."
             )
-
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
@@ -551,17 +436,18 @@ class OpenCVCamera(Camera):
         Internal loop run by the background thread for asynchronous reading.
 
         On each iteration:
-        1. Reads a color frame
+        1. Reads a color frame (blocking call)
         2. Stores result in latest_frame and updates timestamp (thread-safe)
         3. Sets new_frame_event to notify listeners
 
         Stops on DeviceNotConnectedError, logs other errors and continues.
         """
-        if self.stop_event is None:
+        stop_event = self.stop_event
+        if stop_event is None:
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
-        while not self.stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
                 processed_frame = self._postprocess_image(raw_frame)
@@ -599,6 +485,8 @@ class OpenCVCamera(Camera):
 
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=2.0)
+            if self.thread.is_alive():
+                logger.warning(f"{self} read thread did not terminate within timeout.")
 
         self.thread = None
         self.stop_event = None
@@ -608,6 +496,7 @@ class OpenCVCamera(Camera):
             self.latest_timestamp = None
             self.new_frame_event.clear()
 
+    @check_if_not_connected
     def async_read(self, timeout_ms: float = 200) -> NDArray[Any]:
         """
         Reads the latest available frame asynchronously.
@@ -630,8 +519,6 @@ class OpenCVCamera(Camera):
             TimeoutError: If no frame becomes available within the specified timeout.
             RuntimeError: If an unexpected error occurs.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")
@@ -651,7 +538,8 @@ class OpenCVCamera(Camera):
 
         return frame
 
-    def read_latest(self, max_age_ms: int = 1000) -> NDArray[Any]:
+    @check_if_not_connected
+    def read_latest(self, max_age_ms: int = 500) -> NDArray[Any]:
         """Return the most recent frame captured immediately (Peeking).
 
         This method is non-blocking and returns whatever is currently in the
@@ -666,8 +554,6 @@ class OpenCVCamera(Camera):
             DeviceNotConnectedError: If the camera is not connected.
             RuntimeError: If the camera is connected but has not captured any frames yet.
         """
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
 
         if self.thread is None or not self.thread.is_alive():
             raise RuntimeError(f"{self} read thread is not running.")

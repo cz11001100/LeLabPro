@@ -17,7 +17,7 @@ dependencies = [
     "psutil>=5.9.0",
     # SSH runner (lelab/runners/ssh_remote.py) + remote env installer.
     "paramiko>=3.4.0",
-    "lerobot[feetech,smolvla] @ git+https://github.com/cz11001100/LeLabPro.git@main#subdirectory=lerobot",
+    "lerobot[core_scripts,feetech,smolvla,training] @ git+https://github.com/cz11001100/LeLabPro.git@main#subdirectory=lerobot",
     # Windows-only: real DirectShow camera names for /available-cameras so the
     # frontend can match a camera to its browser deviceId (issues #12, #16).
     # Guarded by try/except at the call site, so its absence degrades gracefully.

@@ -136,17 +136,53 @@ def _platform_backend():
 
 
 def _build_camera_configs(cameras: dict, default_backend) -> dict:
-    """Convert the frontend camera dict into OpenCVCameraConfig objects.
+    """Convert the frontend camera dict into lerobot camera configs.
 
-    `backend` (a Cv2Backends name) and `fourcc` (a 4-char code) are optional per
-    camera; when omitted they fall back to `default_backend` and auto-detect.
+    A camera whose source is a stream URL becomes a `NetworkCameraConfig`, opened
+    through OpenCV's FFmpeg backend. For those the resolution and frame rate come
+    from what the stream actually sends, because lerobot turns these numbers into
+    the dataset's image features and a live encoder refuses a resolution it wasn't
+    configured for. `backend` (a Cv2Backends name) and `fourcc` only apply to
+    device indices.
     """
     from lerobot.cameras.configs import Cv2Backends
     from lerobot.cameras.opencv import OpenCVCameraConfig
 
+    from .network_camera import (
+        NetworkCameraError,
+        NetworkCameraConfig,
+        camera_source,
+        install_camera_factory_hook,
+        probe,
+        redact,
+    )
+
     camera_configs: dict = {}
     for camera_name, camera_data in cameras.items():
-        if camera_data.get("type") != "opencv":
+        kind, source = camera_source(camera_data)
+
+        if kind == "network":
+            install_camera_factory_hook()
+            try:
+                stream = probe(str(source))
+            except NetworkCameraError as e:
+                raise RuntimeError(
+                    f"{camera_name} ({redact(source)}) is not reachable: {e}. "
+                    "Check the camera is on this network and that the URL plays in VLC."
+                ) from e
+            fps = stream["fps"] or camera_data.get("fps") or 30
+            width = stream["width"] or camera_data.get("width") or 640
+            height = stream["height"] or camera_data.get("height") or 480
+            camera_configs[camera_name] = NetworkCameraConfig(
+                index_or_path=str(source), fps=fps, width=width, height=height
+            )
+            logger.info(
+                f"✅ CAMERA CONFIG: {camera_name} -> NetworkCameraConfig("
+                f"url={redact(source)}, {width}x{height}@{fps}fps probed from the stream)"
+            )
+            continue
+
+        if kind != "opencv":
             logger.warning(
                 f"⚠️ CAMERA CONFIG: Unsupported camera type '{camera_data.get('type')}' for {camera_name}"
             )
@@ -1347,8 +1383,17 @@ def _harden_camera_reads(robot) -> None:
     from re-triggering reads on the others, and puts the logical name in the log —
     OpenCVCamera's own message only carries the numeric index, which cannot be
     turned back into up/side/wrist after the fact.
+
+    Network cameras are skipped: `NetworkCamera` already holds its last good frame
+    and reopens the stream from its own thread, which is what a dropped Wi-Fi link
+    needs and this escalation ladder can't do.
     """
+    from .network_camera import NetworkCamera
+
     for name, cam in getattr(robot, "cameras", {}).items():
+        if isinstance(cam, NetworkCamera):
+            logger.info(f"🌐 CAMERA READ: {name} is a stream source — using its own reconnect guard")
+            continue
         original = cam.async_read
         latest = cam.read_latest
 
