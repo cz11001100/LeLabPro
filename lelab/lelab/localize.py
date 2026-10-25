@@ -352,7 +352,9 @@ def _replay(args, predictor, colors, out_dir: Path, joint_names) -> list[dict]:
     """Same prediction path, fed from dataset frames — no hardware needed."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    dataset = LeRobotDataset(args.dataset)
+    from .utils.video_backend import video_backend
+
+    dataset = LeRobotDataset(args.dataset, video_backend=video_backend())
     indices = [int(x) for x in str(args.replay_indices).split(",") if x.strip()]
     rows = []
     for slot, index in enumerate(indices, start=1):

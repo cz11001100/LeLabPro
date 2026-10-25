@@ -39,6 +39,10 @@ on_error() {
 }
 trap on_error ERR
 
+# 国内镜像下大 wheel（torch/cudnn/rerun-sdk 几百 MB）常超 uv 默认 30s 而中断，
+# 报 "I/O operation failed during extraction / network timeout"。放宽到 300s。
+export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
+
 # ---------- 退出 conda，避免它覆盖 PATH ----------
 FAILED_STEP="退出 conda"
 if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then

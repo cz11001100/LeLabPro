@@ -66,11 +66,14 @@ def load_for_saliency(checkpoint_path: str, dataset_repo_id: str, dataset_root: 
     cfg.pretrained_path = checkpoint_path
     cfg.device = str(dev)
 
+    from .utils.video_backend import video_backend
+
     ds_meta = LeRobotDatasetMetadata(dataset_repo_id, root=dataset_root or None)
     dataset = LeRobotDataset(
         dataset_repo_id,
         root=dataset_root or None,
         delta_timestamps=resolve_delta_timestamps(cfg, ds_meta),
+        video_backend=video_backend(),
     )
     policy = make_policy(cfg=cfg, ds_meta=ds_meta)
     policy.eval()

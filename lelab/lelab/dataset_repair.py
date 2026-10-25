@@ -755,7 +755,9 @@ def delete_episodes_via_rebuild(root: Path, repo_id: str, episode_indices: list[
     )
 
     try:
-        src = LeRobotDataset(repo_id, root=root)
+        from .utils.video_backend import video_backend
+
+        src = LeRobotDataset(repo_id, root=root, video_backend=video_backend())
     except Exception as e:
         _update_repair_progress(active=False, completed=False, error=str(e), phase="Cannot open dataset")
         raise DatasetRepairError(f"{repo_id}: cannot be opened for editing ({e})") from e

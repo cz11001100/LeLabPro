@@ -63,3 +63,6 @@ node_modules/
 *.tsbuildinfo
 .eslintcache
 /coverage/
+
+# 指向开发机现有虚拟环境的软链（带斜杠的规则不匹配软链接，故单列）
+/venv

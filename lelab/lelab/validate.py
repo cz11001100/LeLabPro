@@ -298,6 +298,21 @@ def _charts(path, joint_names, per_joint_mae, per_joint_naive, horizon_mae, drif
     return out
 
 
+def _video_backend() -> str:
+    """Decoder that works here. Inlined because jobs.py uploads this file to
+    /tmp and runs it standalone, so it cannot import from lelab.utils."""
+    import importlib.util
+
+    if importlib.util.find_spec("torchcodec") is not None:
+        try:
+            from torchcodec.decoders import VideoDecoder  # noqa: F401
+        except Exception as exc:
+            print(f"torchcodec unusable ({str(exc).splitlines()[0]}); decoding with pyav")
+        else:
+            return "torchcodec"
+    return "pyav" if importlib.util.find_spec("av") is not None else "torchcodec"
+
+
 def run_validation(
     checkpoint_path: str,
     dataset_repo_id: str,
@@ -367,7 +382,12 @@ def run_validation(
 
         # Chunked policies expect [B, chunk, dim] actions; mirror training.
         delta_timestamps = resolve_delta_timestamps(cfg, ds_meta)
-        dataset = LeRobotDataset(dataset_repo_id, root=dataset_root or None, delta_timestamps=delta_timestamps)
+        dataset = LeRobotDataset(
+            dataset_repo_id,
+            root=dataset_root or None,
+            delta_timestamps=delta_timestamps,
+            video_backend=_video_backend(),
+        )
 
         policy = make_policy(cfg=cfg, ds_meta=ds_meta)
         policy.eval()
