@@ -12,7 +12,7 @@ const LandingTopBar: React.FC = () => {
             className="h-7 w-7"
           />
           <span className="text-base font-semibold tracking-tight text-white">
-            LeLab
+            LeLabPro
           </span>
         </div>
         <HfAuthChip />
