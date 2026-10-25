@@ -11,32 +11,41 @@ SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥
 
 ## 快速开始
 
+**一条命令装好整个环境**（自动处理 conda 冲突、装 uv、建 Python 3.12 虚拟环境、走国内镜像装依赖、最后自检）：
+
 ```bash
-# 方式一：一条命令装（会自动从本仓库的 lerobot/ 子目录拉取补丁版框架）
-uv tool install "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
+```
+
+装完启动：
+
+```bash
+./LeLabPro/lelab-run.sh
+```
+
+浏览器打开 **http://localhost:8000**。
+
+脚本会克隆仓库到当前目录下的 `LeLabPro/`，虚拟环境在 `LeLabPro/lerobot-env/`。已经克隆过的话重复执行会复用并 `git pull` 更新。
+
+### 备选：只装成命令行工具
+
+不想用脚本、只要一个 `lelab` 命令时：
+
+```bash
+uv tool install --python 3.12 \
+  --default-index https://pypi.tuna.tsinghua.edu.cn/simple \
+  "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
 lelab
 ```
 
-```bash
-# 方式二：克隆后本地装
-git clone https://github.com/cz11001100/LeLabPro.git
-cd LeLabPro/lelab
-pip install -e .
-lelab
-```
+> **`--python 3.12` 不能省。** 不写的话 uv 会挑系统里默认的 Python，若那是 3.14 就会撞上 `torch 2.7.1 无 cp314 轮子` 而解析失败。`--default-index` 是给国内网络的，海外网络可去掉。
 
-启动后浏览器打开 **http://localhost:8000**。
+### 环境要求
 
-环境要求：**Python 3.12+**、Git；训练需要 NVIDIA GPU；机械臂需 USB 串口驱动（Windows 装 CH340/CP2102）。
-
-## 相比上游多了什么
-
-- **SSH 远程训练 / 导出 / 续训** — 本机采集，云端 4090 训练，一键回捞 checkpoint
-- **数据集质检与修复** — 视频帧完整性、重复 episode、表格越界检查，中断数据集重建
-- **录制续录** — 采集中断后接着录，不用整批重录
-- **推理期 chunk 平滑** — 可选 EMA 包装，缓解逐帧抖动
-- **模型评估面板** — 开环误差、感知探针、显著性图、ROI 定位、指向反演五件套
-- **SO-100 实机调参** — 电机总线、串口吞吐、摄像头后端的本地修复
+- **Python 3.12**（安装脚本会自动准备，无需手动装）
+- **Git**、可访问网络
+- 训练需要 NVIDIA GPU；纯采集/推理不需要
+- 机械臂需 USB 串口驱动（Windows 装 CH340/CP2102），Linux 上当前用户要在 `dialout` 组
 
 ## 文档
 
