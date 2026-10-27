@@ -32,6 +32,7 @@
 - **SSH 连接在长命令期间被切断**：远端环境安装的连接未设 keepalive 心跳，`apt-get` 数分钟无数据往来时被防火墙/NAT 静默断开，表现为"测试连接正常，装环境到第 2 步就断"。现每 30 秒发一次心跳
 - **大依赖包下载超时**：国内镜像下 `torch`、`rerun-sdk` 等数百 MB 的包超过 uv 默认 30s HTTP 超时导致安装中断，放宽至 300s
 - **若干指向不存在模块的 import**：`lerobot.configs.dataset` → `lerobot.scripts.lerobot_record`、`lerobot.datasets` → `lerobot.datasets.lerobot_dataset`
+- **一键升级在 monorepo 下必然失败**：解析安装来源时未剥离 URL 的 `#subdirectory=lelab` 片段，仓库名被识别成 `LeLabPro.git#subdirectory=lelab`，重建安装地址时又在其后追加 `.git`，得到不存在的子目录 `lelab.git`。凡是通过 `uv tool install` 安装的人点"升级"都会失败。现正确拆分仓库名与子目录并在生成命令时重新拼接，同时补 6 项回归测试（单仓库安装路径行为不变）
 
 ### 变更
 

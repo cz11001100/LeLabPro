@@ -237,3 +237,60 @@ def test_update_command_for_pip_env(monkeypatch):
     cmd = update._build_update_cmd("huggingface", "leLab")
     assert cmd[:4] == [update.sys.executable, "-m", "pip", "install"]
     assert "--force-reinstall" in cmd
+
+
+# ---- monorepo: the installable package lives in a subdirectory ----
+
+MONOREPO_URL = "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+
+
+def test_parse_github_repo_strips_subdirectory_fragment():
+    """Without stripping, the repo comes back as "LeLabPro.git#subdirectory=lelab"."""
+    assert update._parse_github_repo(MONOREPO_URL) == ("cz11001100", "LeLabPro")
+
+
+def test_parse_github_subdirectory():
+    assert update._parse_github_subdirectory(MONOREPO_URL) == "lelab"
+    assert update._parse_github_subdirectory("https://github.com/a/b.git") is None
+    assert update._parse_github_subdirectory("") is None
+
+
+def test_installed_source_keeps_subdirectory(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "distribution",
+        lambda name: _fake_dist(
+            {"url": MONOREPO_URL, "vcs_info": {"vcs": "git", "commit_id": "abc123"}}
+        ),
+    )
+    assert update.get_installed_source() == {
+        "commit": "abc123",
+        "owner": "cz11001100",
+        "repo": "LeLabPro",
+        "subdirectory": "lelab",
+    }
+
+
+def test_update_command_keeps_fragment_out_of_repo_name(monkeypatch):
+    """Regression: ".git" used to be appended *after* the fragment, producing
+    the non-existent subdirectory "lelab.git" and a failed upgrade."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
+    cmd = update._build_update_cmd("cz11001100", "LeLabPro", "lelab")
+    assert cmd[-1] == "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+
+
+def test_uv_tool_update_command_keeps_fragment(monkeypatch):
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    cmd = update._build_update_cmd("cz11001100", "LeLabPro", "lelab")
+    assert cmd == ["uv", "tool", "install", "--force",
+                   "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"]
+
+
+def test_single_repo_install_unaffected(monkeypatch):
+    """Upstream's flat layout must keep working with no fragment at all."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
+    cmd = update._build_update_cmd("huggingface", "leLab")
+    assert cmd[-1] == "git+https://github.com/huggingface/leLab.git"

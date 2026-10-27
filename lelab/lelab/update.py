@@ -63,30 +63,53 @@ class UpdateResult(BaseModel):
     output: str = ""
 
 
+def _split_fragment(url: str) -> tuple[str, str]:
+    """Split a PEP 508 git URL into ``(without_fragment, fragment)``."""
+    base, _, frag = url.partition("#")
+    return base, frag
+
+
 def _parse_github_repo(url: str) -> tuple[str, str] | None:
-    """Extract ``(owner, repo)`` from a GitHub clone URL, or None if not GitHub."""
+    """Extract ``(owner, repo)`` from a GitHub clone URL, or None if not GitHub.
+
+    The ``#subdirectory=...`` fragment a monorepo install carries must be
+    stripped before the ``.git`` suffix is removed, otherwise the repo name
+    comes back as ``LeLabPro.git#subdirectory=lelab`` and rebuilding the URL
+    appends a second ``.git`` after the fragment — yielding the non-existent
+    subdirectory ``lelab.git`` and a failed update.
+    """
     if not url or "github.com" not in url:
         return None
-    u = url.strip().removeprefix("git+")
+    u, _ = _split_fragment(url.strip().removeprefix("git+"))
     if u.startswith("git@"):
         # git@github.com:owner/repo.git
         _, _, path = u.partition(":")
     else:
         # https://github.com/owner/repo(.git)
         path = u.split("github.com", 1)[1].lstrip("/:")
-    path = path.removesuffix(".git").strip("/")
+    path = path.split("?", 1)[0].removesuffix(".git").strip("/")
     parts = path.split("/")
     if len(parts) < 2 or not parts[0] or not parts[1]:
         return None
     return parts[0], parts[1]
 
 
+def _parse_github_subdirectory(url: str) -> str | None:
+    """The ``subdirectory=`` value from a git URL fragment, if any."""
+    _, frag = _split_fragment((url or "").strip())
+    for part in frag.split("&"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "subdirectory" and value.strip():
+            return value.strip("/")
+    return None
+
+
 def get_installed_source() -> dict[str, str] | None:
     """Read the installed git commit and origin repo from pip metadata.
 
-    Returns ``{"commit", "owner", "repo"}`` for a git install, or None for
-    editable/local/non-git installs (where there's nothing meaningful to
-    compare against).
+    Returns ``{"commit", "owner", "repo"}`` (plus ``"subdirectory"`` for a
+    monorepo install) for a git install, or None for editable/local/non-git
+    installs (where there's nothing meaningful to compare against).
     """
     try:
         dist = distribution("lelab")
@@ -102,11 +125,16 @@ def get_installed_source() -> dict[str, str] | None:
     commit = (data.get("vcs_info") or {}).get("commit_id")
     if not commit:
         return None
-    repo = _parse_github_repo(data.get("url", ""))
+    url = data.get("url", "")
+    repo = _parse_github_repo(url)
     if repo is None:
         return None
     owner, name = repo
-    return {"commit": commit, "owner": owner, "repo": name}
+    source = {"commit": commit, "owner": owner, "repo": name}
+    subdirectory = _parse_github_subdirectory(url)
+    if subdirectory:
+        source["subdirectory"] = subdirectory
+    return source
 
 
 def _github_json(path: str) -> Any | None:
@@ -137,7 +165,7 @@ def _is_uv_tool_install() -> bool:
     return "uv/tools" in Path(sys.executable).as_posix()
 
 
-def _build_update_cmd(owner: str, repo: str) -> list[str]:
+def _build_update_cmd(owner: str, repo: str, subdirectory: str | None = None) -> list[str]:
     """Pick the right updater for how LeLab was installed.
 
     - Standard install is `uv tool install`: update the tool in place with
@@ -146,8 +174,14 @@ def _build_update_cmd(owner: str, repo: str) -> list[str]:
     - uv venv install: `uv pip install` pinned to this interpreter (uv venvs
       ship no pip), matching the extra-install flow in utils/system.py.
     - Plain pip env: `python -m pip install`.
+
+    ``subdirectory`` is re-attached because LeLabPro is a monorepo: the
+    installable package lives in ``lelab/``, so a bare repo URL has no
+    ``pyproject.toml`` at its root and the install fails.
     """
     target = f"git+https://github.com/{owner}/{repo}.git"
+    if subdirectory:
+        target = f"{target}#subdirectory={subdirectory}"
     if shutil.which("uv") and _is_uv_tool_install():
         return ["uv", "tool", "install", "--force", target]
     flags = ["--upgrade", "--force-reinstall", target]
@@ -156,9 +190,9 @@ def _build_update_cmd(owner: str, repo: str) -> list[str]:
     return [sys.executable, "-m", "pip", "install", *flags]
 
 
-def _update_command(owner: str, repo: str) -> str:
+def _update_command(owner: str, repo: str, subdirectory: str | None = None) -> str:
     """The exact command the Update button runs — shown so manual copy matches."""
-    return shlex.join(_build_update_cmd(owner, repo))
+    return shlex.join(_build_update_cmd(owner, repo, subdirectory))
 
 
 def _compute_status() -> dict[str, Any]:
@@ -171,7 +205,7 @@ def _compute_status() -> dict[str, Any]:
     base = UpdateStatus(
         update_available=False,
         current_commit=current,
-        update_command=_update_command(owner, repo),
+        update_command=_update_command(owner, repo, source.get("subdirectory")),
         can_auto_update=True,
     )
 
