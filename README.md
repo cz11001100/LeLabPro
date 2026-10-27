@@ -11,7 +11,7 @@ SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥
 
 ## 快速开始
 
-**一条命令装好整个环境**（自动处理 conda 冲突、装 uv、建 Python 3.12 虚拟环境、走国内镜像装依赖、最后自检）：
+**一条命令装好整个环境**（自动处理 conda 冲突、装 uv、建 Python 3.12 虚拟环境、走国内镜像装依赖、按需修复 torchcodec 的 FFmpeg 依赖、最后逐模块自检）：
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
@@ -46,6 +46,22 @@ lelab
 - **Git**、可访问网络
 - 训练需要 NVIDIA GPU；纯采集/推理不需要
 - 机械臂需 USB 串口驱动（Windows 装 CH340/CP2102），Linux 上当前用户要在 `dialout` 组
+
+## 升级
+
+两种方式取决于你怎么装的：
+
+**用 `install.sh` 装的** —— 代码是仓库的 editable 安装，拉最新代码后重跑脚本即可，已装好的依赖走缓存、很快：
+
+```bash
+cd LeLabPro
+git pull
+bash install.sh
+```
+
+**用 `uv tool install` 装的** —— 界面会提示"落后 N 个提交"，点 **Update** 就地升级；也可以照它显示的那条命令手动执行。
+
+> 只有远端确实有更新时才提示。若你的安装领先于默认分支、或历史被改写过（`diverged`），不会弹升级提示 —— 就地强制重装会丢掉本地提交。
 
 ## 文档
 
