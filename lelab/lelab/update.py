@@ -268,7 +268,7 @@ def handle_run_update() -> UpdateResult:
         )
     try:
         proc = subprocess.run(
-            _build_update_cmd(source["owner"], source["repo"]),
+            _build_update_cmd(source["owner"], source["repo"], source.get("subdirectory")),
             capture_output=True,
             text=True,
             timeout=600,

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import types
 
 import pytest
 
@@ -294,3 +295,32 @@ def test_single_repo_install_unaffected(monkeypatch):
     monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
     cmd = update._build_update_cmd("huggingface", "leLab")
     assert cmd[-1] == "git+https://github.com/huggingface/leLab.git"
+
+
+def test_run_update_passes_subdirectory_to_the_real_command(monkeypatch):
+    """The displayed command and the executed one are built separately — both
+    must carry the fragment, or the button still runs the broken URL."""
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {
+            "commit": "abc123",
+            "owner": "cz11001100",
+            "repo": "LeLabPro",
+            "subdirectory": "lelab",
+        },
+    )
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    result = update.handle_run_update()
+    assert result.success is True
+    assert captured["cmd"][-1] == (
+        "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
+    )
