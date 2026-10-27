@@ -227,6 +227,8 @@ def test_update_command_for_uv_tool_install(monkeypatch):
         "tool",
         "install",
         "--force",
+        "--python",
+        "3.12",
         "git+https://github.com/huggingface/leLab.git",
     ]
 
@@ -285,7 +287,7 @@ def test_uv_tool_update_command_keeps_fragment(monkeypatch):
     monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
     cmd = update._build_update_cmd("cz11001100", "LeLabPro", "lelab")
-    assert cmd == ["uv", "tool", "install", "--force",
+    assert cmd == ["uv", "tool", "install", "--force", "--python", "3.12",
                    "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"]
 
 
@@ -324,3 +326,12 @@ def test_run_update_passes_subdirectory_to_the_real_command(monkeypatch):
     assert captured["cmd"][-1] == (
         "git+https://github.com/cz11001100/LeLabPro.git#subdirectory=lelab"
     )
+
+
+def test_uv_tool_update_pins_python_312(monkeypatch):
+    """Without the pin, uv resolves the machine default (often 3.14) and the
+    upgrade fails on torch having no cp314 wheels."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    cmd = update._build_update_cmd("cz11001100", "LeLabPro", "lelab")
+    assert cmd[cmd.index("--python") + 1] == "3.12"

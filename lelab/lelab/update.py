@@ -183,7 +183,10 @@ def _build_update_cmd(owner: str, repo: str, subdirectory: str | None = None) ->
     if subdirectory:
         target = f"{target}#subdirectory={subdirectory}"
     if shutil.which("uv") and _is_uv_tool_install():
-        return ["uv", "tool", "install", "--force", target]
+        # Pin the interpreter: without this, uv picks the machine's default
+        # Python, which on boxes where 3.14 is the newest resolves torch to a
+        # version with no cp314 wheels and the upgrade dies mid-resolve.
+        return ["uv", "tool", "install", "--force", "--python", "3.12", target]
     flags = ["--upgrade", "--force-reinstall", target]
     if shutil.which("uv"):
         return ["uv", "pip", "install", "--python", sys.executable, *flags]

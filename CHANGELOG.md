@@ -33,6 +33,11 @@
 - **大依赖包下载超时**：国内镜像下 `torch`、`rerun-sdk` 等数百 MB 的包超过 uv 默认 30s HTTP 超时导致安装中断，放宽至 300s
 - **若干指向不存在模块的 import**：`lerobot.configs.dataset` → `lerobot.scripts.lerobot_record`、`lerobot.datasets` → `lerobot.datasets.lerobot_dataset`
 - **一键升级在 monorepo 下必然失败**：解析安装来源时未剥离 URL 的 `#subdirectory=lelab` 片段，仓库名被识别成 `LeLabPro.git#subdirectory=lelab`，重建安装地址时又在其后追加 `.git`，得到不存在的子目录 `lelab.git`。凡是通过 `uv tool install` 安装的人点"升级"都会失败。现正确拆分仓库名与子目录并在生成命令时重新拼接，同时补 6 项回归测试（单仓库安装路径行为不变）
+- **一键升级未固定 Python 版本**：`uv tool install` 那条升级命令没带 `--python`，uv 会挑机器默认解释器 —— 在默认是 3.14 的机器上，torch 没有 cp314 轮子，升级在解析阶段即失败。现固定为 `--python 3.12`，与安装命令一致
+
+### 变更
+
+- `lelab-run.sh` 查找虚拟环境的顺序新增同级目录 `LeLabPro_venv`，便于把环境放在仓库之外（避免备份、打包等递归操作展开整个 8GB 环境）
 
 ### 变更
 
