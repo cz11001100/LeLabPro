@@ -234,6 +234,35 @@ sudo apt install python3.12 python3.12-venv
 export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
 ```
 
+### 开了 VPN，下载反而更慢
+
+**现象**：挂上代理后 `install.sh` 卡在 `Downloading torch...`，比不开 VPN 还慢。
+
+原因是脚本默认走清华镜像，而部分代理客户端（TUN 模式）会把国内域名也一起送出境，流量绕一圈回来。此时官方源直连反而更快 —— 但**谁快没有定论**，取决于代理节点和规则，同一台机器两次测的结果都能互换。
+
+所以脚本不写死，装的时候会各测一次索引页响应时间，谁快用谁，并打印选中的源：
+
+```
+包索引: https://pypi.tuna.tsinghua.edu.cn/simple（VPN 下嫌国内源慢可设 LELAB_INDEX=off 重跑）
+```
+
+想手动指定，重跑前设一个环境变量即可：
+
+```bash
+LELAB_INDEX=off bash install.sh    # 强制官方源
+LELAB_INDEX=https://mirrors.aliyun.com/pypi/simple bash install.sh   # 任意镜像
+```
+
+已经自己配好 `UV_INDEX_URL` / `UV_DEFAULT_INDEX` / `PIP_INDEX_URL` 的，脚本尊重你的设置，不再探测。
+
+判断当前到底谁快，可以自己测（看 `time_total`，小的赢）：
+
+```bash
+for u in https://pypi.tuna.tsinghua.edu.cn/simple/paramiko/ https://pypi.org/simple/paramiko/; do
+  echo "$(curl -m 8 -so /dev/null -w '%{time_total}' $u)  $u"
+done
+```
+
 ### uv 装不上 / 下载 Python 失败
 
 脚本要 uv 自动下载独立 CPython，国内网络可能超时。先装系统 Python：

@@ -22,6 +22,7 @@
 
 - 一键安装脚本 `install.sh`，支持 `curl | bash` 自举：自动退出 conda、装 uv、建 Python 3.12 虚拟环境、走国内镜像装依赖、结束时自检关键模块
 - 全局 `lelab` 命令：交互 shell 中输入即自动准备环境（退出 conda → 激活虚拟环境 → 注入 FFmpeg 路径 → 启动），命令跑完激活态保留在当前 shell
+- 安装时的包索引自动选路：开 VPN / 代理的机器上默认国内镜像会绕境导致下载变慢，现改为先测国内镜像与官方源索引页的响应时间、取较快者，并打印选中的地址。`LELAB_INDEX=off` 强制官方源、`LELAB_INDEX=<url>` 指定任意镜像；已设置 `UV_DEFAULT_INDEX` / `UV_INDEX_URL` / `PIP_INDEX_URL` 的用户沿用其设置，安装过程不再用国内镜像覆盖它
 
 ## [2026-10-27]
 

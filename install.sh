@@ -43,6 +43,37 @@ trap on_error ERR
 # 报 "I/O operation failed during extraction / network timeout"。放宽到 300s。
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 
+# ---------- 选择包索引 ----------
+# 开 VPN 时国内镜像反而慢（流量绕到境外再回来），所以不写死：
+# 1) 尊重用户已设的 UV_DEFAULT_INDEX / UV_INDEX_URL / PIP_INDEX_URL
+# 2) LELAB_INDEX=off 强制用官方源，LELAB_INDEX=<url> 自定义
+# 3) 否则各测一次小索引页的响应时间，谁快用谁；测不动就退回国内镜像
+pick_index() {
+    local cn="$MIRROR" off="https://pypi.org/simple"
+    if [[ -n "${LELAB_INDEX:-}" ]]; then
+        case "$LELAB_INDEX" in
+            off|pypi|official) echo "$off" ;;
+            *) echo "$LELAB_INDEX" ;;
+        esac
+        return
+    fi
+    local preset="${UV_DEFAULT_INDEX:-${UV_INDEX_URL:-${PIP_INDEX_URL:-}}}"
+    if [[ -n "$preset" ]]; then
+        echo "${preset#* }"
+        return
+    fi
+    local t_cn t_off
+    t_cn=$(curl -m 6 -so /dev/null -w '%{time_total}' "$cn/paramiko/" 2>/dev/null || echo 99)
+    t_off=$(curl -m 6 -so /dev/null -w '%{time_total}' "$off/paramiko/" 2>/dev/null || echo 99)
+    if awk -v a="$t_cn" -v b="$t_off" 'BEGIN { exit !(a + 0 <= b + 0) }'; then
+        echo "$cn"
+    else
+        echo "$off"
+    fi
+}
+export UV_INDEX_URL="$(pick_index)"
+info "包索引: $UV_INDEX_URL（VPN 下嫌国内源慢可设 LELAB_INDEX=off 重跑）"
+
 # ---------- 退出 conda，避免它覆盖 PATH ----------
 FAILED_STEP="退出 conda"
 if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
@@ -113,12 +144,12 @@ fi
 FAILED_STEP="步骤3 安装 lerobot"
 info "安装本仓库的 lerobot（含 feetech 电机 / SmolVLA / 训练依赖）..."
 info "  这步要下 torch 等大包，约 5-15 分钟，请耐心等"
-UV_INDEX_URL="$MIRROR" uv pip install --python "$VENV_PY" \
+uv pip install --python "$VENV_PY" \
     -e "$ROOT/lerobot[core_scripts,feetech,smolvla,training]"
 
 # ---------- RealSense（可选）----------
 FAILED_STEP="步骤4 pyrealsense2（可选，允许失败）"
-if UV_INDEX_URL="$MIRROR" uv pip install --python "$VENV_PY" \
+if uv pip install --python "$VENV_PY" \
      "pyrealsense2>=2.55.1.6486,<2.57.0" 2>/dev/null; then
     info "  pyrealsense2 已装（Intel RealSense 深度相机）"
 else
@@ -128,7 +159,7 @@ fi
 # ---------- lelab ----------
 FAILED_STEP="步骤5 安装 LeLab"
 info "安装 LeLab 依赖..."
-UV_INDEX_URL="$MIRROR" uv pip install --python "$VENV_PY" \
+uv pip install --python "$VENV_PY" \
     "fastapi[standard]>=0.115.12" "websockets>=15.0.1" "uvicorn>=0.24.0" \
     "psutil>=5.9.0" "paramiko>=3.4.0"
 info "安装 LeLab..."
