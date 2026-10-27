@@ -41,6 +41,7 @@
 - **SARM / RA-BC 训练命令用错配置节点**：此前按 policy 传参（`--policy.type=sarm` 等），但 lerobot 0.6 里 SARM 属于 reward model、并不在 policy 注册表中，训练必然失败。现改为 `--reward_model.*`，`repo_id` 与 `push_to_hub` 同样归到该节点
 - **RA-BC 权重参数层级错误**：`sample_weighting` 是 `TrainPipelineConfig` 的顶层字段，此前误加了 `--training.` 前缀，配置不被识别；现改为 `--sample_weighting.*`
 - **推理自动重启后偶发秒退**：连续运行时上一进程的串口、相机与显存尚未释放，新进程在原生初始化阶段即被杀，留下 0 字节日志且没有任何报错。现增加重启冷却时间，并对「非零退出 + 空日志」给出明确原因说明
+- **升级会改写受版本控制的启动器**：`install.sh` 无条件重新生成 `lelab-run.sh`，把仓库里的版本覆盖成另一份内容（少一个虚拟环境候选路径），且该文件受 git 跟踪 —— 于是升级后仓库变脏、下次 `git pull` 可能冲突，在把环境放在仓库之外的机器上启动器还会直接失效。现改为仅在文件缺失时才生成
 
 ### 变更
 

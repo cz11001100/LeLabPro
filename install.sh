@@ -146,11 +146,16 @@ fi
 
 # ---------- 启动脚本 ----------
 FAILED_STEP="生成启动脚本"
-cat > "$ROOT/lelab-run.sh" << 'WRAPPER'
+# 仓库自带 lelab-run.sh；只有从别处（如旧 tarball）安装、缺少该文件时才生成。
+# 无条件覆盖会让"升级"这一步把受版本控制的文件改脏，而且生成内容一旦与仓库版本
+# 不同，升级后启动器就指向了错误的虚拟环境。
+if [[ ! -f "$ROOT/lelab-run.sh" ]]; then
+    cat > "$ROOT/lelab-run.sh" << 'WRAPPER'
 #!/usr/bin/env bash
 # 启动 LeLab（代码与环境均来自本仓库）
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$DIR/venv"; [[ -d "$VENV" ]] || VENV="$DIR/lerobot-env"
+VENV="$DIR/../LeLabPro_venv"; [[ -d "$VENV" ]] || VENV="$DIR/venv"
+[[ -d "$VENV" ]] || VENV="$DIR/lerobot-env"
 [[ -d "$VENV" ]] || { echo "[ERROR] 未找到环境，先跑 install.sh"; exit 1; }
 
 if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then conda deactivate 2>/dev/null || true; fi
@@ -165,6 +170,7 @@ fi
 source "$VENV/bin/activate"
 exec lelab "$@"
 WRAPPER
+fi
 chmod +x "$ROOT/lelab-run.sh"
 
 # ---------- 自检 ----------
