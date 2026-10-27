@@ -216,6 +216,24 @@ uv pip install --python lerobot/bin/python 包名
 
 注意：用 `--python` 指定绝对路径，不依赖当前 shell 激活了哪个环境。
 
+### 卡在 `Downloading cpython-3.12...`
+
+不是卡死，多半是在跨境拉解释器。uv 会从 GitHub 下载约 32MB 的 CPython 并解压，国内网络下这一步可能耗十几分钟甚至重试。想确认它还在动：
+
+```bash
+du -sh ~/.local/share/uv/python       # 隔 20 秒看两次，数字在涨就正常
+```
+
+嫌慢的话，任选一种：
+
+```bash
+# 1) 用系统自带的 3.12，uv 就不会下载
+sudo apt install python3.12 python3.12-venv
+
+# 2) 给解释器下载也走国内代理
+export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-sh/python-build-standalone/releases/download
+```
+
 ### uv 装不上 / 下载 Python 失败
 
 脚本要 uv 自动下载独立 CPython，国内网络可能超时。先装系统 Python：

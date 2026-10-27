@@ -105,6 +105,7 @@ if [[ -d "$VENV" ]]; then
     info "复用已有虚拟环境 $VENV"
 else
     info "创建虚拟环境 (Python 3.12，与开发机一致)..."
+    info "  若本机没有 3.12，uv 会先下载解释器；国内网络这一步可能十几分钟，属正常"
     uv venv "$VENV" --python 3.12
 fi
 
