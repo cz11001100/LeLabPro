@@ -50,6 +50,7 @@ lelab
 ## 文档
 
 - 分平台安装：[lelab/INSTALL.md](lelab/INSTALL.md)
+- 更新日志：[CHANGELOG.md](CHANGELOG.md)
 - 报错排查（conda 冲突、SSH 断连、串口权限、import 错误等）：[TROUBLESHOOTING.md](TROUBLESHOOTING.md)
 - 开发架构说明：[lelab/CLAUDE.md](lelab/CLAUDE.md)
 
