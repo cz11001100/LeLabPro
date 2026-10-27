@@ -17,7 +17,7 @@ cd LeLabPro && git pull && bash install.sh
 **启动**
 
 ```bash
-./LeLabPro/lelab-run.sh
+lelab
 ```
 
 浏览器打开 http://localhost:8000。
@@ -28,6 +28,7 @@ cd LeLabPro && git pull && bash install.sh
 
 **2026-10-27**
 - 新增 部署与推理页「结束本回合」：收尾当前试次并自动进入下一回合
+- 新增 装完即用的全局 `lelab` 命令（自动准备环境并启动）
 - 修复 SARM / RA-BC 训练参数节点错误（`--policy.*` → `--reward_model.*`、`sample_weighting` 层级），训练可正常启动
 - 修复 一键升级在 monorepo 布局与 Python 3.14 下失败
 - 修复 SSH 远端装环境的权限探测、连接心跳与依赖下载超时

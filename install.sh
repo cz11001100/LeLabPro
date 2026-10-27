@@ -197,6 +197,52 @@ else
     warn "  [!] torchcodec 不可用 —— 视频解码退回 pyav，功能不受影响但更慢"
 fi
 
+# ---------- 全局 lelab 命令 ----------
+FAILED_STEP="配置全局 lelab 命令"
+BIN_DIR="$HOME/.local/bin"
+mkdir -p "$BIN_DIR"
+if [[ -e "$BIN_DIR/lelab" ]] && ! grep -q "LeLabPro" "$BIN_DIR/lelab" 2>/dev/null; then
+    BAK="$BIN_DIR/lelab.bak.$(date +%Y%m%d-%H%M%S)"
+    mv "$BIN_DIR/lelab" "$BAK"
+    warn "已备份原有的 $BIN_DIR/lelab → $(basename "$BAK")"
+fi
+# 脚本/非交互场景用：直接转发到启动器（启动器内含 conda 退出与 FFmpeg 路径注入）
+cat > "$BIN_DIR/lelab" << WRAPPER
+#!/usr/bin/env bash
+# 由 LeLabPro install.sh 生成
+exec "$ROOT/lelab-run.sh" "\$@"
+WRAPPER
+chmod +x "$BIN_DIR/lelab"
+
+# 交互场景用 shell 函数：能真正把激活态留在当前 shell，方便接着调试。
+# 注意函数里不能调用 lelab-run.sh —— 它结尾是 exec，会把当前 shell 顶掉。
+BASHRC="$HOME/.bashrc"
+if [[ -f "$BASHRC" ]]; then
+    cp "$BASHRC" "$BASHRC.bak.$(date +%Y%m%d-%H%M%S)"
+    sed -i '/^# >>> LeLabPro/,/^# <<< LeLabPro/d' "$BASHRC"
+    cat >> "$BASHRC" << BLOCK
+
+# >>> LeLabPro (install.sh) >>>
+# 输入 lelab 自动准备环境：退出 conda → 激活虚拟环境 → 注入 FFmpeg 路径 → 启动。
+case ":\$PATH:" in *":\$HOME/.local/bin:"*) ;; *) export PATH="\$HOME/.local/bin:\$PATH" ;; esac
+lelab() {
+    local root="$ROOT" venv=""
+    for cand in "\$root/lerobot-env" "\$root/venv" "\$root/../LeLabPro_venv"; do
+        [[ -d "\$cand" ]] && { venv="\$cand"; break; }
+    done
+    [[ -n "\$venv" ]] || { echo "[lelab] 未找到环境，先执行: cd \$root && bash install.sh" >&2; return 1; }
+    [[ -n "\${CONDA_DEFAULT_ENV:-}" ]] && conda deactivate 2>/dev/null
+    source "\$venv/bin/activate"
+    local shim
+    shim="\$("\$venv/bin/python" -c 'from lelab.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
+    [[ -n "\$shim" && -d "\$shim" ]] && export LD_LIBRARY_PATH="\$shim\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+    "\$venv/bin/lelab" "\$@"
+}
+# <<< LeLabPro (install.sh) <<<
+BLOCK
+    info "已在 $BASHRC 配置 lelab 函数（原文件已备份）"
+fi
+
 # ---------- 收尾 ----------
 echo ""
 echo "=========================================="
@@ -204,12 +250,13 @@ if $OK; then info "安装完成，自检全部通过 ✓"; else warn "安装完�
 echo "=========================================="
 echo ""
 step "启动"
-echo "  $ROOT/lelab-run.sh"
+echo "  lelab                      （新开终端生效；当前终端可先 source ~/.bashrc）"
+echo "  $ROOT/lelab-run.sh   （等价写法）"
 echo "  浏览器打开 http://localhost:8000"
 echo ""
 step "常用参数"
-echo "  ./lelab-run.sh --stop      清理残留进程（端口被占时用）"
-echo "  ./lelab-run.sh --no-open   不自动开浏览器"
+echo "  lelab --stop      清理残留进程（端口被占时用）"
+echo "  lelab --no-open   不自动开浏览器"
 echo ""
 step "环境出问题时"
 echo "  rm -rf $VENV && bash install.sh    # 重建环境"
