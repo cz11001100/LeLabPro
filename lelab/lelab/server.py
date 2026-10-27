@@ -70,6 +70,7 @@ from .record import (
 from .rollout import (
     InferenceRequest,
     TakeoverRequest,
+    handle_inference_end_round,
     handle_inference_snapshot,
     handle_inference_status,
     handle_inference_takeover,
@@ -407,6 +408,23 @@ def inference_snapshot():
         raise HTTPException(
             status_code=result.get("status_code", 500),
             detail=result.get("message", "Snapshot failed"),
+        )
+    return result
+
+
+class EndRoundBody(BaseModel):
+    advance: bool = True
+
+
+@app.post("/inference-end-round")
+def inference_end_round(body: EndRoundBody):
+    """End this trial (graceful: finalise data, arm returns home) and start the
+    next one — the rollout twin of the recording page's exit-early."""
+    result = handle_inference_end_round(advance=body.advance)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "End round failed"),
         )
     return result
 

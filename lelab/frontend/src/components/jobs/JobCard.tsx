@@ -31,6 +31,10 @@ import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 
 interface Props {
   job: JobRecord;
+  // Imported models downloaded from the same training run are grouped into one
+  // card; `group` holds every member (including `job`, the representative).
+  // Selecting a checkpoint swaps the active member for validation/inference.
+  group?: JobRecord[];
   onStop: (id: string) => void;
   onDelete: (id: string) => void;
   onPlay: (job: JobRecord, step: number) => void;
@@ -62,31 +66,27 @@ const statePresentation: Record<
   interrupted: { label: "已中断", color: "text-amber-400", Icon: AlertTriangle },
 };
 
-const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onResume }) => {
+const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPlay, onExport, onResume }) => {
   const navigate = useNavigate();
   const { baseUrl, fetchWithHeaders } = useApi();
   const { toast } = useToast();
+  // When grouped, the card represents one training run and `job` is the member
+  // whose checkpoint is currently selected; otherwise it is the single job.
+  const members = group && group.length > 1 ? group : null;
+  const [activeId, setActiveId] = useState<string>(jobProp.id);
+  const job = members
+    ? members.find((m) => m.id === activeId) ?? members[0]
+    : jobProp;
   const present = statePresentation[job.state];
   const Icon = present.Icon;
   const isRunning = job.state === "running";
   const isImported = job.runner === "imported";
-  const importedSource = job.hf_repo_id || job.output_dir;
   const stateLabel = isImported ? "已导入" : present.label;
   const isStarting = isRunning && job.metrics.total_steps === 0;
   const progressPct =
     job.metrics.total_steps > 0
       ? Math.min(100, (job.metrics.current_step / job.metrics.total_steps) * 100)
       : 0;
-
-  const subtitle = isImported
-    ? importedSource
-    : isStarting
-    ? "启动中…"
-    : isRunning
-    ? `开始于${relativeTime(job.started_at)}`
-    : job.ended_at != null
-    ? `结束于${relativeTime(job.ended_at)}`
-    : present.label.toLowerCase();
 
   const [checkpoints, setCheckpoints] = useState<JobCheckpoint[]>([]);
   const [selectedStep, setSelectedStep] = useState<number | null>(null);
@@ -276,6 +276,21 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
   // from the source job record so it survives reloads and server restarts.
   const isDownloaded =
     isSSH && selectedStep != null && (job.exported_steps ?? []).includes(selectedStep);
+  // Grouped imported run: collapse the " (step N)" suffix into a dropdown that
+  // switches the active member. Each member is a separate imported job.
+  const stepOf = (name: string) => {
+    const m = / \(step (\d+)\)$/.exec(name);
+    return m ? Number(m[1]) : 0;
+  };
+  const displayName = members ? job.name.replace(/ \(step \d+\)$/, "") : job.name;
+  const groupCheckpoints = members
+    ? members.map((m) => ({ step: stepOf(m.name), source: "local" as const, ref: m.id }))
+    : [];
+  const groupSelectedStep = members ? stepOf(job.name) : null;
+  const selectGroupStep = (step: number) => {
+    const target = members?.find((m) => stepOf(m.name) === step);
+    if (target) setActiveId(target.id);
+  };
   const exportPct =
     !exportProgress || exportProgress.state === "failed"
       ? 0
@@ -371,17 +386,9 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
           )}
         </div>
         <div>
-          <div className="text-white font-semibold truncate" title={job.name}>
-            {job.name}
+          <div className="text-white font-semibold truncate" title={displayName}>
+            {displayName}
           </div>
-          {!isImported ? (
-            <div
-              className="text-xs text-slate-400 truncate"
-              title={subtitle}
-            >
-              {subtitle}
-            </div>
-          ) : null}
         </div>
         {showProgressBar ? (
           <div className="relative h-5 w-full overflow-hidden rounded-md bg-slate-900 border border-slate-700">
@@ -394,107 +401,102 @@ const JobCard: React.FC<Props> = ({ job, onStop, onDelete, onPlay, onExport, onR
             </div>
           </div>
         ) : null}
-        {showInferenceRow || canValidate ? (
+        {showInferenceRow || canValidate || members || isSSH ? (
           <div className="flex items-center gap-2">
-            {showInferenceRow && !isImported ? (
+            {members ? (
+              <CheckpointDropdown
+                checkpoints={groupCheckpoints}
+                selectedStep={groupSelectedStep}
+                onChange={selectGroupStep}
+              />
+            ) : showInferenceRow || isSSH ? (
               <CheckpointDropdown
                 checkpoints={checkpoints}
                 selectedStep={selectedStep}
                 onChange={setSelectedStep}
+                placeholder={isSSH && checkpoints.length === 0 ? "no SSH..." : undefined}
               />
             ) : null}
-            {canResume ? (
+            {canResume || isSSH ? (
               <Button
                 size="icon"
-                onClick={(e) => { e.stopPropagation(); onResume!(job); }}
-                className="h-8 w-8 bg-amber-500 hover:bg-amber-600 text-white"
+                onClick={canResume ? (e) => { e.stopPropagation(); onResume!(job); } : undefined}
+                disabled={!canResume}
+                className={`h-8 w-8 ${
+                  canResume
+                    ? "bg-amber-500 hover:bg-amber-600 text-white"
+                    : "bg-slate-700 text-slate-500 cursor-not-allowed"
+                }`}
                 aria-label="Resume training from latest checkpoint"
+                title={canResume ? "从最新 checkpoint 续训" : "未检测到远端 checkpoint"}
               >
                 <RotateCcw className="w-4 h-4" />
               </Button>
             ) : null}
             {isSSH && onExport ? (
-              <>
-                <Button
-                  size="icon"
-                  onClick={handleExport}
-                  disabled={exporting}
-                  className={`h-8 w-8 text-white ${
-                    isDownloaded
-                      ? "bg-green-600 hover:bg-green-500"
-                      : "bg-blue-500 hover:bg-blue-600"
-                  }`}
-                  aria-label={isDownloaded ? "重新下载到本地" : "下载 checkpoint 到本地"}
-                  title={isDownloaded ? "已下载到本地（点击重新下载）" : "下载到本地"}
-                >
-                  {exporting ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : isDownloaded ? (
-                    <CheckCircle2 className="w-4 h-4" />
-                  ) : (
-                    <Download className="w-4 h-4" />
-                  )}
-                </Button>
-                <Button
-                  size="icon"
-                  onClick={exporting ? handleCancelExport : undefined}
-                  disabled={!exporting}
-                  className={`h-8 w-8 ${
-                    exporting
-                      ? "bg-red-500 hover:bg-red-600 text-white"
-                      : "bg-slate-700 text-slate-500 cursor-not-allowed"
-                  }`}
-                  aria-label="取消下载"
-                  title={exporting ? "正在下载，点击取消" : "无进行中的下载"}
-                >
-                  <Square className="w-4 h-4" />
-                </Button>
-              </>
+              <Button
+                size="icon"
+                onClick={exporting ? handleCancelExport : handleExport}
+                disabled={!exporting && !showInferenceRow}
+                className={`h-8 w-8 text-white ${
+                  exporting
+                    ? "bg-red-500 hover:bg-red-600"
+                    : !showInferenceRow
+                    ? "bg-slate-700 text-slate-500 cursor-not-allowed"
+                    : isDownloaded
+                    ? "bg-green-600 hover:bg-green-500"
+                    : "bg-blue-500 hover:bg-blue-600"
+                }`}
+                aria-label={exporting ? "取消下载" : isDownloaded ? "重新下载到本地" : "下载 checkpoint 到本地"}
+                title={
+                  exporting
+                    ? "正在下载，点击取消"
+                    : !showInferenceRow
+                    ? "未检测到远端 checkpoint"
+                    : isDownloaded
+                    ? "已下载到本地（点击重新下载）"
+                    : "下载到本地"
+                }
+              >
+                {exporting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : isDownloaded ? (
+                  <CheckCircle2 className="w-4 h-4" />
+                ) : (
+                  <Download className="w-4 h-4" />
+                )}
+              </Button>
             ) : null}
-            {showInferenceRow ? (
+            {isImported && showInferenceRow ? (
               <Button
                 size="icon"
                 onClick={handlePlay}
                 className="h-8 w-8 bg-green-500 hover:bg-green-600 text-white"
                 aria-label="Run inference with this checkpoint"
+                title="在机器人上运行"
               >
                 <Play className="w-4 h-4" />
               </Button>
             ) : null}
             {canValidate ? (
-              <>
-                <Button
-                  size="icon"
-                  onClick={handleValidate}
-                  disabled={validating || vState === "running"}
-                  className="h-8 w-8 bg-purple-500 hover:bg-purple-600 text-white"
-                  aria-label="Validate model"
-                >
-                  {validating || vState === "running" ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <FlaskConical className="w-4 h-4" />
-                  )}
-                </Button>
-                <Button
-                  size="icon"
-                  onClick={vState === "running" ? handleStopValidate : undefined}
-                  disabled={vState !== "running" || validating}
-                  className={`h-8 w-8 ${
-                    vState === "running"
-                      ? "bg-red-500 hover:bg-red-600 text-white"
-                      : "bg-slate-700 text-slate-500 cursor-not-allowed"
-                  }`}
-                  aria-label="停止评测"
-                  title={vState === "running" ? "正在评测，点击停止" : "无进行中的评测"}
-                >
-                  {validating ? (
-                    <Loader2 className="w-4 h-4 animate-spin" />
-                  ) : (
-                    <Square className="w-4 h-4" />
-                  )}
-                </Button>
-              </>
+              <Button
+                size="icon"
+                onClick={vState === "running" ? handleStopValidate : handleValidate}
+                disabled={validating}
+                className={`h-8 w-8 text-white ${
+                  vState === "running"
+                    ? "bg-red-500 hover:bg-red-600"
+                    : "bg-purple-500 hover:bg-purple-600"
+                }`}
+                aria-label={vState === "running" ? "停止评测" : "评测模型"}
+                title={vState === "running" ? "正在评测，点击停止" : "评测模型"}
+              >
+                {validating || vState === "running" ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <FlaskConical className="w-4 h-4" />
+                )}
+              </Button>
             ) : null}
           </div>
         ) : null}

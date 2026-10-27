@@ -35,7 +35,7 @@ export const CheckpointDropdown: React.FC<Props> = ({
       disabled={disabled || checkpoints.length === 0}
     >
       <SelectTrigger
-        className="bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 w-auto min-w-[110px]"
+        className="bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 w-[132px] shrink-0"
         onClick={(e) => e.stopPropagation()}
       >
         <SelectValue placeholder={placeholder} />

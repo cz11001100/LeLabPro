@@ -67,6 +67,9 @@ class InferenceRequest(BaseModel):
     # dagger only: record the policy frames too, so one episode holds both the
     # model's attempt and the human correction (hybrid episode).
     record_autonomous: bool = False
+    # dagger, corrections-only: close the round as soon as one correction is
+    # saved, then let LeLab start the next trial. Needs n_runs > 1.
+    auto_advance: bool = False
     leader_port: str = ""
     leader_config: str = ""
 
@@ -83,6 +86,16 @@ _inference_meta: dict[str, Any] = {}
 _inference_remaining_runs: int = 0
 _inference_current_run: int = 0
 _inference_restart_config: dict[str, Any] = {}
+# Set while "this round succeeded, start the next" is in flight: the status poll
+# must not race it for the restart, and the page must not bounce home during the
+# few seconds the subprocess takes to finalise and respawn.
+_inference_end_in_progress: bool = False
+# After a run exits, the kernel can still hold the serial port / V4L2 cameras
+# and the dying process's host+GPU memory may not be reclaimed for a moment.
+# Respawning the next run immediately intermittently kills it during native
+# init — before Python prints anything, leaving a 0-byte log with no error.
+# This cooldown lets those resources release between consecutive runs.
+_RESTART_COOLDOWN_S = 5.0
 # Guards mutations to the globals above; held only for the short critical
 # sections in start/stop/status. Reentrant because handle_inference_status
 # calls handle_start_inference to auto-restart the next run while it already
@@ -422,13 +435,39 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
         name = f"{org}/rollout_{tail}"
         root = Path(HF_LEROBOT_HOME) / name
         existing = _read_dataset_info(root)
+    if existing is None:
+        # A rollout session stamps a timestamp onto the repo id at create time,
+        # so an earlier round of this session may live in a "<name>_<stamp>"
+        # directory. Reuse the newest one instead of silently forking a sibling.
+        stamped = re.compile(rf"^{re.escape(tail)}_\d{{8}}_\d{{6}}$")
+        candidates = []
+        with contextlib.suppress(OSError):
+            candidates = sorted(
+                (p for p in root.parent.glob(f"{tail}_*") if stamped.match(p.name)),
+                key=lambda p: p.name,
+            )
+        for cand in reversed(candidates):
+            info = _read_dataset_info(cand)
+            if info is not None:
+                name, root, existing = f"{org}/{cand.name}", cand, info
+                break
 
+    # One correction per round when auto-advance is on: lerobot's own loop ends
+    # the session once it has saved its target, so the round closes the moment
+    # the operator finishes and LeLab starts the next trial. Hybrid recording
+    # has no such counter — episodes rotate on wall-clock — so there the round
+    # is closed by "本轮成功" or by the duration instead.
+    per_round = (
+        1
+        if (request.auto_advance and mode == "dagger" and not request.record_autonomous)
+        else request.num_episodes
+    )
     args = [
         f"--dataset.repo_id={name}",
         f"--dataset.root={root}",
         f"--dataset.single_task={request.task}",
         "--dataset.push_to_hub=false",
-        f"--dataset.num_episodes={request.num_episodes}",
+        f"--dataset.num_episodes={per_round}",
     ]
     resolved_leader = ""
     if existing is not None:
@@ -465,7 +504,7 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
             f"--teleop.port={resolved_leader}",
             f"--teleop.id={leader_id}",
             "--strategy.type=dagger",
-            f"--strategy.num_episodes={request.num_episodes}",
+            f"--strategy.num_episodes={per_round}",
             f"--strategy.record_autonomous={'true' if request.record_autonomous else 'false'}",
         ]
         if request.record_autonomous:
@@ -483,6 +522,8 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
             "dataset_root": str(root),
             "appending": existing is not None,
             "num_episodes": request.num_episodes,
+            "episodes_per_round": per_round,
+            "auto_advance": bool(request.auto_advance),
             "record_autonomous": bool(request.record_autonomous),
             "leader_port": resolved_leader,
         },
@@ -815,10 +856,9 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
                 inference_active = False
             return {"success": False, "status_code": 400, "message": capture_error}
 
-        # Setting up the leader bus and the writer threads collides with the
-        # run-restart loop below, so a capture session is always a single run.
-        if capture_meta.get("capture_mode", "base") != "base":
-            request.n_runs = 1
+        # Capture sessions may span rounds: a restart reuses the same dataset
+        # because _build_capture_args resolves the stamped directory lerobot
+        # created on the first round.
 
         # Launch through lelab.smooth_rollout rather than lerobot's rollout
         # directly: the wrapper publishes the control loop's observation frames
@@ -932,6 +972,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "dataset_fps": request.dataset_fps,
             "num_episodes": request.num_episodes,
             "record_autonomous": request.record_autonomous,
+            "auto_advance": request.auto_advance,
             "leader_port": request.leader_port,
             "leader_config": request.leader_config,
         }
@@ -984,6 +1025,98 @@ def _capture_status_fields(meta: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
+    """End this trial now and, unless told otherwise, start the next one.
+
+    "本轮成功" means the operator has seen what this attempt does: the arm should
+    return home and a fresh trial begin — the rollout twin of the recording
+    page's exit-early. Stopping is graceful: the recording strategies finalise
+    the dataset and walk the robot back on their own shutdown path, so ask them
+    through the trigger file and only escalate to a signal if they don't exit.
+    """
+    global inference_active, _inference_proc, _inference_started_at
+    global _inference_rollout_started_at, _inference_meta
+    global _inference_remaining_runs, _inference_current_run, _inference_end_in_progress
+
+    with _state_lock:
+        if not inference_active or _inference_proc is None:
+            return {"success": False, "status_code": 409, "message": "No inference is active"}
+        if _inference_end_in_progress:
+            return {"success": False, "status_code": 409, "message": "上一轮正在收尾，稍等"}
+        proc = _inference_proc
+        mode = str(_inference_meta.get("capture_mode") or "base")
+        current_run = _inference_current_run or 1
+        _inference_end_in_progress = True
+
+    exited = False
+    try:
+        if mode in _MODE_KEYS:
+            with contextlib.suppress(OSError):
+                _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+                (_PREVIEW_DIR / _TAKEOVER_KEY_FILE).write_text("esc")
+            # Encoding the last episode takes time; give it room before killing.
+            for _ in range(90):
+                time.sleep(1.0)
+                if proc.poll() is not None:
+                    exited = True
+                    break
+        if not exited:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.warning("End round: subprocess ignored SIGTERM; killing")
+                proc.kill()
+                proc.wait()
+    finally:
+        with _state_lock:
+            _inference_end_in_progress = False
+            inference_active = False
+            _inference_proc = None
+            _inference_started_at = None
+            _inference_rollout_started_at = None
+            _inference_meta = {}
+            _inference_current_run = 0
+        _stop_inference_cameras()
+
+    if not advance:
+        with _state_lock:
+            _inference_remaining_runs = 0
+            _inference_restart_config = {}
+        return {"success": True, "message": "本轮已结束", "advanced": False}
+
+    with _state_lock:
+        if _inference_remaining_runs <= 0 or not _inference_restart_config:
+            _inference_remaining_runs = 0
+            return {"success": True, "message": "本轮已结束，轮数已用完", "advanced": False}
+        _inference_remaining_runs -= 1
+        next_current = current_run + 1
+        remaining_after = _inference_remaining_runs
+        config = dict(_inference_restart_config)
+
+    # Let the serial port, cameras and GPU memory of the previous run release.
+    time.sleep(_RESTART_COOLDOWN_S)
+    result = handle_start_inference(InferenceRequest(**config))
+    if not result.get("success"):
+        with _state_lock:
+            _inference_remaining_runs = 0
+        return {
+            "success": False,
+            "status_code": result.get("status_code", 500),
+            "message": f"下一轮启动失败: {result.get('message')}",
+        }
+    with _state_lock:
+        _inference_current_run = next_current
+        _inference_remaining_runs = remaining_after
+    return {
+        "success": True,
+        "message": f"第 {next_current} 轮已开始",
+        "advanced": True,
+        "current_run": next_current,
+        "remaining_runs": remaining_after,
+    }
+
+
 def handle_inference_status() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
@@ -994,6 +1127,25 @@ def handle_inference_status() -> dict[str, Any]:
     # Finalise state lazily if the subprocess died on its own.
     with _state_lock:
         proc = _inference_proc
+        if _inference_end_in_progress:
+            # A round is being closed deliberately ("本轮成功"). end_round owns the
+            # restart, so report the session as alive — otherwise the page sees a
+            # gap between rounds and bounces to home.
+            return {
+                "inference_active": True,
+                "started_at": _inference_started_at,
+                "rollout_started_at": None,
+                "elapsed_s": 0,
+                "rollout_elapsed_s": 0,
+                "duration_s": _inference_meta.get("duration_s"),
+                "policy_ref": _inference_meta.get("policy_ref"),
+                "log_path": _inference_meta.get("log_path"),
+                "current_run": _inference_current_run,
+                "total_runs": total_runs,
+                "camera_names": list(_inference_meta.get("cameras", {}).keys()),
+                "switching_round": True,
+                **_capture_status_fields(_inference_meta),
+            }
         if proc is not None and proc.poll() is not None:
             rc = proc.returncode
             logger.info("Inference subprocess exited rc=%s (run %d/%d)",
@@ -1017,6 +1169,9 @@ def handle_inference_status() -> dict[str, Any]:
                 remaining_after = _inference_remaining_runs
                 logger.info("Auto-restarting inference (%d runs remaining)",
                             remaining_after)
+                # Let the previous run's serial port, cameras and memory fully
+                # release before respawning (see _RESTART_COOLDOWN_S).
+                time.sleep(_RESTART_COOLDOWN_S)
                 restart_req = InferenceRequest(**_inference_restart_config)
                 # The previous subprocess has exited; free the slot so
                 # handle_start_inference's active-guard accepts the restart
@@ -1050,13 +1205,30 @@ def handle_inference_status() -> dict[str, Any]:
             _inference_restart_config = {}
             _inference_current_run = 0
             _inference_remaining_runs = 0
+            # A non-zero exit with an empty log means the subprocess died in
+            # native init before Python could print — almost always a device
+            # or memory race with the previous run. Say so instead of showing a
+            # bare exit code that points at a 0-byte log.
+            if rc and not error:
+                log_path = finished_meta.get("log_path")
+                try:
+                    empty = not (log_path and Path(log_path).stat().st_size)
+                except OSError:
+                    empty = True
+                if empty:
+                    error = "进程在输出任何日志前就退出了（多为串口/摄像头/显存尚未释放）。"
+                    outcome = "failed"
+            hint = _friendly_hint(error) or (
+                "这一轮在启动阶段就退出了。若连续多轮出现，请降低并发或检查摄像头/串口是否被占用。"
+                if error else None
+            )
             return {
                 "inference_active": False,
                 "exited": True,
                 "exit_code": rc,
                 "outcome": outcome,
                 "error": error,
-                "hint": _friendly_hint(error),
+                "hint": hint,
                 "policy_ref": finished_meta.get("policy_ref"),
                 "duration_s": finished_meta.get("duration_s"),
                 "log_path": finished_meta.get("log_path"),

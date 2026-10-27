@@ -659,12 +659,19 @@ def start_sarm_training_remote(
     if cfg is None:
         return {"success": False, "message": "Config not found"}
     endpoint = "https://hf-mirror.com" if use_cn_mirror else "https://huggingface.co"
-    push = f"--policy.repo_id={push_repo_id} --policy.push_to_hub=true" if push_repo_id else ""
+    # lerobot 0.6 trains reward models through the same script as policies, but
+    # under its own config node: cfg.reward_model (is_reward_model_training).
+    # `--policy.type=sarm` is not a thing — sarm is not in the policy registry.
+    push = (
+        f"--reward_model.repo_id={push_repo_id} --reward_model.push_to_hub=true"
+        if push_repo_id
+        else ""
+    )
     script = (
         f"export HF_ENDPOINT={endpoint}; "
         f"python3 -m lerobot.scripts.lerobot_train "
-        f"--dataset.repo_id={dataset_repo_id} --policy.type=sarm "
-        f"--policy.annotation_mode=single_stage --policy.image_key={image_key} "
+        f"--dataset.repo_id={dataset_repo_id} --reward_model.type=sarm "
+        f"--reward_model.annotation_mode=single_stage --reward_model.image_key={image_key} "
         f"--steps={steps} --batch_size={batch_size} --output_dir=outputs/sarm {push}; "
         "echo SARM_TRAIN_DONE=$?"
     )

@@ -37,6 +37,11 @@ import { listJobs, JobRecord } from "@/lib/jobsApi";
 
 const ON_SPACE = isHostedSpace();
 
+// Module-level cache keyed by API base: back-navigation to Landing seeds the
+// imported-model list from the last fetch so the Deploy/Eval pickers render
+// without a reload wait; the fetch still revalidates in the background.
+const importedModelsCache = new Map<string, JobRecord[]>();
+
 const Landing = () => {
   const [showUsageModal, setShowUsageModal] = useState(ON_SPACE);
   const { auth } = useHfAuth();
@@ -70,7 +75,9 @@ const Landing = () => {
 
   // Deploy modal state
   const { baseUrl, fetchWithHeaders } = useApi();
-  const [importedModels, setImportedModels] = useState<JobRecord[]>([]);
+  const [importedModels, setImportedModels] = useState<JobRecord[]>(
+    () => importedModelsCache.get(baseUrl) ?? [],
+  );
   const [deployModalOpen, setDeployModalOpen] = useState(false);
   const [deployJob, setDeployJob] = useState<JobRecord | null>(null);
   const [deployStep, setDeployStep] = useState<number | null>(null);
@@ -81,7 +88,9 @@ const Landing = () => {
 
   useEffect(() => {
     listJobs(baseUrl, fetchWithHeaders, 100).then((jobs) => {
-      setImportedModels(jobs.filter((j) => j.runner === "imported"));
+      const imported = jobs.filter((j) => j.runner === "imported");
+      importedModelsCache.set(baseUrl, imported);
+      setImportedModels(imported);
     }).catch(() => {});
   }, [baseUrl, fetchWithHeaders]);
 

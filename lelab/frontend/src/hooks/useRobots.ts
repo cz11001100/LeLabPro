@@ -16,6 +16,11 @@ export interface RobotRecord {
 
 const SELECTED_KEY = "lelab.selectedRobot";
 
+// Module-level cache keyed by API base: re-mounting Landing (back-navigation)
+// seeds the robot list from the last fetch so the UI renders instantly while a
+// silent revalidate runs in the background.
+const recordsCache = new Map<string, Record<string, RobotRecord>>();
+
 const readSelected = (): string | null => {
   try {
     const raw = localStorage.getItem(SELECTED_KEY);
@@ -39,22 +44,26 @@ export const useRobots = () => {
   const { toast } = useToast();
   const location = useLocation();
 
-  const [records, setRecords] = useState<Record<string, RobotRecord>>({});
+  const [records, setRecords] = useState<Record<string, RobotRecord>>(
+    () => recordsCache.get(baseUrl) ?? {},
+  );
   const [selectedName, setSelectedName] = useState<string | null>(() => readSelected());
-  const [isLoading, setIsLoading] = useState(false);
+  const [isLoading, setIsLoading] = useState(() => !recordsCache.has(baseUrl));
 
   // Re-fetch records when location changes (RobotConfigManager mounts only on Landing,
   // so this fires on initial mount and on back-navigation to Landing)
   useEffect(() => {
     let cancelled = false;
     const fetchAll = async () => {
-      setIsLoading(true);
+      // Only spin on a cold start; a warm revalidate updates silently.
+      if (!recordsCache.has(baseUrl)) setIsLoading(true);
       try {
         const res = await fetchWithHeaders(`${baseUrl}/robots`);
         const data = await res.json();
         if (cancelled) return;
         const next: Record<string, RobotRecord> = {};
         for (const r of data.robots ?? []) next[r.name] = r;
+        recordsCache.set(baseUrl, next);
         setRecords(next);
         // Drop the selection if the underlying record vanished (deleted from another tab)
         setSelectedName((prev) => (prev && prev in next ? prev : null));

@@ -43,11 +43,16 @@ const isJobActive = (j: JobRecord) =>
 const isHubJobActive = (h: HubJob) =>
   HUB_ACTIVE_STAGES.has((h.status?.stage ?? "").toUpperCase());
 
+// Module-level cache keyed by API base: back-navigation to Landing seeds the
+// jobs list from the last fetch so the cards render without a reload flash;
+// the fetch still revalidates in the background.
+const jobsCache = new Map<string, JobRecord[]>();
+
 const JobsSection: React.FC = () => {
   const { baseUrl, fetchWithHeaders } = useApi();
   const { toast } = useToast();
 
-  const [jobs, setJobs] = useState<JobRecord[]>([]);
+  const [jobs, setJobs] = useState<JobRecord[]>(() => jobsCache.get(baseUrl) ?? []);
   const [hubJobs, setHubJobs] = useState<HubJob[]>([]);
   const [hubModels, setHubModels] = useState<HubModel[]>([]);
   const [hubAuthenticated, setHubAuthenticated] = useState(false);
@@ -66,6 +71,7 @@ const JobsSection: React.FC = () => {
         listJobs(baseUrl, fetchWithHeaders, LIMIT),
         listHubJobs(baseUrl, fetchWithHeaders),
       ]);
+      jobsCache.set(baseUrl, next);
       setJobs(next);
       setHubJobs(hub.jobs);
       setHubModels(hub.models);
@@ -224,6 +230,38 @@ const JobsSection: React.FC = () => {
     () => filteredJobs.filter((j) => j.runner === "imported"),
     [filteredJobs],
   );
+  // Group imported models that came from the SAME training run. Each downloaded
+  // checkpoint is registered as its own imported job named "<run> (step N)"; we
+  // collapse those into one card whose checkpoint dropdown switches between the
+  // steps. Jobs without the " (step N)" suffix (manual imports) stay alone.
+  const importedGroups = useMemo(() => {
+    const stepRe = /^(.*) \(step (\d+)\)$/;
+    const groups: { base: string; members: JobRecord[] }[] = [];
+    const byBase = new Map<string, JobRecord[]>();
+    for (const job of importedJobs) {
+      const m = stepRe.exec(job.name);
+      if (!m) {
+        groups.push({ base: job.name, members: [job] });
+        continue;
+      }
+      const base = m[1];
+      const bucket = byBase.get(base);
+      if (bucket) bucket.push(job);
+      else {
+        byBase.set(base, [job]);
+        groups.push({ base, members: byBase.get(base)! });
+      }
+    }
+    // Latest step first within each group.
+    for (const g of groups) {
+      if (g.members.length > 1) {
+        g.members.sort(
+          (a, b) => Number(stepRe.exec(b.name)![2]) - Number(stepRe.exec(a.name)![2]),
+        );
+      }
+    }
+    return groups;
+  }, [importedJobs]);
   // Hub jobs already mirrored by a local JobRecord get their richer card via
   // trackedCloudJobs; everything else from the hub gets a plain HubJobCard.
   const trackedHfJobIds = useMemo(
@@ -332,17 +370,27 @@ const JobsSection: React.FC = () => {
       <Collapsible defaultOpen>
         <CollapsibleTrigger className="group flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
           <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
-          本地任务 Local jobs ({localActive.length})
+          任务 Jobs (
+          {localActive.length +
+            sshActive.length +
+            trackedCloudActive.length +
+            untrackedHubActive.length +
+            untrackedHubModels.length}
+          )
         </CollapsibleTrigger>
         <CollapsibleContent className="pt-3">
-          {localActive.length === 0 ? (
+          {localActive.length === 0 &&
+          sshActive.length === 0 &&
+          trackedCloudActive.length === 0 &&
+          untrackedHubActive.length === 0 &&
+          untrackedHubModels.length === 0 ? (
             <p className="text-sm text-slate-500">
               {query
-                ? "没有匹配的本地任务。"
-                : "暂无进行中的本地任务；可在训练页发起。"}
+                ? "没有匹配的任务。"
+                : "暂无任务；可在训练页发起。"}
             </p>
           ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
               {localActive.map((job) => (
                 <JobCard
                   key={job.id}
@@ -354,64 +402,6 @@ const JobsSection: React.FC = () => {
                   onResume={handleResume}
                 />
               ))}
-            </div>
-          )}
-        </CollapsibleContent>
-      </Collapsible>
-
-      {importedJobs.length > 0 ? (
-        <>
-          <div className="border-t border-slate-700" />
-          <Collapsible defaultOpen>
-            <CollapsibleTrigger className="group flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
-              <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
-              导入模型 Imported models ({importedJobs.length})
-            </CollapsibleTrigger>
-            <CollapsibleContent className="pt-3">
-              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                {importedJobs.map((job) => (
-                  <JobCard
-                    key={job.id}
-                    job={job}
-                    onStop={handleStop}
-                    onDelete={handleDelete}
-                    onPlay={handlePlay}
-                    onExport={handleExport}
-                  onResume={handleResume}
-                  />
-                ))}
-              </div>
-            </CollapsibleContent>
-          </Collapsible>
-        </>
-      ) : null}
-
-      <div className="border-t border-slate-700" />
-
-      <Collapsible defaultOpen>
-        <CollapsibleTrigger className="group flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
-          <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
-          云端任务 Cloud jobs (
-          {sshActive.length +
-            trackedCloudActive.length +
-            untrackedHubActive.length +
-            untrackedHubModels.length}
-          )
-        </CollapsibleTrigger>
-        <CollapsibleContent className="pt-3">
-          {sshActive.length === 0 &&
-          trackedCloudActive.length === 0 &&
-          untrackedHubActive.length === 0 &&
-          untrackedHubModels.length === 0 ? (
-            <p className="text-sm text-slate-500">
-              {query
-                ? "没有匹配的云端任务。"
-                : hubAuthenticated
-                ? "暂无进行中的云端任务。"
-                : "暂无进行中的云端任务；登录 Hugging Face 后可查看 HF 云端任务。"}
-            </p>
-          ) : (
-            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
               {sshActive.map((job) => (
                 <JobCard
                   key={job.id}
@@ -444,6 +434,34 @@ const JobsSection: React.FC = () => {
           )}
         </CollapsibleContent>
       </Collapsible>
+
+      {importedJobs.length > 0 ? (
+        <>
+          <div className="border-t border-slate-700" />
+          <Collapsible defaultOpen>
+            <CollapsibleTrigger className="group flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
+              <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
+              模型 Models ({importedJobs.length})
+            </CollapsibleTrigger>
+            <CollapsibleContent className="pt-3">
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {importedGroups.map((g) => (
+                  <JobCard
+                    key={g.members[0].id}
+                    job={g.members[0]}
+                    group={g.members.length > 1 ? g.members : undefined}
+                    onStop={handleStop}
+                    onDelete={handleDelete}
+                    onPlay={handlePlay}
+                    onExport={handleExport}
+                    onResume={handleResume}
+                  />
+                ))}
+              </div>
+            </CollapsibleContent>
+          </Collapsible>
+        </>
+      ) : null}
 
       {untrackedCount > 0 ? (
         <Collapsible>

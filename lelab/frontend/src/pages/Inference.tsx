@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowLeft, Camera, Hand, Loader2, Square, Video, VideoOff } from "lucide-react";
+import { ArrowLeft, Camera, CheckCircle2, Hand, Loader2, Square, Video, VideoOff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import Logo from "@/components/Logo";
@@ -19,6 +19,7 @@ import {
 import {
   InferenceStatus,
   captureInferenceSnapshot,
+  endInferenceRound,
   getInferenceStatus,
   sendInferenceTakeover,
   stopInference,
@@ -84,6 +85,7 @@ const Inference: React.FC = () => {
   const [camerasOn, setCamerasOn] = useState(true);
   const [snapshotLoading, setSnapshotLoading] = useState(false);
   const [pendingAction, setPendingAction] = useState<string | null>(null);
+  const [endingRound, setEndingRound] = useState(false);
   const navigatedAwayRef = useRef(false);
   const stopRequestedRef = useRef(false);
 
@@ -205,6 +207,24 @@ const Inference: React.FC = () => {
       });
     } finally {
       setPendingAction(null);
+    }
+  };
+
+  const handleSuccess = async () => {
+    setEndingRound(true);
+    try {
+      const res = await endInferenceRound(baseUrl, fetchWithHeaders, true);
+      toast({ title: res.message, description: res.advanced ? "正在开下一轮" : "轮数已用完" });
+      navigatedAwayRef.current = false;
+      stopRequestedRef.current = false;
+    } catch (e) {
+      toast({
+        title: "结束本轮失败",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setEndingRound(false);
     }
   };
 
@@ -375,6 +395,18 @@ const Inference: React.FC = () => {
                 <Camera className="w-4 h-4 mr-2" />
               )}
               标记失败
+            </Button>
+            <Button
+              onClick={handleSuccess}
+              disabled={!isRunning || endingRound || !!status.switching_round}
+              className="w-40 bg-green-600 hover:bg-green-700 text-white font-semibold disabled:opacity-50"
+            >
+              {endingRound || status.switching_round ? (
+                <Loader2 className="w-4 h-4 mr-2 animate-spin" />
+              ) : (
+                <CheckCircle2 className="w-4 h-4 mr-2" />
+              )}
+              {status.switching_round ? "开下一轮中…" : "本轮成功"}
             </Button>
             {capturing && captureMode === "dagger" && (
               <>

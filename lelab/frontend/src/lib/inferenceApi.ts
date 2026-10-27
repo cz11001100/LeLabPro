@@ -25,6 +25,8 @@ export interface StartInferenceRequest {
   dataset_fps?: number;
   num_episodes?: number;
   record_autonomous?: boolean;
+  // dagger: end the round as soon as one correction is saved, then continue.
+  auto_advance?: boolean;
   leader_port?: string;
   leader_config?: string;
 }
@@ -53,6 +55,7 @@ export interface InferenceStatus {
   capture_mode?: CaptureMode;
   dataset_repo_id?: string | null;
   takeover?: TakeoverState;
+  switching_round?: boolean;
 }
 
 export async function startInference(
@@ -108,5 +111,22 @@ export async function sendInferenceTakeover(
     method: "POST",
     body: { action },
     action: "Take over",
+  });
+}
+
+/**
+ * End the current trial now: the strategy finalises its dataset and walks the
+ * arm home, then (by default) the next trial starts. Takes up to ~90s when the
+ * last episode still needs encoding.
+ */
+export async function endInferenceRound(
+  baseUrl: string,
+  fetcher: Fetcher,
+  advance = true,
+): Promise<{ message: string; advanced?: boolean; current_run?: number }> {
+  return apiRequest(baseUrl, fetcher, "/inference-end-round", {
+    method: "POST",
+    body: { advance },
+    action: "End round",
   });
 }

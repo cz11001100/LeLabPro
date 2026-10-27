@@ -113,6 +113,7 @@ const InferenceModal: React.FC<Props> = ({
   const [datasetName, setDatasetName] = useState("");
   const [numEpisodes, setNumEpisodes] = useState(20);
   const [recordAutonomous, setRecordAutonomous] = useState(false);
+  const [autoAdvance, setAutoAdvance] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   const [policyConfig, setPolicyConfig] = useState<PolicyConfigSummary | null>(null);
@@ -307,6 +308,7 @@ const InferenceModal: React.FC<Props> = ({
         dataset_repo_id: datasetName,
         num_episodes: numEpisodes,
         record_autonomous: recordAutonomous,
+        auto_advance: autoAdvance,
       });
       onOpenChange(false);
       navigate("/inference");
@@ -614,16 +616,35 @@ const InferenceModal: React.FC<Props> = ({
                   />
                 </div>
                 {captureMode === "dagger" && (
-                  <div className="flex items-center justify-between gap-4">
-                    <Label htmlFor="hybrid-episode" className="text-sm font-medium text-gray-200">
-                      混合集（策略段一起录进同一集）
-                    </Label>
-                    <Switch
-                      id="hybrid-episode"
-                      checked={recordAutonomous}
-                      onCheckedChange={setRecordAutonomous}
-                    />
-                  </div>
+                  <>
+                    <div className="flex items-center justify-between gap-4">
+                      <Label htmlFor="hybrid-episode" className="text-sm font-medium text-gray-200">
+                        混合集（策略段一起录进同一集）
+                      </Label>
+                      <Switch
+                        id="hybrid-episode"
+                        checked={recordAutonomous}
+                        onCheckedChange={setRecordAutonomous}
+                      />
+                    </div>
+                    {!recordAutonomous && (
+                      <div className="flex items-center justify-between gap-4">
+                        <Label htmlFor="auto-advance" className="text-sm font-medium text-gray-200">
+                          纠正保存后自动开下一轮
+                        </Label>
+                        <Switch
+                          id="auto-advance"
+                          checked={autoAdvance}
+                          onCheckedChange={setAutoAdvance}
+                        />
+                      </div>
+                    )}
+                    {(autoAdvance || recordAutonomous) && nRuns <= 1 && (
+                      <p className="text-xs text-amber-400">
+                        轮数需调到 2 以上，一轮结束后才会自动接下一轮。
+                      </p>
+                    )}
+                  </>
                 )}
               </>
             )}

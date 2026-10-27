@@ -25,6 +25,10 @@
 
 ## [2026-10-27]
 
+### 新增
+
+- 部署与推理页「结束本回合」：优雅收尾当前试次（数据落盘、机械臂回 home）并自动开始下一回合，是录制页「提前退出」在 rollout 场景的对应功能
+
 ### 修复
 
 - **torchcodec 找不到 FFmpeg 共享库**：torchcodec 按 FFmpeg 7→6→5→4 依次加载，每个都要求对应大版本的普通 soname（如 `libavcodec.so.61`），没有系统 FFmpeg 的机器安装后直接报 `Could not load libtorchcodec`。现改为复用 PyAV 自带的 FFmpeg 7 —— 其轮子内的库文件名被 hash 过且互相按 hash 名引用，故同时建立普通 soname 与原始名两类软链后交由加载器解析，无需 root 即可恢复硬解
@@ -34,13 +38,14 @@
 - **若干指向不存在模块的 import**：`lerobot.configs.dataset` → `lerobot.scripts.lerobot_record`、`lerobot.datasets` → `lerobot.datasets.lerobot_dataset`
 - **一键升级在 monorepo 下必然失败**：解析安装来源时未剥离 URL 的 `#subdirectory=lelab` 片段，仓库名被识别成 `LeLabPro.git#subdirectory=lelab`，重建安装地址时又在其后追加 `.git`，得到不存在的子目录 `lelab.git`。凡是通过 `uv tool install` 安装的人点"升级"都会失败。现正确拆分仓库名与子目录并在生成命令时重新拼接，同时补 6 项回归测试（单仓库安装路径行为不变）
 - **一键升级未固定 Python 版本**：`uv tool install` 那条升级命令没带 `--python`，uv 会挑机器默认解释器 —— 在默认是 3.14 的机器上，torch 没有 cp314 轮子，升级在解析阶段即失败。现固定为 `--python 3.12`，与安装命令一致
+- **SARM / RA-BC 训练命令用错配置节点**：此前按 policy 传参（`--policy.type=sarm` 等），但 lerobot 0.6 里 SARM 属于 reward model、并不在 policy 注册表中，训练必然失败。现改为 `--reward_model.*`，`repo_id` 与 `push_to_hub` 同样归到该节点
+- **RA-BC 权重参数层级错误**：`sample_weighting` 是 `TrainPipelineConfig` 的顶层字段，此前误加了 `--training.` 前缀，配置不被识别；现改为 `--sample_weighting.*`
+- **推理自动重启后偶发秒退**：连续运行时上一进程的串口、相机与显存尚未释放，新进程在原生初始化阶段即被杀，留下 0 字节日志且没有任何报错。现增加重启冷却时间，并对「非零退出 + 空日志」给出明确原因说明
 
 ### 变更
 
+- 任务卡片与检查点交互：下载状态区分「未下载 / 下载中可取消 / 已下载可重下」，并支持从最新 checkpoint 续训；评测进行中可停止
 - `lelab-run.sh` 查找虚拟环境的顺序新增同级目录 `LeLabPro_venv`，便于把环境放在仓库之外（避免备份、打包等递归操作展开整个 8GB 环境）
-
-### 变更
-
 - 仓库内 `lerobot/` 的基准改为**实际运行版本**（上游 tag `v0.6.0`），此前误用了旧检出
 - 依赖版本收窄到开发机实测档位，避免解析器取到未验证的新版本组合
 - 安装命令统一加 `--python 3.12`：不指定时 uv 会挑系统默认的 Python 3.14，而 torch 2.7.1 无对应轮子导致解析失败

@@ -399,16 +399,16 @@ def build_training_command(
         cmd.extend(["--scheduler.decay_lr", str(request.scheduler_decay_lr)])
 
     # RA-BC weighting (off unless asked for: it silently changes the objective).
-    # `sample_weighting` is Optional on lerobot's side and has no `enable`
-    # field — the config object exists exactly when we pass one of its fields.
+    # `sample_weighting` is a top-level TrainPipelineConfig field with no `enable`
+    # member — the config object exists exactly when we pass one of its fields.
     if request.sample_weighting_enable:
-        cmd.extend(["--training.sample_weighting.type", request.sample_weighting_type])
+        cmd.extend(["--sample_weighting.type", request.sample_weighting_type])
         if request.sample_weighting_progress_path:
-            cmd.extend(["--training.sample_weighting.progress_path", request.sample_weighting_progress_path])
+            cmd.extend(["--sample_weighting.progress_path", request.sample_weighting_progress_path])
         if request.sample_weighting_kappa is not None:
-            cmd.extend(["--training.sample_weighting.kappa", str(request.sample_weighting_kappa)])
+            cmd.extend(["--sample_weighting.kappa", str(request.sample_weighting_kappa)])
         if request.sample_weighting_head_mode:
-            cmd.extend(["--training.sample_weighting.head_mode", request.sample_weighting_head_mode])
+            cmd.extend(["--sample_weighting.head_mode", request.sample_weighting_head_mode])
 
     # Advanced
     cmd.extend(["--use_policy_training_preset", "true" if request.use_policy_training_preset else "false"])
