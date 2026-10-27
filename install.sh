@@ -217,9 +217,13 @@ chmod +x "$BIN_DIR/lelab"
 # 交互场景用 shell 函数：能真正把激活态留在当前 shell，方便接着调试。
 # 注意函数里不能调用 lelab-run.sh —— 它结尾是 exec，会把当前 shell 顶掉。
 BASHRC="$HOME/.bashrc"
-if [[ -f "$BASHRC" ]]; then
+if [[ ! -f "$BASHRC" ]]; then
+    # 精简的系统/容器里可能没有 .bashrc；先建空文件，否则函数会被静默跳过
+    : > "$BASHRC"
+else
     cp "$BASHRC" "$BASHRC.bak.$(date +%Y%m%d-%H%M%S)"
-    sed -i '/^# >>> LeLabPro/,/^# <<< LeLabPro/d' "$BASHRC"
+fi
+sed -i '/^# >>> LeLabPro/,/^# <<< LeLabPro/d' "$BASHRC"
     cat >> "$BASHRC" << BLOCK
 
 # >>> LeLabPro (install.sh) >>>
@@ -240,8 +244,7 @@ lelab() {
 }
 # <<< LeLabPro (install.sh) <<<
 BLOCK
-    info "已在 $BASHRC 配置 lelab 函数（原文件已备份）"
-fi
+info "已在 $BASHRC 配置 lelab 函数（原文件已备份）"
 
 # ---------- 收尾 ----------
 echo ""
