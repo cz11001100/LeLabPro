@@ -33,6 +33,8 @@ lelab
 最近更新，完整历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 **2026-10-28**
+- 新增 本地安装与运行接入 HuggingFace 镜像 —— 实测官方站与 hf-mirror 吞吐选端点，走镜像时自动关掉无视 `HF_ENDPOINT` 的 Xet 传输、放宽跨境读超时
+- 修复 包索引选择改用实测下载吞吐（原先按索引页延迟选，方向经常是反的）
 - 修复 没有独显的机器也在下 2.7GB CUDA 库导致安装普遍超时 —— 档位改为按 GPU 自动选择，无 GPU 自动走 CPU 版 torch
 - 修复 uv 引导、Python 解释器下载、仓库克隆三处只认 GitHub/Cloudflare 直连 —— 各加一条镜像加速回退
 - 新增 Windows 11 一键安装 `install.ps1`（PowerShell 一条命令，装完直接 `lelab`）

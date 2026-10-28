@@ -29,6 +29,8 @@ info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 step() { echo -e "${BLUE}==> $*${NC}"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+# 在 $(...) 里调用的函数要用这个打诊断：info 走 stdout，会被命令替换当成返回值吞进去
+note() { info "$@" >&2; }
 
 # ---------- 安装档位 ----------
 # auto（默认）: 检测到 NVIDIA GPU 才装 CUDA 版 torch，否则装 CPU 版
@@ -88,11 +90,65 @@ trap on_error ERR
 # 报 "I/O operation failed during extraction / network timeout"。放宽到 300s。
 export UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT:-300}"
 
+# ---------- 按实测吞吐挑下载源 ----------
+# 索引页响应快 ≠ 拉包快。挂 VPN 实测过两轮：清华索引页 0.43s / 官方 3.4s，
+# 但真下轮子时一轮是官方 1.69 vs 清华 1.27 MB/s，下一轮又反过来（清华 2.05 /
+# 官方 1.18）。所以不写死，装之前各拉 4MB 真实 wheel 比一次吞吐。
+resolve_wheel() {   # resolve_wheel <索引URL> <包名> [版本前缀] → 一个能下的绝对 wheel 地址
+    local base="$1" pkg="$2" ver="${3:-}" href rel origin depth=0
+    href=$(curl -m 10 -s "$base/$pkg/" 2>/dev/null \
+        | grep -oE "href=\"[^\"]*${pkg}-${ver:-[0-9]}[^\"]*cp312[^\"]*manylinux[^\"]*x86_64\.whl[^\"]*\"" \
+        | tail -1 | sed 's/^href="//; s/"$//; s/#.*$//')
+    [[ -z "$href" ]] && return 1
+    rel="$href"
+    origin=$(printf '%s' "$base" | sed -E 's#^(https?://[^/]+).*#\1#')
+    case "$href" in
+        http*) printf '%s' "$href"; return 0 ;;              # 官方 pytorch 页：绝对 URL
+        /*)    printf '%s%s' "$origin" "$href"; return 0 ;;  # 上交大页：站点根相对
+    esac
+    while [[ "$rel" == ../* ]]; do rel="${rel#../}"; depth=$((depth + 1)); done
+    if (( depth > 0 )); then
+        printf '%s/%s' "$origin" "$rel"                      # PyPI 镜像：../../packages/...
+    else
+        printf '%s/%s' "${base%/}" "$rel"                    # 裸文件名：相对索引页
+    fi
+}
+
+probe_url_mbps() {  # probe_url_mbps <URL> → MB/s；测不出返回非 0
+    local url="$1" out speed code
+    # -L：部分镜像（如上交大）会先 301 到规范地址，不跟跳转就测成 0
+    out=$(curl -m 15 -L -r 0-4000000 -so /dev/null -w '%{speed_download} %{http_code}' "$url" 2>/dev/null \
+          || echo "0 000")
+    read -r speed code <<<"$out"
+    case "$code" in 200|206) : ;; *) return 1 ;; esac
+    awk -v s="${speed:-0}" 'BEGIN { printf "%.2f", s / 1048576 }'
+}
+
+probe_mbps() {      # probe_mbps <索引URL> <包名> [版本前缀] → MB/s；测不出返回非 0
+    local url; url=$(resolve_wheel "$1" "$2" "${3:-}") || return 1
+    probe_url_mbps "$url"
+}
+
+# pick_fast <包名[:版本前缀]> <候选URL...> → 打印吞吐最高的那个；全测不出则保留第一个
+pick_fast() {
+    local spec="$1"; shift
+    local pkg="${spec%%:*}" ver=""
+    [[ "$spec" == *:* ]] && ver="${spec#*:}"
+    local best_url="$1" best=0 url mb
+    for url in "$@"; do
+        mb=$(probe_mbps "$url" "$pkg" "$ver" 2>/dev/null || echo 0)
+        note "  ${url} → ${mb} MB/s"
+        if awk -v a="$mb" -v b="$best" 'BEGIN { exit !(a + 0 > b + 0) }'; then
+            best="$mb"; best_url="$url"
+        fi
+    done
+    printf '%s' "$best_url"
+}
+
 # ---------- 选择包索引 ----------
-# 开 VPN 时国内镜像反而慢（流量绕到境外再回来），所以不写死：
 # 1) 尊重用户已设的 UV_DEFAULT_INDEX / UV_INDEX_URL / PIP_INDEX_URL
-# 2) LELAB_INDEX=off 强制用官方源，LELAB_INDEX=<url> 自定义
-# 3) 否则各测一次小索引页的响应时间，谁快用谁；测不动就退回国内镜像
+# 2) LELAB_INDEX=off 强制官方源，LELAB_INDEX=<url> 自定义
+# 3) 否则实测清华与官方的下载吞吐，谁快用谁
 pick_index() {
     local cn="$MIRROR" off="https://pypi.org/simple"
     if [[ -n "${LELAB_INDEX:-}" ]]; then
@@ -107,17 +163,53 @@ pick_index() {
         echo "${preset#* }"
         return
     fi
-    local t_cn t_off
-    t_cn=$(curl -m 6 -so /dev/null -w '%{time_total}' "$cn/paramiko/" 2>/dev/null || echo 99)
-    t_off=$(curl -m 6 -so /dev/null -w '%{time_total}' "$off/paramiko/" 2>/dev/null || echo 99)
-    if awk -v a="$t_cn" -v b="$t_off" 'BEGIN { exit !(a + 0 <= b + 0) }'; then
-        echo "$cn"
-    else
-        echo "$off"
-    fi
+    note "实测各源下载吞吐（各拉 4MB）..."
+    pick_fast pyarrow "$cn" "$off"
 }
 export UV_INDEX_URL="$(pick_index)"
 info "包索引: $UV_INDEX_URL（VPN 下嫌国内源慢可设 LELAB_INDEX=off 重跑）"
+
+# ---------- Hugging Face 端点 ----------
+# 国内直连 huggingface.co 常年超时，社区通行做法是设 HF_ENDPOINT 指向 hf-mirror.com。
+# 本仓库的 SSH 侧早就这么做了（runners/ssh_remote.py:214），但本地安装和本地运行
+# 一直没设 —— 于是 SmolVLA 底模、Robometer/SARM 打分模型全在直连官方站。
+# 另外两项是从 SSH 侧抄来的必要配套：Xet 传输无视 HF_ENDPOINT、直连 xethub 会 401；
+# 跨境链路的默认 10s 读超时太短，会把每个视频请求变成重试循环。
+HF_OFFICIAL="https://huggingface.co"
+HF_MIRROR="https://hf-mirror.com"
+pick_hf_endpoint() {
+    if [[ -n "${LELAB_HF_ENDPOINT:-}" ]]; then
+        case "$LELAB_HF_ENDPOINT" in
+            off|hf|official) echo "$HF_OFFICIAL" ;;
+            *) echo "$LELAB_HF_ENDPOINT" ;;
+        esac
+        return
+    fi
+    if [[ -n "${HF_ENDPOINT:-}" ]]; then
+        echo "$HF_ENDPOINT"
+        return
+    fi
+    local probe="gpt2/resolve/main/model.safetensors" s_off s_mir
+    s_off=$(probe_url_mbps "$HF_OFFICIAL/$probe" 2>/dev/null || echo 0)
+    s_mir=$(probe_url_mbps "$HF_MIRROR/$probe" 2>/dev/null || echo 0)
+    note "  HuggingFace 实测吞吐：官方 ${s_off} MB/s · hf-mirror ${s_mir} MB/s"
+    if awk -v a="$s_mir" -v b="$s_off" 'BEGIN { exit !(a + 0 > b + 0) }'; then
+        echo "$HF_MIRROR"
+    else
+        echo "$HF_OFFICIAL"
+    fi
+}
+export HF_ENDPOINT="$(pick_hf_endpoint)"
+if [[ "$HF_ENDPOINT" == "$HF_MIRROR" ]]; then
+    HF_DISABLE_XET=1
+    HF_DL_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-60}"
+    export HF_HUB_DISABLE_XET=1
+    export HF_HUB_DOWNLOAD_TIMEOUT="$HF_DL_TIMEOUT"
+else
+    HF_DISABLE_XET=0
+    HF_DL_TIMEOUT="${HF_HUB_DOWNLOAD_TIMEOUT:-10}"
+fi
+info "HuggingFace 端点: $HF_ENDPOINT"
 
 # ---------- 退出 conda，避免它覆盖 PATH ----------
 FAILED_STEP="退出 conda"
@@ -206,13 +298,22 @@ FAILED_STEP="步骤2 创建虚拟环境"
 if [[ -d "$VENV" ]]; then
     info "复用已有虚拟环境 $VENV"
 else
-    # 本机没有 3.12 时 uv 会从 GitHub Releases 拉独立 CPython（约 32MB）。国内直连
-    # 常掉到几十 KB/s，看起来就像卡在 Downloading cpython-3.12 直到超时。
-    if ! uv python list --only-installed 2>/dev/null | grep -q 'cp312\|3\.12'; then
+    # 本机没有 3.12 时 uv 会从 GitHub Releases 拉独立 CPython（约 32MB），国内常掉到
+    # 几十 KB/s，看起来就像卡在 Downloading cpython-3.12 直到超时。直连慢才换镜像：
+    # npmmirror 是 python-build-standalone 的正规镜像（目录布局与 uv 期望一致），
+    # gh-proxy 是社区转发、有速率限制，作兜底。
+    if ! uv python list --only-installed 2>/dev/null | grep -q '3\.12'; then
         GH_LAT=$(curl -m 6 -so /dev/null -w '%{time_total}' https://github.com/astral-sh 2>/dev/null || echo 99)
         if awk -v t="$GH_LAT" 'BEGIN { exit !(t + 0 > 3) }'; then
-            export UV_PYTHON_INSTALL_MIRROR="$GH_PROXY/https://github.com/astral-sh/python-build-standalone/releases/download"
-            info "  GitHub 直连慢（${GH_LAT}s），Python 解释器改走加速前缀"
+            NPM_LAT=$(curl -m 6 -so /dev/null -w '%{time_total}' https://registry.npmmirror.com/-/binary/python-build-standalone/ 2>/dev/null || echo 99)
+            GHP_LAT=$(curl -m 6 -so /dev/null -w '%{time_total}' "$GH_PROXY/https://github.com/astral-sh" 2>/dev/null || echo 99)
+            if awk -v a="$NPM_LAT" -v b="$GHP_LAT" 'BEGIN { exit !(a + 0 <= b + 0) }'; then
+                export UV_PYTHON_INSTALL_MIRROR="https://registry.npmmirror.com/-/binary/python-build-standalone"
+                info "  GitHub 直连慢（${GH_LAT}s），Python 解释器改走 npmmirror（${NPM_LAT}s）"
+            else
+                export UV_PYTHON_INSTALL_MIRROR="$GH_PROXY/https://github.com/astral-sh/python-build-standalone/releases/download"
+                info "  GitHub 直连慢（${GH_LAT}s），Python 解释器改走加速前缀（${GHP_LAT}s）"
+            fi
         fi
     fi
     info "创建虚拟环境 (Python 3.12，与开发机一致)..."
@@ -228,7 +329,15 @@ if [[ "$PROFILE" == lite ]]; then
     # 也就是 CUDA 版，白装几 GB 的 CUDA 运行库。PyTorch 官方 CPU 索引自带 numpy / pillow 等
     # 依赖，单独用它可以完整解析（实测 13 个包）。
     if [[ "$(uname -s)" == Linux ]]; then
-        info "轻量档：先装 CPU 版 torch / torchvision（跳过 CUDA 库，省约 4GB）..."
+        # 官方 CPU 索引挂在 Cloudflare R2 上，挂代理时实测会直接连接超时而交大小
+        # 反而正常；所以下轮子前先拿真 wheel 比一次吞吐，除非用户显式指定了索引。
+        # 探测限定 2.7.x —— 要跟 pyproject 里的 torch 区间一致，否则镜像上还没有的
+        # 新版本会让两边都测不出，白退回默认值
+        if [[ -z "${LELAB_TORCH_INDEX:-}" ]]; then
+            info "实测 CPU torch 索引下载吞吐（各拉 4MB）..."
+            TORCH_INDEX=$(pick_fast "torch:2.7." "$TORCH_INDEX" "https://mirror.sjtu.edu.cn/pytorch-wheels/cpu")
+        fi
+        info "轻量档：从 $(basename "$TORCH_INDEX") 装 CPU 版 torch / torchvision（跳过 CUDA 库，省约 4GB）..."
         uv pip install --python "$VENV_PY" --default-index "$TORCH_INDEX" \
             "torch>=2.7,<2.8.0" "torchvision>=0.22.0,<0.23.0"
     else
@@ -359,6 +468,7 @@ fi
 cat > "$BIN_DIR/lelab" << WRAPPER
 #!/usr/bin/env bash
 # 由 LeLabPro install.sh 生成
+export HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_DISABLE_XET="$HF_DISABLE_XET" HF_HUB_DOWNLOAD_TIMEOUT="$HF_DL_TIMEOUT"
 exec "$ROOT/lelab-run.sh" "\$@"
 WRAPPER
 chmod +x "$BIN_DIR/lelab"
@@ -386,6 +496,8 @@ lelab() {
     [[ -n "\$venv" ]] || { echo "[lelab] 未找到环境，先执行: cd \$root && bash install.sh" >&2; return 1; }
     [[ -n "\${CONDA_DEFAULT_ENV:-}" ]] && conda deactivate 2>/dev/null
     source "\$venv/bin/activate"
+    # 模型与数据集下载端点：装的时候实测选定的。Xet 传输无视 HF_ENDPOINT，走镜像必须关
+    export HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_DISABLE_XET="$HF_DISABLE_XET" HF_HUB_DOWNLOAD_TIMEOUT="$HF_DL_TIMEOUT"
     local shim
     shim="\$("\$venv/bin/python" -c 'from lelab.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
     [[ -n "\$shim" && -d "\$shim" ]] && export LD_LIBRARY_PATH="\$shim\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"

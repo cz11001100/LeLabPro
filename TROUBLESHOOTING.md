@@ -190,12 +190,21 @@ uv pip install --python lerobot-env/bin/python --force-reinstall torch torchvisi
 
 ### 训练卡在下载模型 / 网络很慢
 
-模型权重从 HuggingFace 下载，国内可换镜像：
+模型权重与数据集从 HuggingFace 下载。`install.sh` 已经实测过官方站与 `hf-mirror.com` 的吞吐、谁快用谁，并把结果连同下面两个变量写进了启动配置，一般不用管。手动指定或临时切换：
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
+LELAB_HF_ENDPOINT=https://hf-mirror.com bash install.sh   # 装的时候就钉死镜像
+# 或临时一次：
+export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TIMEOUT=60
 ./lelab-run.sh
 ```
+
+**只设 `HF_ENDPOINT` 常常还是不生效**，两个原因：
+
+- `huggingface_hub` 的新传输协议 Xet 不走这个端点，它直连 `cas-server.xethub.hf.co`，经镜像认证会 401 —— 必须 `HF_HUB_DISABLE_XET=1` 退回普通 HTTP
+- 跨境链路常超过默认 10s 读超时，表现是反复"下载中→重试"，把 `HF_HUB_DOWNLOAD_TIMEOUT` 放宽到 60
+
+数据集上传/下载同理走 `HF_ENDPOINT`；`HF_HOME`（默认 `~/.cache/huggingface`）决定缓存位置，lerobot 的数据集与模型都在下面。
 
 ---
 
