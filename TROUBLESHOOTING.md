@@ -8,7 +8,7 @@
 
 ```bash
 conda deactivate          # 退出所有 conda 环境
-source lerobot/bin/activate
+source lerobot-env/bin/activate
 lelab
 ```
 
@@ -57,7 +57,7 @@ sed -i 's/from lerobot\.datasets import CODEBASE_VERSION/from lerobot.datasets.l
 **原因：缺少 SSH 依赖，训练板块的远程安装/训练无法使用。**
 
 ```bash
-uv pip install --python lerobot/bin/python "paramiko>=3.4.0"
+uv pip install --python lerobot-env/bin/python "paramiko>=3.4.0"
 ```
 
 ### `Could not import realsense: No module named 'pyrealsense2'`
@@ -69,7 +69,7 @@ uv pip install --python lerobot/bin/python "paramiko>=3.4.0"
 如果用 RealSense 相机：
 
 ```bash
-uv pip install --python lerobot/bin/python "pyrealsense2>=2.55.1.6486,<2.57.0"
+uv pip install --python lerobot-env/bin/python "pyrealsense2>=2.55.1.6486,<2.57.0"
 ```
 
 ---
@@ -176,14 +176,14 @@ ClientAliveCountMax 10
 ### `nvidia-smi` 有但训练报 CUDA 不可用
 
 ```bash
-source lerobot/bin/activate
+source lerobot-env/bin/activate
 python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
 ```
 
 如果 `cuda_available` 是 False，说明装的是 CPU 版 torch。重装对应 CUDA 版本：
 
 ```bash
-uv pip install --python lerobot/bin/python --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu121
+uv pip install --python lerobot-env/bin/python --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 （`cu121` 换成你实际的 CUDA 版本，用 `nvidia-smi` 右上角看）
@@ -201,17 +201,41 @@ export HF_ENDPOINT=https://hf-mirror.com
 
 ## 环境类
 
+### 轻薄本 / 没有独立显卡
+
+用轻量档，别装 CUDA 版 torch：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+```
+
+差别只在 torch：默认档从 PyPI 装 CUDA 版，连带 `nvidia-*` 那一整套 CUDA 运行库；轻量档从 PyTorch 的 CPU 索引装同版本区间的 CPU 版。遥操、采集、回放、评估、SSH 云端训练都不受影响，同一套依赖组合下环境从 6.5GB 降到 2.2GB（本机实测）。
+
+已经装过默认档想减体积，得重建环境（换档不能只改参数，虚拟环境里已装好的 CUDA 库不会被自动删）：
+
+```bash
+rm -rf lerobot-env && bash install.sh --lite
+```
+
+反过来，日后插上/换成有 N 卡的机器要本地训练，同样重建：`rm -rf lerobot-env && bash install.sh`。
+
+CPU 索引默认是 `https://download.pytorch.org/whl/cpu`，国内嫌慢可以换上交大镜像：
+
+```bash
+LELAB_TORCH_INDEX=https://mirror.sjtu.edu.cn/pytorch-wheels/cpu bash install.sh --lite
+```
+
 ### 想彻底重装
 
 ```bash
-rm -rf lerobot            # 删掉整个虚拟环境
+rm -rf lerobot-env        # 删掉整个虚拟环境
 bash install.sh           # 重新安装，选 y 确认
 ```
 
 ### 只想补装某个包
 
 ```bash
-uv pip install --python lerobot/bin/python 包名
+uv pip install --python lerobot-env/bin/python 包名
 ```
 
 注意：用 `--python` 指定绝对路径，不依赖当前 shell 激活了哪个环境。
@@ -281,7 +305,7 @@ sudo apt install python3.12 python3.12-venv
 
 ```bash
 # 1. 自检结果
-source lerobot/bin/activate
+source lerobot-env/bin/activate
 python -c "import lelab.server"
 
 # 2. 环境与硬件

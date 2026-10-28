@@ -8,10 +8,22 @@ SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥
 curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
 ```
 
+**安装（轻薄本 · 不本地训练）** —— torch 装 CPU 版，环境从约 6.5GB 降到 2.2GB；遥操、采集、回放、评估照常，训练走 SSH 云端。
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+```
+
+**安装（Windows 11）** —— 在 PowerShell 里粘贴，需先装 Git（`winget install --id Git.Git -e`）。Windows 上的 torch 本身就是 CPU 版，不用加 `--lite`；这条命令重复执行即升级。
+
+```powershell
+powershell -ExecutionPolicy ByPass -NoProfile -Command "irm https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.ps1 | iex"
+```
+
 **升级**
 
 ```bash
-cd LeLabPro && git pull && bash install.sh
+cd LeLabPro && git pull && bash install.sh        # 轻量档加 --lite
 ```
 
 **启动**
@@ -25,6 +37,11 @@ lelab
 ## 更新日志
 
 最近更新，完整历史见 [CHANGELOG.md](CHANGELOG.md)。
+
+**2026-10-28**
+- 新增 Windows 11 一键安装 `install.ps1`（PowerShell 一条命令，装完直接 `lelab`）
+- 新增 轻量安装档 `bash install.sh --lite`：torch 装 CPU 版，跳过约 3GB CUDA 库，适合只做采集、训练放云端的轻薄本
+- 修复 排查表里的虚拟环境路径仍写着旧目录名（`lerobot/` → `lerobot-env/`），照抄会报找不到文件
 
 **2026-10-27**
 - 新增 部署与推理页「结束本回合」：收尾当前试次并自动进入下一回合

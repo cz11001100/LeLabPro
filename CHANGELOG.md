@@ -18,11 +18,17 @@
 
 ## [未发布]
 
+### 修复
+
+- **排查表里的虚拟环境路径是旧的**：`TROUBLESHOOTING.md` 仍有 7 处写 `source lerobot/bin/activate`、`uv pip install --python lerobot/bin/python`，而 `install.sh` 建的虚拟环境叫 `lerobot-env`。照着抄的人会得到"没有那个文件或目录"，白白以为环境坏了。`rm -rf lerobot` 那条重装指令同样会把仓库里的 `lerobot/` 源码目录当成环境删掉
+
 ### 新增
 
 - 一键安装脚本 `install.sh`，支持 `curl | bash` 自举：自动退出 conda、装 uv、建 Python 3.12 虚拟环境、走国内镜像装依赖、结束时自检关键模块
+- Windows 一键安装 `install.ps1`：`powershell -ExecutionPolicy ByPass -NoProfile -Command "irm .../install.ps1 | iex"` 一条命令装完。脚本先查 Git、再装 uv（官方 `astral.sh/uv/install.ps1`），然后用 `uv tool install --force --python 3.12` 从本仓库的 `lelab` 子目录安装，`lerobot` 由 `lelab` 的依赖声明自动带上。走官方 PyPI，不带国内镜像逻辑（境外机器用）。因为 `--force` 常驻，重跑即升级。Windows 上 PyPI 的 torch 本就只有 CPU 版，因此不需要 `--lite`
 - 全局 `lelab` 命令：交互 shell 中输入即自动准备环境（退出 conda → 激活虚拟环境 → 注入 FFmpeg 路径 → 启动），命令跑完激活态保留在当前 shell
 - 安装时的包索引自动选路：开 VPN / 代理的机器上默认国内镜像会绕境导致下载变慢，现改为先测国内镜像与官方源索引页的响应时间、取较快者，并打印选中的地址。`LELAB_INDEX=off` 强制官方源、`LELAB_INDEX=<url>` 指定任意镜像；已设置 `UV_DEFAULT_INDEX` / `UV_INDEX_URL` / `PIP_INDEX_URL` 的用户沿用其设置，安装过程不再用国内镜像覆盖它
+- 轻量安装档 `install.sh --lite`（等价 `LELAB_PROFILE=lite`）：torch 与 torchvision 先按 `pyproject.toml` 的版本区间从 CPU 索引安装，绕开 CUDA 运行库；同一套依赖组合下环境体积实测从 6.5GB 降到 2.2GB，面向没有独立显卡、只做遥操/采集并把训练放到云端的轻薄本。遥操、采集、回放、评估与自检项目全部保持可用；macOS 上 torch 本就不带 CUDA，自动跳过换索引。想转回本地 GPU 训练需删掉虚拟环境重装
 
 ## [2026-10-27]
 

@@ -7,17 +7,41 @@ set -euo pipefail
 #
 # 也可以先 clone 再执行：git clone ... && cd LeLabPro && bash install.sh
 #
+# 轻薄本（不做本地训练，只要遥操/采集 + SSH 云端训练）走轻量档，省约 3GB：
+#
+#   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+#
 # 做的事：退出 conda → 装 uv → 建 Python 3.12 虚拟环境 → 装本仓库的 lerobot 与
 # lelab（国内镜像）→ 自检关键模块 → 生成 ./lelab-run.sh
 
 REPO_URL="https://github.com/cz11001100/LeLabPro.git"
 MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
+# CPU 版 torch 的索引（轻量档用；国内可换 https://mirror.sjtu.edu.cn/pytorch-wheels/cpu）
+TORCH_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
 warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
 step() { echo -e "${BLUE}==> $*${NC}"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+
+# ---------- 安装档位 ----------
+# full: 装 PyPI 上的 CUDA 版 torch，本地训练需要 NVIDIA GPU
+# lite: 同一版本区间的 CPU 版 torch，跳过 CUDA 运行库（实测同依赖组合 6.5GB→2.2GB）
+#       回放/评估页全都照常，本地训练改走 SSH 云端 GPU
+PROFILE="${LELAB_PROFILE:-full}"
+for arg in "$@"; do
+    case "$arg" in
+        --lite) PROFILE="lite" ;;
+        --full) PROFILE="full" ;;
+        *) warn "忽略未知参数：$arg（可选 --lite / --full）" ;;
+    esac
+done
+if [[ "$PROFILE" == lite ]]; then
+    NEED_GB=5
+else
+    NEED_GB=15
+fi
 
 FAILED_STEP=""
 on_error() {
@@ -28,8 +52,8 @@ on_error() {
     case "$FAILED_STEP" in
         *uv*)     echo "  网络访问不了 astral.sh 时：pip install uv 后重跑" ;;
         *环境*)   echo "  uv 下 Python 3.12 超时：sudo apt install python3.12 python3.12-venv 后重跑" ;;
-        *lerobot*) echo "  多为下载超时或磁盘不足。查 df -h ~ （需 ≥15GB），再单独重试："
-                   echo "    uv pip install --python \$VENV/bin/python -e ./lerobot[feetech,smolvla,training]" ;;
+        *lerobot*) echo "  多为下载超时或磁盘不足。查 df -h ~ （需 ≥${NEED_GB}GB），再单独重试："
+                   echo "    uv pip install --python \$VENV/bin/python -e ./lerobot[core_scripts,feetech,smolvla,training]" ;;
         *lelab*)  echo "  单独重试：uv pip install --python \$VENV/bin/python fastapi[standard] websockets uvicorn psutil paramiko" ;;
         *自检*)   echo "  依赖装了但代码对不上，把上面 [X] 的报错原文发给维护者" ;;
     esac
@@ -116,15 +140,19 @@ fi
 
 # ---------- 环境体检（只警告，不阻断）----------
 FAILED_STEP="环境体检"
-info "环境体检..."
+info "环境体检（档位：$PROFILE）..."
 echo "  系统: $(uname -s) $(uname -m)"
 if command -v nvidia-smi &>/dev/null; then
     echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 else
-    warn "  没检测到 NVIDIA GPU —— 采集/推理可用，本地训练不可用（可 SSH 连云端 GPU）"
+    if [[ "$PROFILE" == lite ]]; then
+        echo "  没检测到 NVIDIA GPU —— 轻量档本就面向无独显机器，训练走「SSH 远程训练」"
+    else
+        warn "  没检测到 NVIDIA GPU —— 采集/推理可用，本地训练不可用（可 SSH 连云端 GPU）"
+    fi
 fi
 AVAIL=$(df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9' || echo 0)
-[[ "${AVAIL:-0}" -lt 15 ]] && warn "  磁盘仅剩 ${AVAIL}GB，建议 ≥15GB（torch + 模型权重）" || echo "  磁盘可用: ${AVAIL}GB"
+[[ "${AVAIL:-0}" -lt "$NEED_GB" ]] && warn "  磁盘仅剩 ${AVAIL}GB，本档位建议 ≥${NEED_GB}GB" || echo "  磁盘可用: ${AVAIL}GB"
 ls /dev/ttyUSB* /dev/ttyACM* &>/dev/null || warn "  没看到 /dev/ttyUSB* 或 /dev/ttyACM* —— 机械臂没插或未被识别"
 id -nG 2>/dev/null | grep -qw dialout || warn "  当前用户不在 dialout 组，连机械臂会 Permission denied
       修复: sudo usermod -aG dialout \$USER  然后注销重新登录"
@@ -142,10 +170,48 @@ fi
 
 # ---------- lerobot ----------
 FAILED_STEP="步骤3 安装 lerobot"
+if [[ "$PROFILE" == lite ]]; then
+    # CPU 版与 CUDA 版同名同版本，只是不带 nvidia-* 那 ~2.7GB 依赖。
+    # 这里的 --default-index 不能配 --extra-index-url：候选集里一旦同时出现镜像的
+    # torch==2.7.1 和 CPU 索引的 torch==2.7.1+cpu，uv 会选不带 local 段的那个，
+    # 也就是 CUDA 版，白装几 GB 的 CUDA 运行库。PyTorch 官方 CPU 索引自带 numpy / pillow 等
+    # 依赖，单独用它可以完整解析（实测 13 个包）。
+    if [[ "$(uname -s)" == Linux ]]; then
+        info "轻量档：先装 CPU 版 torch / torchvision（跳过 CUDA 库，省约 4GB）..."
+        uv pip install --python "$VENV_PY" --default-index "$TORCH_INDEX" \
+            "torch>=2.7,<2.8.0" "torchvision>=0.22.0,<0.23.0"
+    else
+        info "轻量档：$(uname -s) 上的 torch 本来就不带 CUDA，无需换索引"
+    fi
+fi
 info "安装本仓库的 lerobot（含 feetech 电机 / SmolVLA / 训练依赖）..."
-info "  这步要下 torch 等大包，约 5-15 分钟，请耐心等"
+info "  这步要下不少大包，约 5-15 分钟，请耐心等"
 uv pip install --python "$VENV_PY" \
     -e "$ROOT/lerobot[core_scripts,feetech,smolvla,training]"
+
+# 装完 lerobot 再确认一次 torch 仍是 CPU 版：lerobot 的依赖里 torch 是版本区间，
+# 理论上已被满足，但解析器一旦把候选集扩到 PyPI，就会选回不带 +cpu 的那个版本，
+# 静默多装几 GB。这里发现就跑一次自愈。
+if [[ "$PROFILE" == lite && "$(uname -s)" == Linux ]]; then
+    TORCH_VER=$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)
+    if [[ "$TORCH_VER" != *+cpu* ]]; then
+        warn "  torch 被解析成了 $TORCH_VER，改回 CPU 版并清理 CUDA 依赖..."
+        uv pip install --python "$VENV_PY" --default-index "$TORCH_INDEX" --force-reinstall \
+            "torch>=2.7,<2.8.0" "torchvision>=0.22.0,<0.23.0"
+        NVIDIA_PKGS=$(uv pip list --python "$VENV_PY" 2>/dev/null | awk '/^nvidia-/{print $1}')
+        if [[ -n "$NVIDIA_PKGS" ]]; then
+            # shellcheck disable=SC2086
+            uv pip uninstall --python "$VENV_PY" $NVIDIA_PKGS
+            info "  已卸载 $(echo "$NVIDIA_PKGS" | wc -l) 个 nvidia-* 包"
+        fi
+        TORCH_VER=$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)
+    fi
+    case "$TORCH_VER" in
+        *+cpu) info "  torch $TORCH_VER —— CPU 版，未装 CUDA 库" ;;
+        *) warn "  torch 仍是 $TORCH_VER，轻量档没生效（约多占 4GB）。手动纠正："
+           warn "    uv pip install --python $VENV_PY --default-index $TORCH_INDEX --force-reinstall 'torch>=2.7,<2.8.0' 'torchvision>=0.22.0,<0.23.0'" ;;
+    esac
+fi
 
 # ---------- RealSense（可选）----------
 FAILED_STEP="步骤4 pyrealsense2（可选，允许失败）"
@@ -284,6 +350,13 @@ echo "=========================================="
 if $OK; then info "安装完成，自检全部通过 ✓"; else warn "安装完成，但自检有问题（见上）"; fi
 echo "=========================================="
 echo ""
+if [[ "$PROFILE" == lite ]]; then
+    step "轻量档说明"
+    echo "  torch: ${TORCH_VER:-$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)}"
+    echo "  遥操 / 采集 / 回放 / 评估页照常可用；训练请用「SSH 远程训练」连云端 GPU"
+    echo "  以后要在本机 GPU 训练：rm -rf $VENV && bash install.sh    # 换档需重建环境"
+    echo ""
+fi
 step "启动"
 echo "  lelab                      （新开终端生效；当前终端可先 source ~/.bashrc）"
 echo "  $ROOT/lelab-run.sh   （等价写法）"

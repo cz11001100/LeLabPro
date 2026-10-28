@@ -12,7 +12,21 @@ LeLab 是 LeRobot 的图形化界面，用于 SO-101 机械臂的标定、遥操
 
 ## Windows 安装
 
-### 方式一：使用 uv（推荐）
+### 方式一：一键脚本（推荐）
+
+在 PowerShell 里粘贴（Windows 11 自带的 `powershell` 就可以，不必装 PowerShell 7）：
+
+```powershell
+powershell -ExecutionPolicy ByPass -NoProfile -Command "irm https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.ps1 | iex"
+```
+
+需要先装 Git（`winget install --id Git.Git -e`），因为脚本从 GitHub 仓库直接安装。这条命令重复执行就是升级。走官方 PyPI，没有国内镜像逻辑——境外机器直接用。
+
+装完**新开一个 PowerShell 窗口**输入 `lelab`（PATH 要新窗口才生效）。
+
+> 如果把这个脚本另存到本地再执行，请用「UTF-8 with BOM」保存：Windows PowerShell 5.1 读无 BOM 的 UTF-8 会把中文按系统 ANSI 码解码，输出变成乱码。`irm | iex` 这条在线路径不受影响。
+
+### 方式二：手动用 uv
 
 ```powershell
 # 安装 uv（如果还没有）
