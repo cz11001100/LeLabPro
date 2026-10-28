@@ -248,7 +248,7 @@ uv pip install --python lerobot-env/bin/python 包名
 du -sh ~/.local/share/uv/python       # 隔 20 秒看两次，数字在涨就正常
 ```
 
-嫌慢的话，任选一种：
+嫌慢的话，脚本已经会自动处理一部分：它先测一次 GitHub 的响应时间，超过 3 秒就把解释器下载切到加速前缀（`LELAB_GH_PROXY` 可换前缀）。不想依赖这个判断，就手动二选一：
 
 ```bash
 # 1) 用系统自带的 3.12，uv 就不会下载

@@ -33,6 +33,8 @@ lelab
 最近更新，完整历史见 [CHANGELOG.md](CHANGELOG.md)。
 
 **2026-10-28**
+- 修复 没有独显的机器也在下 2.7GB CUDA 库导致安装普遍超时 —— 档位改为按 GPU 自动选择，无 GPU 自动走 CPU 版 torch
+- 修复 uv 引导、Python 解释器下载、仓库克隆三处只认 GitHub/Cloudflare 直连 —— 各加一条镜像加速回退
 - 新增 Windows 11 一键安装 `install.ps1`（PowerShell 一条命令，装完直接 `lelab`）
 - 新增 轻量安装档 `bash install.sh --lite`：torch 装 CPU 版，环境从约 6.5GB 降到 2.2GB，适合只做采集、训练放云端的轻薄本
 - 修复 排查表里的虚拟环境路径仍写着旧目录名（`lerobot/` → `lerobot-env/`），照抄会报找不到文件

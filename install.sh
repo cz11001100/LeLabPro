@@ -13,11 +13,16 @@ set -euo pipefail
 #
 # 做的事：退出 conda → 装 uv → 建 Python 3.12 虚拟环境 → 装本仓库的 lerobot 与
 # lelab（国内镜像）→ 自检关键模块 → 生成 ./lelab-run.sh
+#
+# 档位自动选：检测到 NVIDIA GPU 才下 CUDA 版 torch，没有就下 CPU 版（少约 4GB）。
+# 想强制：--full 装 CUDA 版，--lite 装 CPU 版。
 
 REPO_URL="https://github.com/cz11001100/LeLabPro.git"
 MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 # CPU 版 torch 的索引（轻量档用；国内可换 https://mirror.sjtu.edu.cn/pytorch-wheels/cpu）
 TORCH_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+# GitHub 加速前缀：astral.sh / github.com 直连不通时的回退（用法：$GH_PROXY/<原始 github 地址>）
+GH_PROXY="${LELAB_GH_PROXY:-https://gh-proxy.com}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -26,10 +31,11 @@ step() { echo -e "${BLUE}==> $*${NC}"; }
 die()  { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 
 # ---------- 安装档位 ----------
-# full: 装 PyPI 上的 CUDA 版 torch，本地训练需要 NVIDIA GPU
-# lite: 同一版本区间的 CPU 版 torch，跳过 CUDA 运行库（实测同依赖组合 6.5GB→2.2GB）
-#       回放/评估页全都照常，本地训练改走 SSH 云端 GPU
-PROFILE="${LELAB_PROFILE:-full}"
+# auto（默认）: 检测到 NVIDIA GPU 才装 CUDA 版 torch，否则装 CPU 版
+# full: 强制 CUDA 版 torch（本地训练需要 NVIDIA GPU）
+# lite: 强制 CPU 版 torch，跳过 CUDA 运行库（实测同依赖组合 6.5GB→2.2GB）
+#       遥操/采集/回放/评估页全都照常，本地训练改走 SSH 云端 GPU
+PROFILE="${LELAB_PROFILE:-auto}"
 for arg in "$@"; do
     case "$arg" in
         --lite) PROFILE="lite" ;;
@@ -37,6 +43,21 @@ for arg in "$@"; do
         *) warn "忽略未知参数：$arg（可选 --lite / --full）" ;;
     esac
 done
+
+has_nvidia_gpu() {
+    command -v nvidia-smi &>/dev/null && nvidia-smi -L &>/dev/null 2>&1
+}
+
+AUTO_PROFILE=false
+if [[ "$PROFILE" == auto ]]; then
+    AUTO_PROFILE=true
+    if has_nvidia_gpu; then
+        PROFILE=full
+    else
+        PROFILE=lite
+    fi
+fi
+
 if [[ "$PROFILE" == lite ]]; then
     NEED_GB=5
 else
@@ -121,7 +142,13 @@ else
         FAILED_STEP="克隆仓库"
         command -v git &>/dev/null || die "需要 git，请先安装：sudo apt install git"
         info "克隆 $REPO_URL 到 $ROOT"
-        git clone --depth 1 -q "$REPO_URL" "$ROOT"
+        # GitHub 直连在国内常被限速到几十 KB/s 或直接重置；直连失败就换 gh-proxy 前缀重试
+        if ! git clone --depth 1 -q "$REPO_URL" "$ROOT" 2>/dev/null; then
+            rm -rf "$ROOT"
+            info "  直连 GitHub 失败，改用镜像加速重试"
+            git clone --depth 1 -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$ROOT" \
+                || die "克隆失败：直连与 $GH_PROXY 都不通。换个网络，或手动 git clone 后在该目录里跑 bash install.sh"
+        fi
     fi
 fi
 VENV="$ROOT/lerobot-env"
@@ -133,20 +160,36 @@ if command -v uv &>/dev/null; then
     info "uv 已就绪: $(uv --version)"
 else
     info "安装 uv..."
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # astral.sh 挂在 Cloudflare 上，国内经常连不通；先试它，不通就用 PyPI 镜像里的
+    # uv 轮子引导（纯回退，不改变后续用的还是同一个 uv）。
+    if curl -fsSL -m 20 https://astral.sh/uv/install.sh 2>/dev/null | sh 2>/dev/null; then
+        :
+    fi
     export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-    command -v uv &>/dev/null || die "uv 安装失败：curl -LsSf https://astral.sh/uv/install.sh | sh"
+    hash -r 2>/dev/null || true
+    if ! command -v uv &>/dev/null; then
+        info "  astral.sh 没装上，改用 pip 从 $UV_INDEX_URL 装 uv"
+        # 新点的发行版按 PEP 668 拦 pip --user 安装，退路是加 --break-system-packages
+        # （只装到 ~/.local，不碰系统包）
+        python3 -m pip install --user --quiet --index-url "$UV_INDEX_URL" uv 2>/dev/null \
+            || python3 -m pip install --user --quiet --break-system-packages --index-url "$UV_INDEX_URL" uv 2>/dev/null \
+            || die "uv 安装失败。手动任一： pip3 install --user uv -i $UV_INDEX_URL   或   curl -LsSf https://astral.sh/uv/install.sh | sh"
+        hash -r 2>/dev/null || true
+    fi
+    command -v uv &>/dev/null || die "uv 装好了但不在 PATH：把 $HOME/.local/bin 加进 PATH 后重跑"
 fi
 
 # ---------- 环境体检（只警告，不阻断）----------
 FAILED_STEP="环境体检"
-info "环境体检（档位：$PROFILE）..."
+TAG=""
+$AUTO_PROFILE && TAG=" · 按 GPU 自动选择"
+info "环境体检（档位：$PROFILE$TAG）..."
 echo "  系统: $(uname -s) $(uname -m)"
-if command -v nvidia-smi &>/dev/null; then
+if has_nvidia_gpu; then
     echo "  GPU: $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
 else
     if [[ "$PROFILE" == lite ]]; then
-        echo "  没检测到 NVIDIA GPU —— 轻量档本就面向无独显机器，训练走「SSH 远程训练」"
+        echo "  没检测到 NVIDIA GPU → 装 CPU 版 torch（少下约 4GB）；要本地训练加 --full 重跑"
     else
         warn "  没检测到 NVIDIA GPU —— 采集/推理可用，本地训练不可用（可 SSH 连云端 GPU）"
     fi
@@ -163,8 +206,16 @@ FAILED_STEP="步骤2 创建虚拟环境"
 if [[ -d "$VENV" ]]; then
     info "复用已有虚拟环境 $VENV"
 else
+    # 本机没有 3.12 时 uv 会从 GitHub Releases 拉独立 CPython（约 32MB）。国内直连
+    # 常掉到几十 KB/s，看起来就像卡在 Downloading cpython-3.12 直到超时。
+    if ! uv python list --only-installed 2>/dev/null | grep -q 'cp312\|3\.12'; then
+        GH_LAT=$(curl -m 6 -so /dev/null -w '%{time_total}' https://github.com/astral-sh 2>/dev/null || echo 99)
+        if awk -v t="$GH_LAT" 'BEGIN { exit !(t + 0 > 3) }'; then
+            export UV_PYTHON_INSTALL_MIRROR="$GH_PROXY/https://github.com/astral-sh/python-build-standalone/releases/download"
+            info "  GitHub 直连慢（${GH_LAT}s），Python 解释器改走加速前缀"
+        fi
+    fi
     info "创建虚拟环境 (Python 3.12，与开发机一致)..."
-    info "  若本机没有 3.12，uv 会先下载解释器；国内网络这一步可能十几分钟，属正常"
     uv venv "$VENV" --python 3.12
 fi
 
@@ -352,9 +403,10 @@ echo "=========================================="
 echo ""
 if [[ "$PROFILE" == lite ]]; then
     step "轻量档说明"
+    $AUTO_PROFILE && echo "  （自动选的：这台机器没检测到 NVIDIA GPU）"
     echo "  torch: ${TORCH_VER:-$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)}"
     echo "  遥操 / 采集 / 回放 / 评估页照常可用；训练请用「SSH 远程训练」连云端 GPU"
-    echo "  以后要在本机 GPU 训练：rm -rf $VENV && bash install.sh    # 换档需重建环境"
+    echo "  以后要在本机 GPU 训练：rm -rf $VENV && bash install.sh --full    # 换档需重建环境"
     echo ""
 fi
 step "启动"
