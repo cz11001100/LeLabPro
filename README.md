@@ -8,7 +8,7 @@ SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥
 curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
 ```
 
-**安装（轻薄本 · 不本地训练）**
+**最小安装**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
