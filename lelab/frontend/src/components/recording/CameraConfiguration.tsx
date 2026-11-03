@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/select";
 import { Input } from "@/components/ui/input";
 import { NumberInput } from "@/components/ui/number-input";
-import { Camera, Plus, X, VideoOff, RefreshCw, ChevronRight } from "lucide-react";
+import { Camera, Plus, X, VideoOff, RefreshCw, ChevronRight, RotateCw } from "lucide-react";
 import {
   Collapsible,
   CollapsibleContent,
@@ -60,6 +60,7 @@ export interface CameraConfig {
   fps?: number;
   fourcc?: string; // 4-char OpenCV pixel format (e.g. "MJPG"); undefined = auto-detect
   backend?: string; // Cv2Backends name (e.g. "AVFOUNDATION"); undefined = platform default
+  rotation?: 0 | 90 | 180 | 270; // Clockwise quarter-turn applied to a network stream before storage
 }
 
 interface CameraConfigurationProps {
@@ -88,6 +89,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
   const [selectedCameraIndex, setSelectedCameraIndex] = useState<string>("");
   const [cameraName, setCameraName] = useState("");
   const [cameraUrl, setCameraUrl] = useState("");
+  const [pickerRotation, setPickerRotation] = useState<0 | 90 | 180 | 270>(0);
   // Which entry the name dropdown shows: a preset name, CUSTOM_NAME (reveal the
   // free-text input), or "" (nothing picked yet).
   const [nameMode, setNameMode] = useState<string>("");
@@ -98,10 +100,15 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
   // and frame rate it does send become the dataset's image features.
   const {
     probe: streamProbe,
+    displayWidth: streamWidth,
+    displayHeight: streamHeight,
     error: streamError,
     isChecking: streamChecking,
     feedUrl: streamFeedUrl,
-  } = useNetworkCameraSource(isNetworkSource ? cameraUrl : undefined);
+  } = useNetworkCameraSource(
+    isNetworkSource ? cameraUrl : undefined,
+    pickerRotation,
+  );
 
   // Names already taken by configured cameras — presets matching these are
   // disabled in the dropdown so the same orientation name can't be reused.
@@ -163,6 +170,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     setSelectedCameraIndex("");
     setCameraName("");
     setCameraUrl("");
+    setPickerRotation(0);
     setNameMode("");
     toast({
       title: "摄像头已添加",
@@ -189,6 +197,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
       width: streamProbe.width,
       height: streamProbe.height,
       fps: streamProbe.fps ?? 30,
+      rotation: pickerRotation,
     });
   };
 
@@ -371,12 +380,27 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
               </SelectContent>
             </Select>
             {isNetworkSource && (
-              <Input
-                value={cameraUrl}
-                onChange={(e) => setCameraUrl(e.target.value)}
-                placeholder="rtsp://user:pass@192.168.1.20:554/stream1"
-                className="bg-gray-800 border-gray-700 text-white font-mono text-xs"
-              />
+              <div className="flex gap-2">
+                <Input
+                  value={cameraUrl}
+                  onChange={(e) => setCameraUrl(e.target.value)}
+                  placeholder="http://10.55.30.197:8080/video"
+                  className="bg-gray-800 border-gray-700 text-white font-mono text-xs flex-1"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() =>
+                    setPickerRotation(((pickerRotation + 90) % 360) as 0 | 90 | 180 | 270)
+                  }
+                  className="bg-gray-800 border-gray-700 text-white hover:bg-gray-700 whitespace-nowrap"
+                  title="Rotate preview 90° clockwise"
+                >
+                  <RotateCw className="w-4 h-4 mr-1" />
+                  {pickerRotation || 0}°
+                </Button>
+              </div>
             )}
           </div>
 
@@ -443,7 +467,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
               {streamChecking && <span className="text-gray-400">连接中…</span>}
               {streamProbe && (
                 <span className="text-green-400">
-                  {streamProbe.width}×{streamProbe.height}
+                  {streamWidth}×{streamHeight}
                   {streamProbe.fps ? ` · ${streamProbe.fps} fps` : ""}
                 </span>
               )}
@@ -522,10 +546,15 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
   // a UVC device, which the recorder must hold alone.
   const {
     probe: streamProbe,
+    displayWidth: streamWidth,
+    displayHeight: streamHeight,
     error: streamError2,
     isChecking: streamChecking,
     feedUrl: streamFeedUrl,
-  } = useNetworkCameraSource(isNetwork && !paused ? camera.url : undefined);
+  } = useNetworkCameraSource(
+    isNetwork && !paused ? camera.url : undefined,
+    camera.rotation ?? 0,
+  );
   const { videoRef, hasError: streamError } = useCameraStream(
     isNetwork ? undefined : camera.device_id,
     paused
@@ -611,13 +640,31 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                   <span className="w-16 shrink-0">Stream:</span>
                   <span className={streamError2 ? "text-amber-400" : "text-gray-300"}>
                     {streamProbe
-                      ? `${streamProbe.width}×${streamProbe.height}${
+                      ? `${streamWidth}×${streamHeight}${
                           streamProbe.fps ? ` · ${streamProbe.fps} fps` : ""
                         }`
                       : streamChecking
                       ? "探测中…"
                       : streamError2 || "未连接"}
                   </span>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      const next = (((camera.rotation ?? 0) + 90) % 360) as
+                        | 0
+                        | 90
+                        | 180
+                        | 270;
+                      onUpdate({ rotation: next });
+                    }}
+                    className="ml-auto h-6 px-2 text-[11px] bg-gray-800 border-gray-700 text-white hover:bg-gray-700"
+                    title="Rotate 90° clockwise"
+                  >
+                    <RotateCw className="w-3 h-3 mr-1" />
+                    {camera.rotation ?? 0}°
+                  </Button>
                 </div>
               </div>
             )}

@@ -4,16 +4,35 @@ import { X, Loader2, Radio } from "lucide-react";
 import { useState } from "react";
 
 export default function ActiveTasksBanner() {
-  const { recordingTask, sshInstallTask, hasActiveRecording, hasActiveSshInstall } = useActiveTasks();
+  const {
+    recordingTask,
+    sshInstallTask,
+    hasActiveRecording,
+    hasActiveSshInstall,
+    hasActiveInference,
+    inferenceLabel,
+  } = useActiveTasks();
   const navigate = useNavigate();
   const location = useLocation();
   const [dismissed, setDismissed] = useState<Set<string>>(new Set());
 
-  if ((!hasActiveRecording && !hasActiveSshInstall) || dismissed.size >= 2) {
+  if (
+    (!hasActiveRecording && !hasActiveSshInstall && !hasActiveInference) ||
+    dismissed.size >= 3
+  ) {
     return null;
   }
 
   const items: { id: string; label: string; path: string; icon: React.ReactNode }[] = [];
+
+  if (hasActiveInference && !dismissed.has("inference") && location.pathname !== "/inference") {
+    items.push({
+      id: "inference",
+      label: inferenceLabel || "推理运行中",
+      path: "/inference",
+      icon: <Radio className="w-3.5 h-3.5 text-green-400 animate-pulse" />,
+    });
+  }
 
   if (hasActiveRecording && recordingTask && !dismissed.has("recording")) {
     const onRecordingPage = location.pathname === "/recording";

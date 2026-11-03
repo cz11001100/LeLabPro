@@ -47,6 +47,8 @@ const CameraFeed: React.FC<CameraFeedProps> = ({ deviceId, label }) => {
 interface StreamCameraFeedProps {
   /** RTSP/HTTP source to preview through the backend. */
   url: string;
+  /** Clockwise quarter-turn applied by the backend before serving the preview. */
+  rotation?: number;
   label?: string;
 }
 
@@ -56,8 +58,8 @@ interface StreamCameraFeedProps {
  * concurrent sessions, so this never steals the device from a recording or an
  * inference run the way a USB camera would.
  */
-export const StreamCameraFeed: React.FC<StreamCameraFeedProps> = ({ url, label }) => {
-  const { probe, feedUrl, error, isChecking } = useNetworkCameraSource(url);
+export const StreamCameraFeed: React.FC<StreamCameraFeedProps> = ({ url, rotation = 0, label }) => {
+  const { probe, feedUrl, error, isChecking } = useNetworkCameraSource(url, rotation);
   const showFeed = !!feedUrl && !error;
 
   return (

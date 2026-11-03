@@ -315,6 +315,15 @@ def run(
     return {"frames": rows, "grid": grid, "cameras": cams, "output_dir": str(out)}
 
 
+def _where(labels: dict | None, index: int) -> str:
+    """Title prefix for an overlay frame.
+
+    A bare global row number is what hid the fact that every pick came from the
+    same episode, so the evaluator passes an ``ep#/f#`` label instead.
+    """
+    return (labels or {}).get(int(index), f"frame {index}")
+
+
 def attach_saliency(
     dataset,
     policy,
@@ -328,6 +337,7 @@ def attach_saliency(
     tile_batch: int = 6,
     fill: str = "mean",
     colors: list[str] | None = None,
+    labels: dict | None = None,
 ) -> dict:
     """Run the occlusion probe on an already-loaded policy.
 
@@ -383,7 +393,7 @@ def attach_saliency(
             ball,
             peaks,
             out_dir / name,
-            f"frame {index} · {camera_key.split('.')[-1]}"
+            f"{_where(labels, index)} · {camera_key.split('.')[-1]}"
             + (f" · peak->ball {dist:.0f}px" if dist is not None else " · 未检测到目标"),
         )
         rows.append(

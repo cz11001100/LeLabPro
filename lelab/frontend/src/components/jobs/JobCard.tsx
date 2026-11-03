@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { JobRecord, startJobValidation, stopJobValidation, ValidationState } from "@/lib/jobsApi";
+import { modelStepOf, modelBaseName } from "@/lib/modelGroups";
 import {
   Square,
   X,
@@ -278,17 +279,13 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
     isSSH && selectedStep != null && (job.exported_steps ?? []).includes(selectedStep);
   // Grouped imported run: collapse the " (step N)" suffix into a dropdown that
   // switches the active member. Each member is a separate imported job.
-  const stepOf = (name: string) => {
-    const m = / \(step (\d+)\)$/.exec(name);
-    return m ? Number(m[1]) : 0;
-  };
-  const displayName = members ? job.name.replace(/ \(step \d+\)$/, "") : job.name;
+  const displayName = members ? modelBaseName(job.name) : job.name;
   const groupCheckpoints = members
-    ? members.map((m) => ({ step: stepOf(m.name), source: "local" as const, ref: m.id }))
+    ? members.map((m) => ({ step: modelStepOf(m.name), source: "local" as const, ref: m.id }))
     : [];
-  const groupSelectedStep = members ? stepOf(job.name) : null;
+  const groupSelectedStep = members ? modelStepOf(job.name) : null;
   const selectGroupStep = (step: number) => {
-    const target = members?.find((m) => stepOf(m.name) === step);
+    const target = members?.find((m) => modelStepOf(m.name) === step);
     if (target) setActiveId(target.id);
   };
   const exportPct =
@@ -370,7 +367,7 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
               onClick={handleAction}
               className="h-7 px-2 text-red-400 hover:text-red-300"
             >
-              {isRunning ? "确认停止?" : "确认删除?"}
+              {isRunning ? "Confirm Stop?" : "Confirm Delete?"}
             </Button>
           ) : (
             <Button
@@ -378,8 +375,8 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
               size="icon"
               onClick={handleAction}
               className="h-7 w-7 text-slate-400 hover:text-white"
-              aria-label={isRunning ? "停止任务" : "删除任务"}
-              title={isRunning ? "停止任务" : "删除任务"}
+              aria-label={isRunning ? "Stop task" : "Delete task"}
+              title={isRunning ? "Stop task" : "Delete task"}
             >
               {isRunning ? <Square className="w-3.5 h-3.5" /> : <X className="w-3.5 h-3.5" />}
             </Button>
@@ -428,7 +425,7 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                     : "bg-slate-700 text-slate-500 cursor-not-allowed"
                 }`}
                 aria-label="Resume training from latest checkpoint"
-                title={canResume ? "从最新 checkpoint 续训" : "未检测到远端 checkpoint"}
+                title={canResume ? "Resume from latest checkpoint" : "No remote checkpoint detected"}
               >
                 <RotateCcw className="w-4 h-4" />
               </Button>
@@ -447,15 +444,15 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                     ? "bg-green-600 hover:bg-green-500"
                     : "bg-blue-500 hover:bg-blue-600"
                 }`}
-                aria-label={exporting ? "取消下载" : isDownloaded ? "重新下载到本地" : "下载 checkpoint 到本地"}
+                aria-label={exporting ? "Cancel download" : isDownloaded ? "Re-download to local" : "Download checkpoint to local"}
                 title={
                   exporting
-                    ? "正在下载，点击取消"
+                    ? "Downloading — click to cancel"
                     : !showInferenceRow
-                    ? "未检测到远端 checkpoint"
+                    ? "No remote checkpoint detected"
                     : isDownloaded
-                    ? "已下载到本地（点击重新下载）"
-                    : "下载到本地"
+                    ? "Downloaded to local (click to re-download)"
+                    : "Download to local"
                 }
               >
                 {exporting ? (
@@ -473,7 +470,7 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                 onClick={handlePlay}
                 className="h-8 w-8 bg-green-500 hover:bg-green-600 text-white"
                 aria-label="Run inference with this checkpoint"
-                title="在机器人上运行"
+                title="Run on robot"
               >
                 <Play className="w-4 h-4" />
               </Button>
@@ -488,8 +485,8 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                     ? "bg-red-500 hover:bg-red-600"
                     : "bg-purple-500 hover:bg-purple-600"
                 }`}
-                aria-label={vState === "running" ? "停止评测" : "评测模型"}
-                title={vState === "running" ? "正在评测，点击停止" : "评测模型"}
+                aria-label={vState === "running" ? "Stop evaluation" : "Evaluate model"}
+                title={vState === "running" ? "Evaluating — click to stop" : "Evaluate model"}
               >
                 {validating || vState === "running" ? (
                   <Loader2 className="w-4 h-4 animate-spin" />

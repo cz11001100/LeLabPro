@@ -28,6 +28,7 @@ import os
 import re
 import shlex
 import time
+import threading
 from typing import Generator
 
 logger = logging.getLogger(__name__)
@@ -180,6 +181,11 @@ def effective_python(cfg, client=None) -> str:
     from .ssh_config import set_remote_python
 
     floor = local_python_floor()
+    # A stored interpreter was validated when it was written (and is what the
+    # training path trusts verbatim). Re-probing it on every scoring start costs
+    # a 60 s SSH command on a loaded pod for no new information.
+    if cfg.remote_python:
+        return cfg.remote_python
     owned = client is None
     if owned:
         client = _connect(cfg)
@@ -200,6 +206,63 @@ def effective_python(cfg, client=None) -> str:
         )
         return found
     return cfg.remote_python or found or "python3"
+
+
+_SSH_STATUS_PATH = os.path.join(
+    os.path.expanduser("~"), ".cache", "huggingface", "lerobot", "ssh_status.json"
+)
+_SSH_STATUS_LOCK = threading.Lock()
+
+
+def _record_ssh_status(cfg, ok: bool) -> None:
+    """Remember the last *real* connection outcome for this config.
+
+    Probing SSH on page load is not an option — a dead pod takes up to four
+    15-second retries to fail — so the home page badge reads whatever the last
+    genuine use (Test, Check Environment, a remote job) learned.
+    """
+    cfg_id = str(getattr(cfg, "id", "") or "")
+    if not cfg_id:
+        return
+    with _SSH_STATUS_LOCK:
+        try:
+            data = json.loads(open(_SSH_STATUS_PATH).read())
+            if not isinstance(data, dict):
+                data = {}
+        except (OSError, ValueError):
+            data = {}
+        data[cfg_id] = {
+            "ok": bool(ok),
+            "at": int(time.time()),
+            "name": str(getattr(cfg, "name", "") or ""),
+            "host": str(getattr(cfg, "host", "") or ""),
+        }
+        try:
+            os.makedirs(os.path.dirname(_SSH_STATUS_PATH), exist_ok=True)
+            tmp = _SSH_STATUS_PATH + ".tmp"
+            with open(tmp, "w") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, _SSH_STATUS_PATH)
+        except OSError as exc:
+            logger.info("SSH status not persisted: %s", exc)
+
+
+def ssh_connection_status() -> dict:
+    """Aggregated last-known reachability of the saved SSH connections."""
+    try:
+        data = json.loads(open(_SSH_STATUS_PATH).read())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    connected = [c for c in data.values() if isinstance(c, dict) and c.get("ok")]
+    newest = max(connected, key=lambda c: int(c.get("at") or 0), default=None)
+    return {
+        "connected": bool(connected),
+        "configs": data,
+        "last_ok": newest,
+        "age_s": (int(time.time()) - int(newest["at"])) if newest else None,
+    }
 
 
 def _connect(cfg) -> "paramiko.SSHClient":
@@ -226,6 +289,7 @@ def _connect(cfg) -> "paramiko.SSHClient":
             transport = client.get_transport()
             if transport is not None:
                 transport.set_keepalive(30)
+            _record_ssh_status(cfg, True)
             return client
         except Exception as exc:
             last_exc = exc
@@ -233,6 +297,7 @@ def _connect(cfg) -> "paramiko.SSHClient":
                 client.close()
             logger.warning("SSH connect attempt %d failed: %s", attempt + 1, exc)
             time.sleep(3 * (attempt + 1))
+    _record_ssh_status(cfg, False)
     raise last_exc  # type: ignore[misc]
 
 
@@ -550,6 +615,171 @@ def diagnose_env(data: dict, *, python_used: str, floor=None, local_version=None
 REWARD_MODEL_REPOS = ("lerobot/Robometer-4B", "Qwen/Qwen3-VL-4B-Instruct")
 _REWARD_LOG = "/tmp/lelab_reward_download.log"
 _SARM_TRAIN_LOG = "/tmp/lelab_sarm_train.log"
+_ROLL_SCORE_LOG = "/tmp/lelab_rollout_score.log"
+
+
+def run_remote_scoring(config_id: str, command: str, *, use_cn_mirror: bool = True) -> dict:
+    """Run a prepared progress-scoring command on the pod, detached.
+
+    The command itself is built by rollout_eval (that is where the per-backend
+    CLI differences live); this only handles the mirror, the detach and the log.
+    Detached because scoring a 30-episode set takes far longer than an HTTP
+    request, and a dropped SSH channel must not kill it.
+    """
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "status_code": 404, "message": "Config not found"}
+    endpoint = "https://hf-mirror.com" if use_cn_mirror else "https://huggingface.co"
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        command = _prepend_effective_python(client, cfg, command)
+        script = (
+            # Unbuffered: the terminal panel needs lines as they happen, not when
+            # an 8 KB stdout block fills up.
+            f"export HF_ENDPOINT={endpoint} HF_HUB_DISABLE_XET=1 PYTHONUNBUFFERED=1; "
+            f"{command}; echo ROLL_SCORE_DONE=$?"
+        )
+        cmd = f"nohup bash -c {shlex.quote(script)} > {_ROLL_SCORE_LOG} 2>&1 < /dev/null &"
+        code, _, err = _run_cmd(client, cmd, timeout=30)
+        if code != 0:
+            return {"success": False, "message": f"启动打分失败: {err[-300:]}"}
+        return {
+            "success": True,
+            "message": "已在 pod 上开始打分",
+            "log_path": _ROLL_SCORE_LOG,
+            "command": command,
+        }
+    finally:
+        client.close()
+
+
+def remote_scoring_status(config_id: str) -> dict:
+    """Is the pod-side scorer still running, and did it exit cleanly?"""
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        # One round trip, not seven: each SSH command over a cloud proxy costs
+        # seconds, and the page polls this every few seconds.
+        log = _ROLL_SCORE_LOG
+        script = (
+            "echo '==RUN'; pgrep -af '[c]ompute_rabc_weights' | head -3; "
+            f"echo '==TAIL'; tail -c 4000 {log} 2>/dev/null; "
+            f"echo '==STAT'; stat -c '%s %y' {log} 2>/dev/null || echo missing; "
+            f"echo '==OK'; grep -c 'ROLL_SCORE_DONE=0' {log} 2>/dev/null; "
+            f"echo '==DONE'; grep -c 'ROLL_SCORE_DONE=' {log} 2>/dev/null; "
+            "echo '==PS'; for p in $(pgrep -f '[c]ompute_rabc_weights' | head -2); do "
+            "ps -o pid=,etime=,time=,pcpu= -p $p; done; "
+            "echo '==KERN'; dmesg -T 2>/dev/null | grep -iE 'killed process|out of memory' | tail -2; "
+            "echo '==END'"
+        )
+        code, out, err = _run_cmd(client, script, timeout=60)
+        if code != 0 and not out.strip():
+            return {"success": False, "message": f"读取状态失败: {err[-200:]}"}
+
+        def section(name: str) -> str:
+            marker = f"=={name}"
+            if marker not in out:
+                return ""
+            body = out.split(marker, 1)[1]
+            for nxt in ("==RUN", "==TAIL", "==STAT", "==OK", "==DONE", "==PS", "==KERN", "==END"):
+                if nxt != marker and nxt in body:
+                    body = body.split(nxt, 1)[0]
+            return body.strip(" \n")
+
+        running = section("RUN")
+        tail = section("TAIL")
+        log_stat = section("STAT")
+        done = section("OK")
+        failed_out = section("DONE")
+        proc_stats = section("PS")
+        kernel_hits = section("KERN")
+        return {
+            "success": True,
+            "running": bool(running.strip()),
+            "finished_ok": done.strip() not in ("", "0"),
+            "finished": failed_out.strip() not in ("", "0"),
+            "log_path": _ROLL_SCORE_LOG,
+            "log_stat": log_stat.strip(),
+            "proc_stats": proc_stats.strip(),
+            "processes": running.strip()[-400:],
+            "log_chunk": tail[-4000:],
+            "kernel_kill": kernel_hits.strip()[-300:],
+            "log_tail": tail.replace("\r", "\n").strip().splitlines()[-1][-300:] if tail.strip() else "",
+        }
+    finally:
+        client.close()
+
+
+def _prepend_effective_python(client, cfg, command: str) -> str:
+    """Swap whatever interpreter the caller assumed for the one that has lerobot.
+
+    Non-interactive `bash -c` never sources ~/.bashrc, so a pod whose lerobot
+    lives in a conda/venv only exposes it through an explicit path. Every remote
+    command used to hardcode `python3` and died with ModuleNotFoundError.
+    """
+    head, _, rest = command.partition(" ")
+    if not head.split("/")[-1].startswith("python"):
+        return command
+    return f"{effective_python(cfg, client)} {rest}"
+
+
+def download_remote_file(config_id: str, remote_path: str, local_path: str) -> dict:
+    """Copy one file back over SFTP.
+
+    The Hub is not a reliable return path: a pod without a write token fails at
+    `--push-to-hub` after the scoring work is already done (401 preupload). SFTP
+    needs nothing but the SSH login we already have.
+    """
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return {"success": False, "message": "Config not found"}
+    try:
+        client = _connect(cfg)
+    except Exception as exc:
+        return {"success": False, "message": _explain_connect_error(exc)}
+    try:
+        sftp = client.open_sftp()
+        try:
+            sftp.get(remote_path, local_path)
+        finally:
+            sftp.close()
+        return {"success": True, "message": f"已取回 {remote_path}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"success": False, "message": f"取回失败：{exc}"}
+    finally:
+        client.close()
+
+
+def read_remote_file_tail(config_id: str, path: str, max_chars: int = 20000) -> str:
+    """Last chunk of a file on the pod, for the scoring terminal view."""
+    from .ssh_config import get_ssh_config
+
+    cfg = get_ssh_config(config_id)
+    if cfg is None:
+        return ""
+    try:
+        client = _connect(cfg)
+    except Exception as exc:  # noqa: BLE001
+        return f"[SSH 连不上：{_explain_connect_error(exc)}]"
+    try:
+        _, out, _ = _run_cmd(client, f"tail -c {int(max_chars)} {path} 2>/dev/null", timeout=30)
+        return out
+    finally:
+        client.close()
 
 
 def _repo_cache_dir(repo: str) -> str:
@@ -574,25 +804,66 @@ def reward_model_status(config_id: str) -> dict:
         for repo in REWARD_MODEL_REPOS:
             path = _repo_cache_dir(repo)
             code, size, _ = _run_cmd(
-                client, f"du -sh {path} 2>/dev/null | cut -f1", timeout=30
+                client, f"du -sm {path} 2>/dev/null | cut -f1", timeout=30
+            )
+            mb = int(size.strip()) if size.strip().isdigit() else 0
+            # A size threshold can't tell a complete small repo from a failed big
+            # one: Robometer-4B ships only its head (~1MB — the 4B backbone comes
+            # from Qwen), while a dead Xet pull leaves tens of KB of metadata.
+            # What a finished download has and a failed one doesn't is a snapshot.
+            _, snap, _ = _run_cmd(
+                client,
+                f"ls -A {path}/snapshots 2>/dev/null | head -1",
+                timeout=20,
             )
             models.append(
                 {
                     "repo_id": repo,
-                    "present": code == 0 and bool(size.strip()),
-                    "size": size.strip(),
+                    "present": bool(snap.strip()),
+                    "size": f"{mb / 1024:.1f}GB" if mb >= 1024 else f"{mb}MB",
                 }
             )
-        _, running, _ = _run_cmd(
-            client, "pgrep -f 'hf download' | head -3", timeout=20
-        )
+        # `-a` prints the command line: "a process exists" and "which repo is it
+        # pulling" are different facts, and the former alone hides a stuck pull.
+        _, running, _ = _run_cmd(client, "pgrep -af '[h]f download' | head -3", timeout=20)
         _, log_tail, _ = _run_cmd(client, f"tail -3 {_REWARD_LOG} 2>/dev/null", timeout=20)
+        # A missing or zero-byte log is the difference between "downloading
+        # quietly" and "the detached job never wrote anything" — say which.
+        _, log_stat, _ = _run_cmd(
+            client,
+            f"stat -c '%s %y' {_REWARD_LOG} 2>/dev/null || echo missing",
+            timeout=20,
+        )
+        _, hub_size, _ = _run_cmd(
+            client, "du -sh ~/.cache/huggingface/hub 2>/dev/null | cut -f1", timeout=30
+        )
+        # The detached job's exit code is the only honest "it finished" signal:
+        # a 401 from the storage backend leaves the process gone and the cache
+        # nearly empty, which looks identical to "never started" otherwise.
+        _, done, _ = _run_cmd(
+            client,
+            f"grep -o 'REWARD_DOWNLOAD_DONE=[0-9]*' {_REWARD_LOG} 2>/dev/null | tail -1",
+            timeout=20,
+        )
+        marker = done.strip()
         return {
             "success": True,
             "models": models,
-            "ready": all(m["present"] for m in models),
+            # Never "ready" while a pull is still in flight — snapshots appear
+            # file by file, so presence alone is true halfway through.
+            "ready": not running.strip()
+            and (
+                marker.endswith("=0")
+                if marker
+                else all(m["present"] for m in models)
+            ),
             "downloading": bool(running.strip()),
+            "finished": bool(marker),
+            "failed": bool(marker) and not marker.endswith("=0"),
+            "processes": running.strip()[-400:],
             "log_path": _REWARD_LOG,
+            "log_stat": log_stat.strip(),
+            "hub_cache_size": hub_size.strip(),
             "log_tail": log_tail.strip()[-400:],
         }
     finally:
@@ -610,19 +881,21 @@ def start_reward_model_download(config_id: str, *, use_cn_mirror: bool = True) -
     if cfg is None:
         return {"success": False, "message": "Config not found"}
     endpoint = "https://hf-mirror.com" if use_cn_mirror else "https://huggingface.co"
-    pulls = " && ".join(f'hf download {repo}' for repo in REWARD_MODEL_REPOS)
-    script = (
-        f"export HF_ENDPOINT={endpoint}; "
-        f"command -v hf >/dev/null 2>&1 || python3 -m pip install -q -U huggingface_hub; "
-        f"{pulls}; echo REWARD_DOWNLOAD_DONE=$?"
-    )
-    cmd = f"nohup bash -c {shlex.quote(script)} > {_REWARD_LOG} 2>&1 < /dev/null &"
-
     try:
         client = _connect(cfg)
     except Exception as exc:
         return {"success": False, "message": _explain_connect_error(exc)}
     try:
+        python = effective_python(cfg, client)
+        pulls = " && ".join(f"hf download {repo}" for repo in REWARD_MODEL_REPOS)
+        script = (
+            f"export HF_ENDPOINT={endpoint} HF_HUB_DISABLE_XET=1; "
+            # Install into the interpreter that has lerobot, not whatever `python3`
+            # happens to be in a non-interactive shell.
+            f'command -v hf >/dev/null 2>&1 || "{python}" -m pip install -q -U huggingface_hub; '
+            f"{pulls}; echo REWARD_DOWNLOAD_DONE=$?"
+        )
+        cmd = f"nohup bash -c {shlex.quote(script)} > {_REWARD_LOG} 2>&1 < /dev/null &"
         code, _, err = _run_cmd(client, cmd, timeout=30)
         if code != 0:
             return {"success": False, "message": f"启动下载失败: {err[-300:]}"}
@@ -667,20 +940,21 @@ def start_sarm_training_remote(
         if push_repo_id
         else ""
     )
-    script = (
-        f"export HF_ENDPOINT={endpoint}; "
-        f"python3 -m lerobot.scripts.lerobot_train "
-        f"--dataset.repo_id={dataset_repo_id} --reward_model.type=sarm "
-        f"--reward_model.annotation_mode=single_stage --reward_model.image_key={image_key} "
-        f"--steps={steps} --batch_size={batch_size} --output_dir=outputs/sarm {push}; "
-        "echo SARM_TRAIN_DONE=$?"
-    )
-    cmd = f"nohup bash -c {shlex.quote(script)} > {_SARM_TRAIN_LOG} 2>&1 < /dev/null &"
     try:
         client = _connect(cfg)
     except Exception as exc:
         return {"success": False, "message": _explain_connect_error(exc)}
     try:
+        python = effective_python(cfg, client)
+        script = (
+            f"export HF_ENDPOINT={endpoint} HF_HUB_DISABLE_XET=1; "
+            f'"{python}" -m lerobot.scripts.lerobot_train '
+            f"--dataset.repo_id={dataset_repo_id} --reward_model.type=sarm "
+            f"--reward_model.annotation_mode=single_stage --reward_model.image_key={image_key} "
+            f"--steps={steps} --batch_size={batch_size} --output_dir=outputs/sarm {push}; "
+            "echo SARM_TRAIN_DONE=$?"
+        )
+        cmd = f"nohup bash -c {shlex.quote(script)} > {_SARM_TRAIN_LOG} 2>&1 < /dev/null &"
         code, _, err = _run_cmd(client, cmd, timeout=30)
         if code != 0:
             return {"success": False, "message": f"启动 SARM 训练失败: {err[-300:]}"}
@@ -705,7 +979,7 @@ def sarm_training_status(config_id: str) -> dict:
     except Exception as exc:
         return {"success": False, "message": _explain_connect_error(exc)}
     try:
-        _, running, _ = _run_cmd(client, "pgrep -f lerobot_train | head -3", timeout=20)
+        _, running, _ = _run_cmd(client, "pgrep -f '[l]erobot_train' | head -3", timeout=20)
         _, tail, _ = _run_cmd(client, f"tail -4 {_SARM_TRAIN_LOG} 2>/dev/null", timeout=20)
         _, done, _ = _run_cmd(client, f"grep -c 'SARM_TRAIN_DONE=0' {_SARM_TRAIN_LOG} 2>/dev/null", timeout=20)
         return {

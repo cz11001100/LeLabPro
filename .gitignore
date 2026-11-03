@@ -66,3 +66,6 @@ node_modules/
 
 # install.sh 建的环境目录（必须忽略，否则会把整个 venv 提交进仓库）
 /lerobot-env/
+
+# Qoder 本地会话/技能配置，不入库
+/.qoder/

@@ -134,8 +134,12 @@ def lerobot_cache(tmp_lerobot_home, monkeypatch: pytest.MonkeyPatch):
     return tmp_lerobot_home
 
 
-def _tiny_dataset(repo_id: str, episodes: int = 3, frames: int = 4):
-    """Write a small finished, non-video dataset and return its root."""
+def _tiny_dataset(repo_id: str, episodes: int = 3, frames: int = 4, tasks: list[str] | None = None):
+    """Write a small finished, non-video dataset and return its root.
+
+    ``tasks`` rotates one task text per episode, which is what a real session looks
+    like once the user retargets the robot mid-recording.
+    """
     import numpy as np
 
     from lerobot.datasets import LeRobotDataset
@@ -146,9 +150,10 @@ def _tiny_dataset(repo_id: str, episodes: int = 3, frames: int = 4):
     }
     dataset = LeRobotDataset.create(repo_id, fps=10, features=features, use_videos=False)
     for episode in range(episodes):
+        task = tasks[episode % len(tasks)] if tasks else "push"
         for frame in range(frames):
             values = np.full(2, episode * frames + frame, dtype=np.float32)
-            dataset.add_frame({"action": values, "observation.state": values, "task": "push"})
+            dataset.add_frame({"action": values, "observation.state": values, "task": task})
         dataset.save_episode()
     dataset.finalize()
     return dataset.root
@@ -373,3 +378,28 @@ def test_dataset_info_falls_back_to_the_session_snapshot(lerobot_cache, monkeypa
     info = handle_get_dataset_info(DatasetInfoRequest(dataset_repo_id="info_test/not_yet"))
 
     assert info["num_episodes"] == 2
+
+
+def test_dataset_info_lists_every_task_in_the_dataset(lerobot_cache) -> None:
+    """A session that retargets mid-recording holds several task descriptions.
+
+    Reporting only tasks.parquet's first row made the upload page claim the whole
+    dataset was one task while a third of its episodes were another.
+    """
+    from lelab.record import DatasetInfoRequest, handle_get_dataset_info
+
+    _tiny_dataset(
+        "info_test/multi_task",
+        episodes=5,
+        frames=6,
+        tasks=["grasp the blue ball", "grasp the red ball"],
+    )
+
+    info = handle_get_dataset_info(DatasetInfoRequest(dataset_repo_id="info_test/multi_task"))
+
+    assert {t["task"]: t["episodes"] for t in info["tasks"]} == {
+        "grasp the blue ball": 3,
+        "grasp the red ball": 2,
+    }
+    # The page derives 平均长度 from these counts, so it needs every episode.
+    assert [e["length"] for e in info["episodes"]] == [6] * 5

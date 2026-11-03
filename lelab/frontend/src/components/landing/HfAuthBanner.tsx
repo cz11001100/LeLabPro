@@ -87,10 +87,10 @@ const HfAuthBanner: React.FC = () => {
               {submitting ? (
                 <>
                   <Loader2 className="w-4 h-4 mr-2 animate-spin" />
-                  保存中…
+                  Saving…
                 </>
               ) : (
-                "保存 token"
+                "Save Token"
               )}
             </Button>
           </form>

@@ -17,12 +17,15 @@ import {
   SSHConfig,
   SSHConfigInput,
   RemoteEnvInfo,
+  RewardModelStatus,
   InstallProgress,
   createSSHConfig,
   updateSSHConfig,
   deleteSSHConfig,
   testSSHConfig,
   checkSSHRemoteEnv,
+  getRewardModelStatus,
+  startRewardModelDownload,
   installLerobotRemote,
 } from "@/lib/jobsApi";
 import { useApi } from "@/contexts/ApiContext";
@@ -129,6 +132,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
   const [sshTesting, setSSHTesting] = useState<string | null>(null);
   const [envChecking, setEnvChecking] = useState(false);
   const [remoteEnv, setRemoteEnv] = useState<RemoteEnvInfo | null>(null);
+  const [rewardStatus, setRewardStatus] = useState<RewardModelStatus | null>(null);
   const [installing, setInstalling] = useState(false);
   const [installProgress, setInstallProgress] = useState<InstallProgress | null>(null);
   const [installLogs, setInstallLogs] = useState<string[]>([]);
@@ -136,6 +140,9 @@ const TargetCard: React.FC<TargetCardProps> = ({
   const [installPolicies, setInstallPolicies] = useState<string[]>(
     INSTALLABLE_POLICIES.map((p) => p.v),
   );
+  // The scoring weights are a 17.8 GB model pull, not a pip extra, but they
+  // belong in the same "what should this machine end up having" decision.
+  const [installWeights, setInstallWeights] = useState(true);
 
   // Check for active SSH install task on mount (for reconnection)
   useEffect(() => {
@@ -330,12 +337,49 @@ const TargetCard: React.FC<TargetCardProps> = ({
     }
   };
 
+  const loadRewardStatus = async (id: string): Promise<RewardModelStatus | null> => {
+    try {
+      const st = await getRewardModelStatus(baseUrl, fetchWithHeaders, id);
+      setRewardStatus(st);
+      return st;
+    } catch {
+      setRewardStatus(null);
+      return null;
+    }
+  };
+
+  const handleDownloadReward = async (id: string) => {
+    try {
+      const res = await startRewardModelDownload(baseUrl, fetchWithHeaders, id);
+      toast({
+        title: res.message,
+        description: res.log_path ? `日志 ${res.log_path}` : undefined,
+      });
+      setRewardStatus({ success: true, downloading: true, models: [] });
+    } catch (e) {
+      toast({
+        title: "下载没起来",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    }
+  };
+
+  // The 18 GB pull runs detached on the pod; poll until it lands.
+  const activeSSHId = target.ssh_config_id || "";
+  React.useEffect(() => {
+    if (!rewardStatus?.downloading || !activeSSHId) return;
+    const timer = window.setInterval(() => loadRewardStatus(activeSSHId), 15000);
+    return () => window.clearInterval(timer);
+  }, [rewardStatus?.downloading, activeSSHId]);
+
   const handleCheckEnv = async (id: string) => {
     setEnvChecking(true);
     setRemoteEnv(null);
     try {
       const env = await checkSSHRemoteEnv(baseUrl, fetchWithHeaders, id);
       setRemoteEnv(env);
+      if (env.success) loadRewardStatus(id);
       if (!env.success) {
         toast({
           title: "环境检查失败",
@@ -378,6 +422,12 @@ const TargetCard: React.FC<TargetCardProps> = ({
       });
       if (result.success) {
         await handleCheckEnv(id);
+        // Weights are a separate, much longer pull: start it detached once the
+        // dependencies are in place, and let the status row follow it.
+        if (installWeights) {
+          const st = await loadRewardStatus(id);
+          if (st?.success && !st.ready && !st.downloading) handleDownloadReward(id);
+        }
       }
     } catch (e) {
       toast({
@@ -451,7 +501,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                 onClick={() => showSSHForm ? handleCancelSSHForm() : (setEditingSSHId(null), setSSHForm(emptySSHForm), setSSHCommandText(""), setShowSSHForm(true))}
               >
                 <Plus className="w-3 h-3 mr-1" />
-                {showSSHForm ? "取消" : "新建连接"}
+                {showSSHForm ? "Cancel" : "New Connection"}
               </Button>
             </div>
 
@@ -519,12 +569,12 @@ const TargetCard: React.FC<TargetCardProps> = ({
                 >
                   {sshCreating ? (
                     <>
-                      <Loader2 className="w-3 h-3 mr-1 animate-spin" /> 保存中…
+                      <Loader2 className="w-3 h-3 mr-1 animate-spin" /> Saving…
                     </>
                   ) : editingSSHId ? (
-                    "更新连接"
+                    "Update Connection"
                   ) : (
-                    "保存连接"
+                    "Save Connection"
                   )}
                 </Button>
               </div>
@@ -571,7 +621,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                         onClick={() => handleEditSSH(selectedSSH)}
                       >
                         <Pencil className="w-3 h-3" />
-                        <span className="ml-1">编辑</span>
+                        <span className="ml-1">Edit</span>
                       </Button>
                       <Button
                         variant="ghost"
@@ -585,7 +635,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                         ) : (
                           <Wifi className="w-3 h-3" />
                         )}
-                        <span className="ml-1">测试</span>
+                        <span className="ml-1">Test</span>
                       </Button>
                       <Button
                         variant="ghost"
@@ -599,7 +649,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                         ) : (
                           <Server className="w-3 h-3" />
                         )}
-                        <span className="ml-1">检查环境</span>
+                        <span className="ml-1">Check Environment</span>
                       </Button>
                       <Button
                         variant="ghost"
@@ -608,7 +658,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                         onClick={() => handleDeleteSSH(selectedSSH.id)}
                       >
                         <Trash2 className="w-3 h-3" />
-                        <span className="ml-1">删除</span>
+                        <span className="ml-1">Delete</span>
                       </Button>
                     </div>
 
@@ -651,7 +701,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                             }
                           }}
                         >
-                          保存
+                          Save
                         </Button>
                       </div>
                       <p className="text-xs text-slate-500">
@@ -691,6 +741,34 @@ const TargetCard: React.FC<TargetCardProps> = ({
                               {remoteEnv.policies_missing?.length ? (
                                 <span className="text-slate-500">，缺失: {remoteEnv.policies_missing.join(", ")}</span>
                               ) : null}
+                            </div>
+                          )}
+                          {target.ssh_config_id && (
+                            <div className="text-slate-400 col-span-2 flex flex-wrap items-center gap-2">
+                              <span>打分权重（Robometer/SARM 用）:</span>
+                              {rewardStatus?.ready ? (
+                                <span className="flex items-center gap-1 text-green-400">
+                                  <CheckCircle className="w-3 h-3" />
+                                  已下载
+                                  {rewardStatus.models?.length
+                                    ? ` (${rewardStatus.models
+                                        .map((m) => m.size)
+                                        .filter(Boolean)
+                                        .join(" + ")})`
+                                    : ""}
+                                </span>
+                              ) : rewardStatus?.downloading ? (
+                                <span className="text-amber-400">下载中…</span>
+                              ) : rewardStatus?.failed ? (
+                                <span className="text-red-400">
+                                  下载失败 — {rewardStatus.hub_cache_size || "无"} 落盘，看日志
+                                  {rewardStatus.log_path ? ` ${rewardStatus.log_path}` : ""}
+                                </span>
+                              ) : (
+                                <span className="text-slate-500">
+                                  {rewardStatus === null ? "未检查" : "未下载"}
+                                </span>
+                              )}
                             </div>
                           )}
                         </div>
@@ -743,7 +821,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
                                   )
                                 }
                               >
-                                {installPolicies.length === INSTALLABLE_POLICIES.length ? "清空" : "全选"}
+                                {installPolicies.length === INSTALLABLE_POLICIES.length ? "Clear" : "Select All"}
                               </button>
                             </div>
                             <div className="grid grid-cols-3 gap-x-2 gap-y-1 mt-1">
@@ -782,6 +860,26 @@ const TargetCard: React.FC<TargetCardProps> = ({
                                 );
                               })}
                             </div>
+                            <label className="flex items-center gap-1.5 text-xs text-slate-300 cursor-pointer mt-2">
+                              <Checkbox
+                                checked={installWeights}
+                                onCheckedChange={(c) => setInstallWeights(c === true)}
+                                className="border-slate-500 data-[state=checked]:bg-blue-600"
+                              />
+                              打分权重（Robometer-4B + Qwen3-VL，约 17.8GB）
+                              {rewardStatus?.ready ? (
+                                <span className="flex items-center gap-0.5 text-green-400">
+                                  <CheckCircle className="w-3 h-3" />
+                                  <span className="text-[10px]">已装</span>
+                                </span>
+                              ) : rewardStatus?.downloading ? (
+                                <span className="text-[10px] text-amber-400">下载中</span>
+                              ) : rewardStatus?.failed ? (
+                                <span className="text-[10px] text-red-400">失败</span>
+                              ) : remoteEnv?.success ? (
+                                <span className="text-[10px] text-amber-400">未装</span>
+                              ) : null}
+                            </label>
                             {installPolicies.length === 0 && (
                               <p className="text-[10px] text-amber-400 mt-1">
                                 未勾选任何策略 — 将安装全部策略的 extra
@@ -808,14 +906,14 @@ const TargetCard: React.FC<TargetCardProps> = ({
                           >
                             {installing ? (
                               <>
-                                <Loader2 className="w-3 h-3 mr-1 animate-spin" /> 安装中…
+                                <Loader2 className="w-3 h-3 mr-1 animate-spin" /> Installing…
                               </>
                             ) : (
                               <>
                                 <Download className="w-3 h-3 mr-1" />
                                 {remoteEnv.lerobot_installed
-                                  ? "重装 / 补装所选策略依赖"
-                                  : "安装 lerobot"}
+                                  ? "Reinstall / Add Selected Policy Dependencies"
+                                  : "Install LeRobot"}
                               </>
                             )}
                           </Button>

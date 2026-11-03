@@ -25,10 +25,18 @@ export interface StartInferenceRequest {
   dataset_fps?: number;
   num_episodes?: number;
   record_autonomous?: boolean;
-  // dagger: end the round as soon as one correction is saved, then continue.
-  auto_advance?: boolean;
   leader_port?: string;
   leader_config?: string;
+}
+
+export interface TakeStats {
+  takes: number;
+  corrected_takes: number;
+  failures: number;
+  takeover_rate: number | null;
+  failure_rate: number | null;
+  updated?: string;
+  policy_ref?: string;
 }
 
 export interface TakeoverState {
@@ -36,6 +44,23 @@ export interface TakeoverState {
   phase?: "autonomous" | "paused" | "correcting" | string;
   episodes?: number;
   repo_id?: string;
+  // Takes the operator marked as failures during this session (not stored in
+  // the dataset; success rate comes from the evaluation page).
+  failures?: number;
+  // Attempts started, and how many of them needed a human, this session.
+  takes?: number;
+  corrected_takes?: number;
+  // LeLab's capture session phase: 'ready' = rest screen waiting for 开始下一集,
+  // 'running' = an episode is in progress. Drives the capture page layout.
+  session_phase?: "ready" | "running" | string;
+  episode_elapsed_s?: number;
+  // Frames in the episode just saved, vs the policy's chunk horizon: RA-BC
+  // needs the episode to be at least chunk_size frames long.
+  last_episode_frames?: number;
+  rabc_chunk_size?: number;
+  // Seconds the policy has spent driving — the budget `duration` is measured
+  // against, so it stops while the operator is paused or correcting.
+  policy_s?: number;
 }
 
 export interface InferenceStatus {
@@ -54,7 +79,13 @@ export interface InferenceStatus {
   camera_names?: string[];
   capture_mode?: CaptureMode;
   dataset_repo_id?: string | null;
+  // Dataset-wide episode target (段数上限): a resumed dataset counts toward this
+  // total, so the page shows 第 N / M 集 instead of process restarts.
+  episode_target?: number;
   takeover?: TakeoverState;
+  // Lifetime counters for the capture dataset being written, folded in from the
+  // rollout subprocess on every poll.
+  take_stats?: TakeStats;
   switching_round?: boolean;
 }
 
@@ -105,7 +136,7 @@ export async function captureInferenceSnapshot(
 export async function sendInferenceTakeover(
   baseUrl: string,
   fetcher: Fetcher,
-  action: "pause" | "correct" | "save" | "stop",
+  action: "pause" | "correct" | "save" | "stop" | "success" | "fail",
 ): Promise<{ message: string; key: string }> {
   return apiRequest(baseUrl, fetcher, "/inference-takeover", {
     method: "POST",

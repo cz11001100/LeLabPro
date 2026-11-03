@@ -206,6 +206,66 @@ class TrainingRequest(BaseModel):
     config_path: str | None = None
 
 
+def preflight_rabc(config: "TrainingRequest") -> str | None:
+    """Flag RA-BC runs whose progress file is missing or clearly misaligned.
+
+    RA-BC indexes per-frame progress by the training dataset's global ``index``,
+    so a merged demo+correction dataset must be re-scored — the old parquet's
+    indices no longer line up and most frames silently fall back to weight 1.0
+    (RA-BC effectively off). Return a user-facing message instead of letting that
+    happen unnoticed; return None when OK or when we cannot verify.
+    """
+    if not config.sample_weighting_enable:
+        return None
+    try:
+        import json
+        from pathlib import Path
+
+        explicit = (config.sample_weighting_progress_path or "").strip()
+        if explicit:
+            return None if Path(explicit).is_file() else f"RA-BC 进度文件不存在：{explicit}"
+
+        root = config.dataset_root
+        if not root:
+            import os
+
+            base = os.environ.get("HF_LEROBOT_HOME") or str(
+                Path.home() / ".cache" / "huggingface" / "lerobot"
+            )
+            root = str(Path(base) / config.dataset_repo_id)
+        root_p = Path(root)
+        parquet = root_p / "sarm_progress.parquet"
+        if not parquet.is_file():
+            return (
+                "已开启 RA-BC，但训练集根目录没有 sarm_progress.parquet"
+                f"（{root}）。若你把演示集和纠正集合成了新数据集，请先在评估页对"
+                "合并后的数据集重新打分；否则 RA-BC 会静默按 1.0 加权、等于没开。"
+            )
+        try:
+            info = json.loads((root_p / "meta" / "info.json").read_text())
+            total_frames = int(info.get("total_frames") or 0)
+        except Exception:
+            total_frames = 0
+        if total_frames:
+            try:
+                import pandas as pd
+
+                df = pd.read_parquet(parquet)
+                if "index" in df.columns and len(df):
+                    max_index = int(df["index"].max())
+                    if max_index + 50 < total_frames:
+                        return (
+                            f"RA-BC 进度文件与训练集不对齐：进度最大帧号 {max_index}，"
+                            f"数据集共 {total_frames} 帧。多半是合并数据集后没有重新打分——"
+                            "请对合并后的数据集重新打分再训练。"
+                        )
+            except Exception:
+                return None
+        return None
+    except Exception:
+        return None
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,

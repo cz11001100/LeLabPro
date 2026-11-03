@@ -265,3 +265,42 @@ def test_deleting_nothing_is_an_error(lerobot_home: Path) -> None:
 
     with pytest.raises(DatasetRepairError, match="No episodes selected"):
         delete_episodes_via_rebuild(root, REPO_ID, [])
+
+
+def test_deleting_from_a_merged_dataset_survives_merge_bookkeeping(lerobot_home: Path) -> None:
+    """lerobot's merge leaves the episode index inconsistent, in two fatal ways.
+
+    - `meta/episodes/{chunk,file}_index` is copied from the source datasets, so rows
+      name shards the merged set never wrote and the editor opens a missing path;
+    - a feature stripped to line the sources up keeps its `stats/<feature>/*`
+      columns, and the rows that never carried it flush as a `null` column type,
+      which no longer matches the file the first batch created.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lelab.dataset_repair import delete_episodes_via_rebuild
+
+    root = _record(REPO_ID, video=False, episodes=4)
+    shard = root / "meta" / "episodes" / "chunk-000" / "file-000.parquet"
+    table = pq.read_table(shard)
+
+    field = table.column_names.index("meta/episodes/file_index")
+    table = table.set_column(
+        field,
+        table.schema.field(field),
+        pa.array([2, 0, 2, 0], type=pa.int64()),
+    )
+    table = table.append_column(
+        pa.field("stats/intervention/min", pa.list_(pa.float64())),
+        pa.array([[0.0, 1.0], None, [0.0, 1.0], None], type=pa.list_(pa.float64())),
+    )
+    pq.write_table(table, shard)
+
+    msg = delete_episodes_via_rebuild(root, REPO_ID, [2])
+
+    assert "4 -> 3" in msg
+    rebuilt = pq.read_table(shard)
+    assert "stats/intervention/min" not in rebuilt.column_names
+    assert set(rebuilt["meta/episodes/file_index"].to_pylist()) == {0}
+    assert set(rebuilt["meta/episodes/chunk_index"].to_pylist()) == {0}

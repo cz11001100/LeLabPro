@@ -28,6 +28,8 @@ import {
 } from "@/lib/jobsApi";
 import { JobCheckpoint, listJobCheckpoints } from "@/lib/checkpointsApi";
 import { DatasetItem, listDatasets } from "@/lib/replayApi";
+import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
+import { ModelVariant } from "@/lib/modelGroups";
 
 const CHART_CAPTIONS: Record<string, string> = {
   per_joint: "每个关节的开环误差（对比「永远预测均值」的基线）",
@@ -80,27 +82,36 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
 
 const EVAL_CONFIG_KEY = "lelab.eval.config";
 
+type EvalPreset = "quick" | "normal" | "deep";
+
 interface EvalConfig {
-  numBatches: number;
+  preset: EvalPreset;
   batchSize: number;
-  seed: number;
-  holdout: number;
-  framesPerEpisode: number;
   probe: boolean;
-  saliencyFrames: number;
-  aimFrames: number;
   device: string;
 }
 
+// 三档预设：批次数/每集取几帧/定位热区图/指向反演帧数/种子都收进档位，
+// 评估页不再暴露这些采样参数。每批样本与设备随硬件自定义，单独保留。
+export const EVAL_PRESETS: Record<
+  EvalPreset,
+  {
+    numBatches: number;
+    framesPerEpisode: number;
+    saliencyFrames: number;
+    aimFrames: number;
+    seed: number;
+  }
+> = {
+  quick: { numBatches: 5, framesPerEpisode: 0, saliencyFrames: 1, aimFrames: 1, seed: 0 },
+  normal: { numBatches: 20, framesPerEpisode: 8, saliencyFrames: 2, aimFrames: 4, seed: 0 },
+  deep: { numBatches: 50, framesPerEpisode: 16, saliencyFrames: 4, aimFrames: 8, seed: 0 },
+};
+
 const DEFAULT_EVAL_CONFIG: EvalConfig = {
-  numBatches: 20,
+  preset: "normal",
   batchSize: 8,
-  seed: 0,
-  holdout: 20,
-  framesPerEpisode: 8,
   probe: true,
-  saliencyFrames: 2,
-  aimFrames: 4,
   device: "cuda",
 };
 
@@ -109,7 +120,13 @@ const loadEvalConfig = (): EvalConfig => {
     const raw = localStorage.getItem(EVAL_CONFIG_KEY);
     if (!raw) return DEFAULT_EVAL_CONFIG;
     const parsed = JSON.parse(raw);
-    return { ...DEFAULT_EVAL_CONFIG, ...parsed };
+    return {
+      preset: parsed.preset in EVAL_PRESETS ? parsed.preset : DEFAULT_EVAL_CONFIG.preset,
+      batchSize:
+        typeof parsed.batchSize === "number" ? parsed.batchSize : DEFAULT_EVAL_CONFIG.batchSize,
+      probe: typeof parsed.probe === "boolean" ? parsed.probe : DEFAULT_EVAL_CONFIG.probe,
+      device: typeof parsed.device === "string" ? parsed.device : DEFAULT_EVAL_CONFIG.device,
+    };
   } catch {
     return DEFAULT_EVAL_CONFIG;
   }
@@ -124,7 +141,13 @@ const saveEvalConfig = (config: Partial<EvalConfig>) => {
   }
 };
 
-const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
+const EvaluationCard: React.FC<{
+  job: JobRecord;
+  // Sibling checkpoints of one imported run: renders a Checkpoint selector at
+  // the front of the parameter grid that switches the evaluated job.
+  variants?: ModelVariant[];
+  onSelectJob?: (jobId: string) => void;
+}> = ({ job, variants, onSelectJob }) => {
   const { baseUrl, fetchWithHeaders } = useApi();
   const { toast } = useToast();
   const [checkpoints, setCheckpoints] = useState<JobCheckpoint[]>([]);
@@ -132,14 +155,9 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
   
   // Load saved config from localStorage
   const savedConfig = loadEvalConfig();
-  const [numBatches, setNumBatches] = useState(savedConfig.numBatches);
+  const [preset, setPreset] = useState<EvalPreset>(savedConfig.preset);
   const [batchSize, setBatchSize] = useState(savedConfig.batchSize);
-  const [seed, setSeed] = useState(savedConfig.seed);
-  const [holdout, setHoldout] = useState(savedConfig.holdout);
-  const [framesPerEpisode, setFramesPerEpisode] = useState(savedConfig.framesPerEpisode);
   const [probe, setProbe] = useState(savedConfig.probe);
-  const [saliencyFrames, setSaliencyFrames] = useState(savedConfig.saliencyFrames);
-  const [aimFrames, setAimFrames] = useState(savedConfig.aimFrames);
   const [device, setDevice] = useState(savedConfig.device);
   const [starting, setStarting] = useState(false);
   const [stopping, setStopping] = useState(false);
@@ -193,18 +211,9 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
   }, [state, baseUrl, fetchWithHeaders, job.id]);
 
   const run = async () => {
+    const p = EVAL_PRESETS[preset];
     // Save current config to localStorage before running
-    saveEvalConfig({
-      numBatches,
-      batchSize,
-      seed,
-      holdout,
-      framesPerEpisode,
-      probe,
-      saliencyFrames,
-      aimFrames,
-      device,
-    });
+    saveEvalConfig({ preset, batchSize, probe, device });
 
     setStarting(true);
     setState("running");
@@ -212,15 +221,15 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
     try {
       await startJobValidation(baseUrl, fetchWithHeaders, job.id, {
         step: step ? Number(step) : undefined,
-        num_batches: numBatches,
+        num_batches: p.numBatches,
         batch_size: batchSize,
-        seed,
-        holdout_episodes: valDataset ? 0 : holdout,
+        seed: p.seed,
+        holdout_episodes: 0,
         dataset_repo_id: valDataset || undefined,
-        frames_per_episode: framesPerEpisode,
+        frames_per_episode: p.framesPerEpisode,
         probe,
-        saliency_frames: saliencyFrames,
-        aim_frames: aimFrames,
+        saliency_frames: p.saliencyFrames,
+        aim_frames: p.aimFrames,
         device,
       });
       toast({ title: "评测已启动" });
@@ -270,52 +279,39 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
       </CardHeader>
       <CardContent className="space-y-4">
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-          <Field label="批次数">
-            <NumberInput
-              value={numBatches}
-              onChange={(v) => v !== undefined && setNumBatches(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
+          {variants && variants.length > 0 ? (
+            <Field label="Checkpoint">
+              <CheckpointDropdown
+                checkpoints={variants.map((v) => ({
+                  step: v.step,
+                  source: "local" as const,
+                  ref: v.jobId,
+                }))}
+                selectedStep={variants.find((v) => v.jobId === job.id)?.step ?? null}
+                onChange={(step) => {
+                  const v = variants.find((x) => x.step === step);
+                  if (v) onSelectJob?.(v.jobId);
+                }}
+                triggerClassName="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+              />
+            </Field>
+          ) : null}
+          <Field label="评估深度">
+            <Select value={preset} onValueChange={(v) => setPreset(v as EvalPreset)}>
+              <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent className="bg-slate-800 border-slate-600 text-white">
+                <SelectItem value="quick">快速评估</SelectItem>
+                <SelectItem value="normal">一般评估</SelectItem>
+                <SelectItem value="deep">深度评估</SelectItem>
+              </SelectContent>
+            </Select>
           </Field>
           <Field label="每批样本">
             <NumberInput
               value={batchSize}
               onChange={(v) => v !== undefined && setBatchSize(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="随机种子">
-            <NumberInput
-              value={seed}
-              onChange={(v) => v !== undefined && setSeed(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="留出最后几集">
-            <NumberInput
-              value={holdout}
-              onChange={(v) => v !== undefined && setHoldout(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="每集取几帧">
-            <NumberInput
-              value={framesPerEpisode}
-              onChange={(v) => v !== undefined && setFramesPerEpisode(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="定位热区图">
-            <NumberInput
-              value={saliencyFrames}
-              onChange={(v) => v !== undefined && setSaliencyFrames(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="指向反演帧数">
-            <NumberInput
-              value={aimFrames}
-              onChange={(v) => v !== undefined && setAimFrames(v)}
               className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
             />
           </Field>
@@ -368,7 +364,7 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
               ) : (
                 <Square className="w-4 h-4 mr-2" />
               )}
-              {stopping ? "停止中…" : "停止评测"}
+              {stopping ? "Stopping…" : "Stop Evaluation"}
             </Button>
           ) : (
             <Button
@@ -381,7 +377,7 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
               ) : (
                 <FlaskConical className="w-4 h-4 mr-2" />
               )}
-              {results ? "重新评测" : "开始评测"}
+              {results ? "Re-evaluate" : "Start Evaluation"}
             </Button>
           )}
         </div>
@@ -562,7 +558,9 @@ const EvaluationCard: React.FC<{ job: JobRecord }> = ({ job }) => {
 
             {results.charts ? (
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                {Object.entries(results.charts).map(([key, rel]) => (
+                {Object.entries(results.charts)
+                  .filter(([key]) => key !== "episodes")
+                  .map(([key, rel]) => (
                   <div key={key} className="bg-slate-900/50 rounded-lg p-2">
                     <img
                       src={evaluationChartUrl(baseUrl, job.id, rel)}
@@ -806,7 +804,7 @@ const DimensionDetail: React.FC<{
           onClick={onClose}
           className="text-slate-400 hover:text-white text-sm px-3 py-1 rounded hover:bg-slate-800"
         >
-          收起
+          Collapse
         </button>
       </div>
 

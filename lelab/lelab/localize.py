@@ -79,6 +79,7 @@ def camera_arg(cameras: list[dict]) -> dict[str, dict]:
                 "width": cam.get("width", 640),
                 "height": cam.get("height", 480),
                 "fps": cam.get("fps", 30),
+                "rotation": cam.get("rotation", 0),
             }
             continue
         out[cam["name"]] = {

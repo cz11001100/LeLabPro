@@ -51,6 +51,10 @@ DRIFT_THRESHOLD_DEG = 10.0
 # A perturbation that changes the action by less than this fraction of the
 # dataset's own action spread is treated as "the policy did not notice".
 INSENSITIVE_RATIO = 0.02
+# How far into the future a visual probe looks for a reach, and how many degrees
+# of commanded motion count as "the demonstrator had started reaching".
+AIM_HORIZON = 25
+MIN_REACH_DEG = 2.0
 
 
 def _joint_names(ds_meta, n: int) -> list[str]:
@@ -61,8 +65,8 @@ def _joint_names(ds_meta, n: int) -> list[str]:
     return [f"joint_{i}" for i in range(n)]
 
 
-def _frame_columns(dataset):
-    """Return (episode_index, frame_index) per dataset frame as plain ints.
+def _column(dataset, name: str) -> list:
+    """One dataset column as plain Python values.
 
     ``hf_dataset`` hands back torch scalars when a format is set, and those are
     not hashable, so read through the underlying Arrow table.
@@ -72,8 +76,13 @@ def _frame_columns(dataset):
         raise RuntimeError("Unsupported LeRobotDataset: no hf_dataset to index episodes")
     table = getattr(hf, "data", None)
     if table is not None and hasattr(table, "column"):
-        return table.column("episode_index").to_pylist(), table.column("frame_index").to_pylist()
-    return [int(x) for x in hf["episode_index"]], [int(x) for x in hf["frame_index"]]
+        return table.column(name).to_pylist()
+    return list(hf[name])
+
+
+def _frame_columns(dataset):
+    """Return (episode_index, frame_index) per dataset frame as plain ints."""
+    return _column(dataset, "episode_index"), _column(dataset, "frame_index")
 
 
 def _sample_indices(
@@ -121,6 +130,39 @@ def _sample_indices(
 
     n = min(n, len(eligible))
     return sorted(random.Random(seed).sample(eligible, n))
+
+
+def _probe_frames(dataset, indices: list[int], n: int, horizon: int) -> tuple[list[int], dict[int, str]]:
+    """Pick ``n`` overlay frames spread over the sampled set, reaching ones only.
+
+    ``indices`` is sorted, so ``indices[:n]`` renders n near-identical frames from
+    the first second of episode 0. Frames before the reach starts are useless for
+    a visual probe — the policy has no aim to read out yet. Reads the action/state
+    columns rather than dataset items so filtering costs no video decode.
+
+    Returns the picks plus an ``ep#/f#`` label per pick: a bare global row number
+    is what hid the episode-0 clustering in the first place.
+    """
+    acts = _column(dataset, "action")
+    states = _column(dataset, "observation.state")
+    ep_col, fr_col = _frame_columns(dataset)
+
+    def reaching(index: int) -> bool:
+        target = acts[min(index + horizon - 1, len(acts) - 1)]
+        state = states[index]
+        delta = (abs(float(a) - float(s)) for a, s in zip(target, state))
+        return max(delta, default=0.0) >= MIN_REACH_DEG
+
+    pool = [i for i in indices if reaching(i)] or list(indices)
+    if len(pool) <= n:
+        picks = pool
+    elif n <= 1:
+        picks = [pool[len(pool) // 2]]
+    else:
+        stride = (len(pool) - 1) / (n - 1)
+        picks = list(dict.fromkeys(pool[round(j * stride)] for j in range(n)))
+
+    return picks, {int(i): f"ep{ep_col[int(i)]}·f{fr_col[int(i)]}" for i in picks}
 
 
 def _collate(items: list[dict]):
@@ -663,6 +705,8 @@ def run_validation(
             from .saliency import attach_saliency
 
             cam = next((k for k in cfg.input_features if "image" in k), None)
+            reach_h = max(1, min(AIM_HORIZON, chunk_len))
+            probe_idx, probe_labels = _probe_frames(dataset, indices, int(saliency_frames), reach_h)
             if cam:
                 colours = sorted({c for t in alt_tasks for c in ("green", "orange", "red", "blue") if c in t.lower()})
                 loc = attach_saliency(
@@ -671,10 +715,11 @@ def run_validation(
                     preprocessor,
                     postprocessor,
                     dev,
-                    indices[: int(saliency_frames)],
+                    probe_idx,
                     cam,
                     Path(output_dir),
                     colors=colours or None,
+                    labels=probe_labels,
                 )
                 charts = results.setdefault("charts", {})
                 for i, row in enumerate(loc["rows"]):
@@ -690,7 +735,7 @@ def run_validation(
                     preprocessor,
                     postprocessor,
                     dev,
-                    indices[: int(saliency_frames)],
+                    probe_idx,
                     cams,
                     sorted({c for t in alt_tasks for c in ("green", "orange", "red", "blue") if c in t.lower()})
                     or ["green", "orange"],
@@ -712,7 +757,7 @@ def run_validation(
 
             cam = next((k for k in cfg.input_features if "image" in k), None)
             colours = sorted({c for t in alt_tasks for c in ("green", "orange", "red", "blue") if c in t.lower()})
-            calibration = fit_aim(dataset, cam, colours or ["green", "orange"], horizon=25) if cam else None
+            calibration = fit_aim(dataset, cam, colours or ["green", "orange"], horizon=AIM_HORIZON) if cam else None
             if calibration:
 
                 def _predict_item(item):
@@ -723,13 +768,17 @@ def run_validation(
                     state = torch.as_tensor(batch["observation.state"]).float().reshape(-1)
                     return pred[0], state[: pred.shape[-1]]
 
+                aim_idx, aim_labels = _probe_frames(
+                    dataset, indices, int(aim_frames), max(1, min(AIM_HORIZON, chunk_len))
+                )
                 aim = probe_aim(
                     dataset,
                     _predict_item,
-                    indices[: int(aim_frames)],
+                    aim_idx,
                     calibration,
                     colours or ["green", "orange"],
                     Path(output_dir),
+                    labels=aim_labels,
                 )
                 charts = results.setdefault("charts", {})
                 for i, row in enumerate(aim["rows"]):

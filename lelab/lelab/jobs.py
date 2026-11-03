@@ -1042,6 +1042,16 @@ class JobRegistry:
         if target.runner == "ssh" and not target.ssh_config_id:
             raise ValueError("ssh_config_id is required when runner is ssh")
 
+        # Local training with RA-BC: refuse to start when the progress file is
+        # missing or misaligned (merged dataset not re-scored), so weighting
+        # isn't silently disabled. Remote runners can't be checked from here.
+        if target.runner == "local":
+            from .train import preflight_rabc
+
+            _rabc_msg = preflight_rabc(config)
+            if _rabc_msg:
+                raise ValueError(_rabc_msg)
+
         ssh_config = None
         if target.runner == "ssh":
             ssh_config = get_ssh_config(target.ssh_config_id)

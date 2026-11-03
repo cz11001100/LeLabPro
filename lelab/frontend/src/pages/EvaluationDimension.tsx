@@ -162,7 +162,7 @@ function getActionMetrics(results: ValidationResults): MetricDetail[] {
       value: `${relNaive.toFixed(2)}×`,
       threshold: "< 1",
       status: relNaive < 1 ? "pass" : "fail",
-      description: "模型误差  预测均值误差（<1 才比"瞎猜"强）",
+      description: "模型误差 / 预测均值误差（<1 才比“瞎猜”强）",
     });
   }
 

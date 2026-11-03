@@ -40,7 +40,7 @@ MAX_STALE_MS = 30_000
 _RECONNECT_DELAYS_S = (1.0, 2.0, 5.0, 10.0)
 _RECONNECT_MAX_ATTEMPTS = 12
 # Ticks a preview feed tolerates without a frame before it closes the response
-# (10 fps → ~30s, which outlasts one FFmpeg reopen attempt).
+# (24 fps → ~12s, which outlasts one FFmpeg reopen attempt).
 MAX_PREVIEW_MISSES = 300
 
 
@@ -65,7 +65,7 @@ def normalize_url(value: Any) -> str:
     if not url:
         raise NetworkCameraError("camera URL is empty")
     if "://" not in url:
-        raise NetworkCameraError(f"`{url}` is missing a scheme — e.g. rtsp://192.168.1.20:554/stream1")
+        raise NetworkCameraError(f"`{url}` is missing a scheme — e.g. http://10.55.30.197:8080/video")
     scheme = url.split("://", 1)[0].lower() + "://"
     if scheme not in NETWORK_SCHEMES:
         raise NetworkCameraError(f"`{scheme}` is not a stream scheme — expected one of {', '.join(NETWORK_SCHEMES)}")
@@ -86,12 +86,34 @@ def ensure_stream_env() -> None:
     grey blocks, which is fatal for a training dataset. The options are read per
     `VideoCapture` creation, so this runs before every open. A value the user
     already exported wins, since it may be tuned for a camera this default suits.
+
+    `max_delay` is the muxer/demuxer's re-ordering window; 100 ms is short enough
+    that a phone MJPEG stream shows the last tenth-of-a-second rather than a
+    half-second-old frame, while still tolerating ordinary network jitter.
     """
     os.environ.setdefault(
         "OPENCV_FFMPEG_CAPTURE_OPTIONS",
         # stimeout and max_delay are microseconds.
-        "rtsp_transport;tcp|stimeout;8000000|fflags;nobuffer|max_delay;500000|flags;low_delay",
+        "rtsp_transport;tcp|stimeout;5000000|fflags;nobuffer|max_delay;100000|flags;low_delay|framedrop;1",
     )
+
+
+def _configure_low_latency(capture: Any) -> None:
+    """Shrink cv2's own queue so a read returns the newest frame, not a backlog.
+
+    The default buffers 5-10 frames, so when the caller polls slower than the
+    stream delivers — 10 fps preview against a 30 fps camera — each read hands
+    back a stale frame and the effective latency grows by the whole buffer.
+    Backends differ in how strictly they honour this; failures are silently
+    ignored, since many builds clamp to their own minimum.
+    """
+    import cv2
+
+    for prop in (cv2.CAP_PROP_BUFFERSIZE,):
+        try:
+            capture.set(prop, 1)
+        except Exception:
+            pass
 
 
 def _prop(capture: Any, prop: int) -> float:
@@ -153,6 +175,7 @@ def _read_stream_properties(url: str, read_timeout_s: float) -> dict[str, Any]:
     if not cap.isOpened():
         cap.release()
         raise NetworkCameraError(f"could not open {redact(url)}")
+    _configure_low_latency(cap)
     try:
         width = int(round(_prop(cap, cv2.CAP_PROP_FRAME_WIDTH)))
         height = int(round(_prop(cap, cv2.CAP_PROP_FRAME_HEIGHT)))
@@ -176,6 +199,37 @@ def _read_stream_properties(url: str, read_timeout_s: float) -> dict[str, Any]:
         cap.release()
 
     return {"width": width, "height": height, "fps": round(fps) if fps > 0 else None}
+
+
+def normalize_rotation(value: Any) -> int:
+    """Snap any UI input to the four supported clockwise quarter-turns."""
+    try:
+        deg = int(value)
+    except (TypeError, ValueError):
+        return 0
+    deg %= 360
+    if deg % 90:
+        return 0
+    return deg
+
+
+def swap_dimensions(rotation: int, width: int, height: int) -> tuple[int, int]:
+    if rotation in (90, 270):
+        return height, width
+    return width, height
+
+
+def apply_rotation(frame: Any, rotation: int) -> Any:
+    """Rotate a BGR frame by a clockwise quarter-turn (0 = passthrough)."""
+    if rotation not in (90, 180, 270) or frame is None:
+        return frame
+    import cv2
+
+    if rotation == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if rotation == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
 
 def probe(url: str, *, timeout_s: float = 15.0, read_timeout_s: float = 8.0) -> dict[str, Any]:
@@ -225,9 +279,13 @@ class NetworkCameraConfig(OpenCVCameraConfig):
     index_or_path: str
     warmup_s: int = 3
     backend: Cv2Backends = Cv2Backends.ANY
+    rotation: int = 0
 
     def __post_init__(self) -> None:
         self.index_or_path = normalize_url(self.index_or_path)
+        self.rotation = normalize_rotation(self.rotation)
+        if self.rotation in (90, 270) and self.width and self.height:
+            self.width, self.height = self.height, self.width
         super().__post_init__()
         self.backend = Cv2Backends.ANY
 
@@ -238,6 +296,7 @@ class NetworkCamera(OpenCVCamera):
     def __init__(self, config: NetworkCameraConfig):
         super().__init__(config)
         self.url: str = str(config.index_or_path)
+        self.rotation: int = normalize_rotation(getattr(config, "rotation", 0))
         self._held: Any = None
         self._held_at: float = 0.0
         self._reconnecting: bool = False
@@ -253,6 +312,8 @@ class NetworkCamera(OpenCVCamera):
         self._closed = False
         ensure_stream_env()
         super().connect(warmup=warmup)
+        if self.videocapture is not None:
+            _configure_low_latency(self.videocapture)
 
     def _read_loop(self) -> None:
         """Stop quietly when the stream dies.
@@ -291,6 +352,7 @@ class NetworkCamera(OpenCVCamera):
         actual_w = int(round(_prop(self.videocapture, cv2.CAP_PROP_FRAME_WIDTH)))
         actual_h = int(round(_prop(self.videocapture, cv2.CAP_PROP_FRAME_HEIGHT)))
         actual_fps = _prop(self.videocapture, cv2.CAP_PROP_FPS)
+        actual_w, actual_h = swap_dimensions(self.rotation, actual_w, actual_h)
 
         if actual_w and actual_h and (actual_w, actual_h) != (self.width, self.height):
             logger.warning(
@@ -335,19 +397,19 @@ class NetworkCamera(OpenCVCamera):
 
     def async_read(self, timeout_ms: float = 200) -> Any:
         try:
-            return self._hold(super().async_read(timeout_ms=timeout_ms))
+            return self._hold(apply_rotation(super().async_read(timeout_ms=timeout_ms), self.rotation))
         except Exception as e:
             return self._stale(e)
 
     def read(self, *args: Any, **kwargs: Any) -> Any:
         try:
-            return self._hold(super().read(*args, **kwargs))
+            return self._hold(apply_rotation(super().read(*args, **kwargs), self.rotation))
         except Exception as e:
             return self._stale(e)
 
     def read_latest(self, max_age_ms: int = 500) -> Any:
         try:
-            return self._hold(super().read_latest(max_age_ms=max_age_ms))
+            return self._hold(apply_rotation(super().read_latest(max_age_ms=max_age_ms), self.rotation))
         except Exception as e:
             return self._stale(e)
 
@@ -406,6 +468,7 @@ class NetworkCamera(OpenCVCamera):
             "fps": self.fps,
             "width": self.width,
             "height": self.height,
+            "rotation": self.rotation,
             **self.stats,
         }
 
@@ -461,14 +524,18 @@ def camera_source(camera_data: dict) -> tuple[str, Any]:
     return camera_data.get("type", "opencv"), source
 
 
-def preview_stream(url: str):
+def preview_stream(url: str, rotation: int = 0):
     """A self-healing stand-in for `cv2.VideoCapture` on a stream URL.
 
     RTSP allows several concurrent client sessions, so LeLab can open its own copy
     for a live preview while a recording or inference run holds the primary one —
     unlike a UVC device, which takes a single opener. `read()`/`release()` match
     cv2's so callers don't need to know which kind of source they got.
+
+    `rotation` is applied to each returned frame so the picker matches what a
+    recording session will actually store.
     """
+    rotation = normalize_rotation(rotation)
 
     class _Stream:
         def __init__(self, target: str) -> None:
@@ -489,9 +556,10 @@ def preview_stream(url: str):
                     self.cap = None
                     self._next_open = time.monotonic() + 2.0
                     return False, None
+                _configure_low_latency(self.cap)
             ok, frame = self.cap.read()
             if ok and frame is not None:
-                return True, frame
+                return True, apply_rotation(frame, rotation)
             # A failed read means the session is gone for good; reopen on the next call.
             self.cap.release()
             self.cap = None
@@ -506,33 +574,59 @@ def preview_stream(url: str):
     return _Stream(url)
 
 
-def preview_frames(url: str, fps: float = 10.0, max_misses: int | None = None):
+def preview_frames(url: str, fps: float = 24.0, rotation: int = 0, max_misses: int | None = None):
     """Yield multipart-MJPEG chunks from a stream URL until the client leaves.
 
-    Browsers render `multipart/x-mixed-replace` straight in an <img>. A failed
-    read just skips a tick — the stream reopens itself, so a Wi-Fi drop shows as
-    a frozen frame rather than a broken image.
+    A daemon reader thread pulls the stream as fast as FFmpeg will hand frames
+    and overwrites a single `latest` slot; the yielder takes that snapshot on
+    its own clock. Without this split, a 10 fps poll on a 30 fps stream leaves
+    an extra 5-10 frames sitting in cv2's queue and the browser watches history
+    instead of the present.
 
-    The miss cap exists because a server only learns about a closed browser tab
-    between chunks: a generator that never produces one holds its request thread
-    forever. So an unreadable stream ends on its own instead.
+    A failed read skips a tick — the stream reopens itself, so a Wi-Fi drop
+    shows as a frozen frame rather than a broken image. The miss cap exists
+    because a server only learns about a closed browser tab between chunks: a
+    generator that never produces one holds its request thread forever.
     """
     import cv2
 
-    stream = preview_stream(url)
+    stream = preview_stream(url, rotation=rotation)
+    lock = threading.Lock()
+    stop = threading.Event()
+    box: dict[str, Any] = {"frame": None, "at": 0.0}
+
+    def reader() -> None:
+        while not stop.is_set():
+            try:
+                ok, frame = stream.read()
+            except Exception:
+                ok, frame = False, None
+            if ok and frame is not None:
+                with lock:
+                    box["frame"] = frame
+                    box["at"] = time.monotonic()
+            else:
+                time.sleep(0.1)
+
+    thread = threading.Thread(target=reader, name="preview-reader", daemon=True)
+    thread.start()
+
     interval = 1.0 / fps
     misses_allowed = MAX_PREVIEW_MISSES if max_misses is None else max_misses
     misses = 0
     try:
         while misses < misses_allowed:
-            ok, frame = stream.read()
-            if ok and frame is not None:
+            with lock:
+                frame = box["frame"]
+                age = time.monotonic() - box["at"] if box["at"] else None
+            if frame is not None and age is not None and age < (MAX_STALE_MS / 1000.0):
                 misses = 0
-                encoded, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                encoded, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 55])
                 if encoded:
                     yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
             else:
                 misses += 1
             time.sleep(interval)
     finally:
+        stop.set()
         stream.release()

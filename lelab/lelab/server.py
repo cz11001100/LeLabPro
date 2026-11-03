@@ -79,17 +79,29 @@ from .rollout import (
     inference_camera_frames,
 )
 from .rollout_eval import (
+    DEFAULT_SUCCESS_PROGRESS,
+    RemoteScoreRequest,
     RolloutScoreRequest,
+    ScorePreflightRequest,
     apply_intervention_exemption,
     handle_compare_progress,
+    handle_rollout_episode_series,
     handle_rollout_score,
+    handle_rollout_score_remote,
+    handle_rollout_score_remote_status,
     handle_rollout_score_status,
     handle_rollout_summary,
+    handle_rollout_score_logs,
+    handle_score_job,
+    handle_score_preflight,
+    latest_capture_stats,
     list_capture_datasets,
     promote_progress,
+    read_take_stats,
 )
 from .dataset_merge import MergeRequest, handle_merge, handle_merge_status, inspect_merge_sources
 from .ssh_remote_env import sarm_training_status as _sarm_training_status
+from .ssh_remote_env import ssh_connection_status as _ssh_connection_status
 from .ssh_remote_env import start_sarm_training_remote as _start_sarm_training
 
 # Import our custom teleoperation functionality
@@ -448,9 +460,35 @@ def rollout_datasets():
 
 
 @app.get("/rollout-summary")
-def rollout_summary(repo_id: str):
+def rollout_summary(
+    repo_id: str,
+    success_progress: float = DEFAULT_SUCCESS_PROGRESS,
+    head_mode: str = "sparse",
+):
     """Closed-loop success rate and per-episode progress for a rollout dataset."""
-    return handle_rollout_summary(repo_id)
+    return handle_rollout_summary(repo_id, success_progress=success_progress, head_mode=head_mode)
+
+
+@app.get("/rollout-episode-series")
+def rollout_episode_series(
+    repo_id: str, episode_index: int, max_points: int = 400, head_mode: str = "sparse"
+):
+    """One episode's progress curve plus the windows where a human was driving."""
+    return handle_rollout_episode_series(
+        repo_id, episode_index, max_points=max_points, head_mode=head_mode
+    )
+
+
+@app.get("/rollout-take-stats")
+def rollout_take_stats(repo_id: str):
+    """Take / takeover / failure counters recorded while capturing a dataset."""
+    return read_take_stats(repo_id)
+
+
+@app.get("/rollout-latest-real-world")
+def rollout_latest_real_world(policy_ref: str = ""):
+    """Newest capture dataset's on-robot numbers, for the deploy page."""
+    return latest_capture_stats(policy_ref)
 
 
 @app.post("/rollout-score")
@@ -468,6 +506,44 @@ def rollout_score(request: RolloutScoreRequest):
 @app.get("/rollout-score-status")
 def rollout_score_status():
     return handle_rollout_score_status()
+
+
+@app.get("/rollout-score-job")
+def rollout_score_job():
+    """The scoring job to re-attach to after a reload (survives a LeLab restart)."""
+    return handle_score_job()
+
+
+@app.get("/rollout-score-logs")
+def rollout_score_logs(max_chars: int = 20000):
+    """Live stdout of the running scorer (local log file or the pod's)."""
+    return handle_rollout_score_logs(max_chars)
+
+
+@app.post("/rollout-score-preflight")
+def rollout_score_preflight(request: ScorePreflightRequest):
+    """Report whether the scoring job could actually run, and what blocks it."""
+    return handle_score_preflight(request)
+
+
+@app.post("/rollout-score-remote")
+def rollout_score_remote(request: RemoteScoreRequest):
+    """Score on a pod (the laptop GPU can't host a 4B progress model)."""
+    result = handle_rollout_score_remote(request)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Remote scoring failed"),
+        )
+    return result
+
+
+@app.get("/rollout-score-remote-status")
+def rollout_score_remote_status(
+    config_id: str, dataset_repo_id: str = "", backend: str = ""
+):
+    """Poll the pod job; once done, pull its parquet back and verify alignment."""
+    return handle_rollout_score_remote_status(config_id, dataset_repo_id, backend)
 
 
 class RolloutRepoBody(BaseModel):
@@ -710,6 +786,7 @@ _NETWORK_PREVIEW_TTL_S = 1800.0
 
 class NetworkCameraSource(BaseModel):
     url: str
+    rotation: int = 0
 
 
 def _remember_preview_source(url: str) -> str:
@@ -722,6 +799,14 @@ def _remember_preview_source(url: str) -> str:
     return key
 
 
+_NO_STORE = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+    "Expires": "0",
+    "X-Accel-Buffering": "no",  # nginx: don't buffer the MJPEG stream
+}
+
+
 @app.post("/network-camera-source")
 def register_network_camera_source(body: NetworkCameraSource):
     """Validate a stream URL and report what it sends, for the camera picker.
@@ -729,8 +814,19 @@ def register_network_camera_source(body: NetworkCameraSource):
     The resolution and frame rate are the *stream's*, not whatever was typed into
     the form: they become the dataset's image features, and an IP camera won't
     switch to a resolution it wasn't configured to encode.
+
+    `rotation` only affects the reported dimensions (a 90°/270° turn swaps the
+    axes); the preview itself takes rotation as a query parameter so the button
+    reconnects in one frame instead of waiting on a fresh probe.
     """
-    from .network_camera import NetworkCameraError, normalize_url, probe, redact
+    from .network_camera import (
+        NetworkCameraError,
+        normalize_rotation,
+        normalize_url,
+        probe,
+        redact,
+        swap_dimensions,
+    )
 
     try:
         url = normalize_url(body.url)
@@ -742,30 +838,40 @@ def register_network_camera_source(body: NetworkCameraSource):
     except NetworkCameraError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    rotation = normalize_rotation(body.rotation)
+    width, height = swap_dimensions(rotation, stream["width"], stream["height"])
+
     return {
         "status": "success",
         "key": _remember_preview_source(url),
         "url": redact(url),
-        **stream,
+        "rotation": rotation,
+        "width": width,
+        "height": height,
+        "fps": stream["fps"],
     }
 
 
 @app.get("/network-camera-feed")
-def network_camera_feed(key: str):
+def network_camera_feed(key: str, rotation: int = 0):
     """Live MJPEG preview of a registered stream URL.
 
     Independent of any session: RTSP takes several client sessions, so the picker
     can watch a camera while a recording or inference run holds its own copy.
+    Rotation travels as a query param so changing it only reloads the `<img>`,
+    never the multi-second probe.
     """
-    from .network_camera import preview_frames
+    from .network_camera import normalize_rotation, preview_frames
 
     source = _network_preview_sources.get(key)
     if source is None:
         raise HTTPException(status_code=404, detail="Unknown preview key — re-register the camera URL")
-    _network_preview_sources[key] = (source[0], time.time())
+    url, _ = source
+    _network_preview_sources[key] = (url, time.time())
     return StreamingResponse(
-        preview_frames(source[0]),
+        preview_frames(url, rotation=normalize_rotation(rotation)),
         media_type="multipart/x-mixed-replace; boundary=frame",
+        headers=_NO_STORE,
     )
 
 
@@ -926,6 +1032,14 @@ def repair_progress_current():
 async def create_training_job(req: Request):
     raw = await req.json()
     body = StartTrainingBody.from_legacy(raw)
+    # RA-BC reads a per-frame progress file keyed on global frame index; a missing
+    # or stale one degrades into wrong weights without any error, so check first.
+    if getattr(body.config, "sample_weighting_enable", False):
+        from .rollout_eval import preflight_rabc_training
+
+        problem = preflight_rabc_training(body.config.dataset_repo_id)
+        if problem:
+            raise HTTPException(status_code=400, detail=problem)
     try:
         record = job_registry.start(body.config, body.target)
     except JobAlreadyRunningError as exc:
@@ -1376,6 +1490,12 @@ class SSHInstallBody(BaseModel):
 def ssh_configs_list():
     """List saved SSH connection configs (passwords redacted)."""
     return {"configs": [c.model_dump() for c in list_ssh_configs()]}
+
+
+@app.get("/ssh-status")
+def ssh_status():
+    """Last-known reachability of the saved connections, for the home page badge."""
+    return _ssh_connection_status()
 
 
 @app.post("/ssh-configs", status_code=201)
@@ -1836,18 +1956,36 @@ def _v4l2_camera_name(index: int) -> str | None:
 
 
 def _linux_cameras() -> list[dict[str, Any]]:
-    """Enumerate Linux cameras, naming each from sysfs (no extra deps)."""
-    import cv2
+    """Enumerate Linux cameras from sysfs, without opening the devices.
 
-    cameras: list[dict[str, Any]] = []
-    for i in range(10):
-        cap = cv2.VideoCapture(i, cv2.CAP_V4L2)
-        opened = cap.isOpened()
-        cap.release()
-        if not opened:
+    Opening each /dev/videoN just to test availability breaks the moment another
+    process holds it: the browser's getUserMedia preview takes V4L2 exclusively,
+    so the open-test failed on every node and returned [] — the deploy dialog
+    then showed no cameras and black previews even though they were plugged in.
+    sysfs needs no open. A UVC camera exposes two nodes (capture + metadata)
+    that share one ``device`` symlink; keeping the lowest index per device gives
+    the capture node cv2 will use.
+    """
+    import glob
+    import os
+
+    by_device: dict[str, tuple[int, str]] = {}
+    for path in glob.glob("/sys/class/video4linux/video*"):
+        try:
+            index = int(os.path.basename(path).removeprefix("video"))
+        except ValueError:
             continue
-        cameras.append({"index": i, "name": _v4l2_camera_name(i) or f"Camera {i}", "available": True})
-    return cameras
+        name = _v4l2_camera_name(index)
+        if not name:
+            continue
+        device = os.path.realpath(os.path.join(path, "device"))
+        prev = by_device.get(device)
+        if prev is None or index < prev[0]:
+            by_device[device] = (index, name)
+    return [
+        {"index": index, "name": name, "available": True}
+        for index, name in sorted(by_device.values())
+    ]
 
 
 @app.get("/available-cameras")

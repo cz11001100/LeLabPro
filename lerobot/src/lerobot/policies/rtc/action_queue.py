@@ -234,13 +234,18 @@ class ActionQueue:
         effective_delay = max(0, real_delay)
 
         if action_index_before_inference is not None:
-            indexes_diff = max(0, self.last_index - action_index_before_inference)
-            if indexes_diff != real_delay:
-                logger.warning(
-                    "Indexes diff is not equal to real delay. indexes_diff=%d, real_delay=%d",
-                    indexes_diff,
+            # Trust the queue: `last_index` advanced by exactly the actions the
+            # robot executed while the chunk was being computed. The latency
+            # estimate divides by the *nominal* fps, so on a loop that runs below
+            # it (22Hz against a 30fps config here) it over-counts the delay and
+            # the extra skipped actions show up as a periodic jerk every replan.
+            measured = max(0, self.last_index - action_index_before_inference)
+            if measured != real_delay:
+                logger.debug(
+                    "Delay measured from the queue (%d) differs from the latency estimate (%d); using the measurement",
+                    measured,
                     real_delay,
                 )
-                return real_delay
+            return measured
 
         return effective_delay

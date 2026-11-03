@@ -1,4 +1,5 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useApi } from "@/contexts/ApiContext";
@@ -9,7 +10,9 @@ import {
   HubModel,
   JobProgressSnapshot,
   JobRecord,
+  SSHStatus,
   deleteJob,
+  getSSHStatus,
   listHubJobs,
   listJobs,
   stopJob,
@@ -20,13 +23,32 @@ import HubModelCard from "./HubModelCard";
 import InferenceModal from "@/components/landing/InferenceModal";
 import ImportModelModal from "./ImportModelModal";
 import { useRobots } from "@/hooks/useRobots";
+import { useDatasets } from "@/hooks/useDatasets";
 import {
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
-import { ChevronRight, Download, RefreshCw, Search } from "lucide-react";
+import {
+  CalendarDays,
+  ChevronRight,
+  Download,
+  ExternalLink,
+  Gauge,
+  HardDrive,
+  HardDriveUpload,
+  RefreshCw,
+  Search,
+  Wifi,
+  X,
+} from "lucide-react";
+import { Card, CardContent } from "@/components/ui/card";
+import { DatasetItem } from "@/lib/replayApi";
 import { exportCheckpoint, resumeJob } from "@/lib/checkpointsApi";
+import { groupImportedByRun } from "@/lib/modelGroups";
+import { randomGreeting } from "@/lib/greetings";
+import { useHfAuth } from "@/contexts/HfAuthContext";
+import ScoringModal from "./ScoringModal";
 
 // The registry holds every job ever run; the untracked section collapses
 // finished ones, so a small cap hid whole months of history (26 records were
@@ -48,9 +70,159 @@ const isHubJobActive = (h: HubJob) =>
 // the fetch still revalidates in the background.
 const jobsCache = new Map<string, JobRecord[]>();
 
+const sshAgeText = (s?: number | null) => {
+  if (s == null) return "";
+  if (s < 60) return `${s}s 前验证`;
+  if (s < 3600) return `${Math.round(s / 60)} 分钟前验证`;
+  return `${Math.round(s / 3600)} 小时前验证`;
+};
+
+const DatasetCard: React.FC<{
+  dataset: DatasetItem;
+  hub?: boolean;
+  onOpen: (repoId: string) => void;
+  onScore: (repoId: string) => void;
+  onDelete: (repoId: string) => void;
+}> = ({ dataset: d, hub = false, onOpen, onScore, onDelete }) => {
+  // Two-step inline confirm with the same 3s auto-disarm as the job cards:
+  // deleting wipes the local dataset directory, so one click is never enough.
+  const [armed, setArmed] = useState(false);
+  const armTimer = useRef<number | null>(null);
+  const hasLocalCopy = d.source !== "hub";
+
+  const disarm = () => {
+    if (armTimer.current != null) {
+      window.clearTimeout(armTimer.current);
+      armTimer.current = null;
+    }
+    setArmed(false);
+  };
+
+  useEffect(() => {
+    return () => {
+      if (armTimer.current != null) window.clearTimeout(armTimer.current);
+    };
+  }, []);
+
+  return (
+    <Card
+      onClick={() => onOpen(d.repo_id)}
+      className="bg-slate-800/50 border-slate-700 rounded-xl transition-colors cursor-pointer hover:border-slate-500"
+    >
+      <CardContent className="p-4 space-y-2">
+        <div className="flex items-center justify-between gap-2">
+          <div
+            className={`flex items-center gap-1.5 text-xs font-semibold ${
+              hub ? "text-cyan-400" : "text-slate-400"
+            }`}
+          >
+            {hub ? (
+              <HardDriveUpload className="w-3.5 h-3.5" />
+            ) : (
+              <HardDrive className="w-3.5 h-3.5" />
+            )}
+            {hub ? "On Hub" : "Local"}
+            {d.private ? (
+              <span className="text-[10px] font-normal px-1.5 py-0.5 rounded border bg-slate-700/60 text-slate-300 border-slate-600">
+                Private
+              </span>
+            ) : null}
+          </div>
+          {hasLocalCopy ? (
+            armed ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  disarm();
+                  onDelete(d.repo_id);
+                }}
+                className="h-7 px-2 text-red-400 hover:text-red-300"
+              >
+                Confirm Delete?
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                size="icon"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setArmed(true);
+                  if (armTimer.current != null) window.clearTimeout(armTimer.current);
+                  armTimer.current = window.setTimeout(() => setArmed(false), 3000);
+                }}
+                className="h-7 w-7 text-slate-400 hover:text-white"
+                aria-label="Delete local dataset"
+                title="Delete local dataset"
+              >
+                <X className="w-3.5 h-3.5" />
+              </Button>
+            )
+          ) : null}
+        </div>
+        <div className="text-white font-semibold truncate" title={d.repo_id}>
+          {d.repo_id}
+        </div>
+        <div className="flex items-center gap-2">
+          <div className="flex h-8 w-[132px] shrink-0 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-2 text-xs text-white">
+            <CalendarDays className="w-3.5 h-3.5 shrink-0 text-slate-400" />
+            <span className="truncate tabular-nums">
+              {d.last_modified ? d.last_modified.slice(0, 10) : "—"}
+            </span>
+          </div>
+          <Button
+            size="icon"
+            onClick={(e) => {
+              e.stopPropagation();
+              onScore(d.repo_id);
+            }}
+            className="h-8 w-8 bg-indigo-500 text-white hover:bg-indigo-600"
+            aria-label="Score this dataset"
+            title="Score this dataset"
+          >
+            <Gauge className="w-4 h-4" />
+          </Button>
+          {hub ? (
+            <Button
+              variant="ghost"
+              size="icon"
+              asChild
+              className="h-8 w-8 bg-cyan-600 text-white hover:bg-cyan-700"
+              aria-label="Open Hub dataset page"
+              title="Open Hub dataset page"
+            >
+              <a
+                href={`https://huggingface.co/datasets/${d.repo_id}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <ExternalLink className="w-4 h-4" />
+              </a>
+            </Button>
+          ) : null}
+        </div>
+      </CardContent>
+    </Card>
+  );
+};
+
 const JobsSection: React.FC = () => {
   const { baseUrl, fetchWithHeaders } = useApi();
+  const navigate = useNavigate();
   const { toast } = useToast();
+  const { auth } = useHfAuth();
+
+  // Picked once per mount, so navigating home re-rolls the line; waiting for
+  // the HF status lets the user's handle appear instead of a nameless variant.
+  const [greeting, setGreeting] = useState<string | null>(null);
+  useEffect(() => {
+    if (greeting !== null || auth.status === "loading") return;
+    setGreeting(
+      randomGreeting(auth.status === "authenticated" ? auth.username : ""),
+    );
+  }, [auth, greeting]);
 
   const [jobs, setJobs] = useState<JobRecord[]>(() => jobsCache.get(baseUrl) ?? []);
   const [hubJobs, setHubJobs] = useState<HubJob[]>([]);
@@ -60,10 +232,90 @@ const JobsSection: React.FC = () => {
   const [search, setSearch] = useState("");
 
   const { selectedRecord } = useRobots();
+  // Datasets for the DATASETS section: Hub-uploaded ones shown, local-only
+  // ones folded into a nested collapsed group.
+  const { datasets, loading: datasetsLoading, refresh: refreshDatasets } = useDatasets();
+  const hubDatasets = useMemo(
+    () => datasets.filter((d) => d.source === "hub" || d.source === "both"),
+    [datasets],
+  );
+  const localOnlyDatasets = useMemo(
+    () => datasets.filter((d) => d.source === "local"),
+    [datasets],
+  );
   const [inferenceModalOpen, setInferenceModalOpen] = useState(false);
   const [importModalOpen, setImportModalOpen] = useState(false);
+  const [scoringModalOpen, setScoringModalOpen] = useState(false);
+  const [scoringRepoId, setScoringRepoId] = useState("");
   const [inferenceJob, setInferenceJob] = useState<JobRecord | null>(null);
   const [inferenceStep, setInferenceStep] = useState<number | null>(null);
+  const [sshStatus, setSshStatus] = useState<SSHStatus | null>(null);
+
+  // The badge shows the last connection that actually worked — probing SSH on
+  // load would stall the page for a minute when a pod is powered off.
+  useEffect(() => {
+    let cancelled = false;
+    const load = () =>
+      getSSHStatus(baseUrl, fetchWithHeaders)
+        .then((res) => {
+          if (!cancelled) setSshStatus(res);
+        })
+        .catch(() => {});
+    load();
+    window.addEventListener("focus", load);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", load);
+    };
+  }, [baseUrl, fetchWithHeaders]);
+
+  // From a dataset card, a dialog over the list beats navigating away; the full
+  // section still lives on the Dataset page.
+  const openScoring = useCallback((repoId: string) => {
+    setScoringRepoId(repoId);
+    setScoringModalOpen(true);
+  }, []);
+
+  // The dataset detail page loads everything else itself from /dataset-info.
+  const openDataset = useCallback(
+    (repoId: string) => {
+      navigate("/upload", { state: { datasetInfo: { dataset_repo_id: repoId } } });
+    },
+    [navigate],
+  );
+
+  // Local disk only — the Hub copy is left alone by design.
+  const deleteLocalDataset = useCallback(
+    async (repoId: string) => {
+      try {
+        const response = await fetchWithHeaders(`${baseUrl}/delete-dataset`, {
+          method: "POST",
+          body: JSON.stringify({ dataset_repo_id: repoId }),
+        });
+        const data = await response.json();
+        if (response.ok && data.success) {
+          toast({
+            title: "Dataset deleted",
+            description: `${repoId} removed from local disk.`,
+          });
+          refreshDatasets();
+        } else {
+          toast({
+            title: "Delete failed",
+            description: data.message ?? "Unable to delete the local dataset.",
+            variant: "destructive",
+          });
+        }
+      } catch {
+        toast({
+          title: "Connection error",
+          description: "Cannot reach the backend.",
+          variant: "destructive",
+        });
+      }
+    },
+    [baseUrl, fetchWithHeaders, refreshDatasets, toast],
+  );
 
   const refresh = useCallback(async () => {
     try {
@@ -230,38 +482,9 @@ const JobsSection: React.FC = () => {
     () => filteredJobs.filter((j) => j.runner === "imported"),
     [filteredJobs],
   );
-  // Group imported models that came from the SAME training run. Each downloaded
-  // checkpoint is registered as its own imported job named "<run> (step N)"; we
-  // collapse those into one card whose checkpoint dropdown switches between the
-  // steps. Jobs without the " (step N)" suffix (manual imports) stay alone.
-  const importedGroups = useMemo(() => {
-    const stepRe = /^(.*) \(step (\d+)\)$/;
-    const groups: { base: string; members: JobRecord[] }[] = [];
-    const byBase = new Map<string, JobRecord[]>();
-    for (const job of importedJobs) {
-      const m = stepRe.exec(job.name);
-      if (!m) {
-        groups.push({ base: job.name, members: [job] });
-        continue;
-      }
-      const base = m[1];
-      const bucket = byBase.get(base);
-      if (bucket) bucket.push(job);
-      else {
-        byBase.set(base, [job]);
-        groups.push({ base, members: byBase.get(base)! });
-      }
-    }
-    // Latest step first within each group.
-    for (const g of groups) {
-      if (g.members.length > 1) {
-        g.members.sort(
-          (a, b) => Number(stepRe.exec(b.name)![2]) - Number(stepRe.exec(a.name)![2]),
-        );
-      }
-    }
-    return groups;
-  }, [importedJobs]);
+  // Collapse per-step imported jobs into one card per training run (shared with
+  // the Landing Deploy/Eval pickers via modelGroups).
+  const importedGroups = useMemo(() => groupImportedByRun(importedJobs), [importedJobs]);
   // Hub jobs already mirrored by a local JobRecord get their richer card via
   // trackedCloudJobs; everything else from the hub gets a plain HubJobCard.
   const trackedHfJobIds = useMemo(
@@ -332,18 +555,36 @@ const JobsSection: React.FC = () => {
   return (
     <section className="space-y-6">
       <div className="flex items-center justify-between gap-3">
-        <h2 className="text-lg font-semibold text-white">训练任务 Jobs</h2>
+        <h2 className="text-lg font-semibold text-white truncate">{greeting ?? ""}</h2>
         <div className="flex items-center gap-2">
           <div className="relative">
             <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-slate-400 pointer-events-none" />
             <Input
               value={search}
               onChange={(e) => setSearch(e.target.value)}
-              placeholder="搜索任务…"
+              placeholder="Search jobs…"
               className="h-8 w-48 sm:w-60 pl-8 bg-slate-800/50 border-slate-700 text-sm text-white placeholder:text-slate-500"
-              aria-label="搜索任务"
+              aria-label="Search jobs"
             />
           </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => navigate("/training", { state: { sshRunner: true } })}
+            title={
+              sshStatus?.connected
+                ? `${sshStatus.last_ok?.name || "SSH"} 已连通 · ${sshAgeText(sshStatus.age_s)}`
+                : "未连接 · 点进去添加连接或用 Test 验证"
+            }
+            className={`h-8 border-slate-700 bg-slate-800/50 ${
+              sshStatus?.connected
+                ? "text-blue-300 hover:text-blue-200"
+                : "text-slate-500 hover:text-slate-300"
+            }`}
+          >
+            <Wifi className="w-3.5 h-3.5 mr-1.5" />
+            SSH
+          </Button>
           <Button
             variant="outline"
             size="sm"
@@ -351,7 +592,7 @@ const JobsSection: React.FC = () => {
             className="h-8 border-slate-700 bg-slate-800/50 text-slate-200 hover:text-white"
           >
             <Download className="w-3.5 h-3.5 mr-1.5" />
-            导入模型
+            Import Model
           </Button>
           <Button
             variant="ghost"
@@ -463,6 +704,60 @@ const JobsSection: React.FC = () => {
         </>
       ) : null}
 
+      <div className="border-t border-slate-700" />
+
+      <Collapsible defaultOpen>
+        <CollapsibleTrigger className="group flex items-center gap-1.5 text-sm font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
+          <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
+          数据集 DATASETS
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-3 space-y-4">
+          {datasetsLoading ? (
+            <p className="text-sm text-slate-500">Loading datasets…</p>
+          ) : hubDatasets.length === 0 && localOnlyDatasets.length === 0 ? (
+            <p className="text-sm text-slate-500">No datasets yet.</p>
+          ) : (
+            <div className="space-y-4">
+              {hubDatasets.length > 0 ? (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                  {hubDatasets.map((d) => (
+                    <DatasetCard
+                      key={d.repo_id}
+                      dataset={d}
+                      hub
+                      onOpen={openDataset}
+                      onScore={openScoring}
+                      onDelete={deleteLocalDataset}
+                    />
+                  ))}
+                </div>
+              ) : null}
+              {localOnlyDatasets.length > 0 ? (
+                <Collapsible defaultOpen={false}>
+                  <CollapsibleTrigger className="group flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-500 hover:text-slate-300 transition-colors">
+                    <ChevronRight className="w-3.5 h-3.5 transition-transform group-data-[state=open]:rotate-90" />
+                    其他数据集 Local only ({localOnlyDatasets.length})
+                  </CollapsibleTrigger>
+                  <CollapsibleContent className="pt-3">
+                    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                      {localOnlyDatasets.map((d) => (
+                        <DatasetCard
+                          key={d.repo_id}
+                          dataset={d}
+                          onOpen={openDataset}
+                          onScore={openScoring}
+                          onDelete={deleteLocalDataset}
+                        />
+                      ))}
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
+              ) : null}
+            </div>
+          )}
+        </CollapsibleContent>
+      </Collapsible>
+
       {untrackedCount > 0 ? (
         <Collapsible>
           <CollapsibleTrigger className="group flex items-center gap-1.5 text-xs font-semibold uppercase tracking-wide text-slate-400 hover:text-white transition-colors">
@@ -526,6 +821,12 @@ const JobsSection: React.FC = () => {
         open={importModalOpen}
         onOpenChange={setImportModalOpen}
         onImported={refresh}
+      />
+
+      <ScoringModal
+        open={scoringModalOpen}
+        onOpenChange={setScoringModalOpen}
+        datasetRepoId={scoringRepoId || undefined}
       />
     </section>
   );

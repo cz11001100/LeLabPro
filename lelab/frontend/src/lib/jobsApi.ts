@@ -475,6 +475,24 @@ export async function listSSHConfigs(
   return body.configs;
 }
 
+export interface SSHStatus {
+  connected: boolean;
+  configs: Record<string, { ok: boolean; at: number; name?: string; host?: string }>;
+  last_ok?: { ok: boolean; at: number; name?: string; host?: string } | null;
+  age_s?: number | null;
+}
+
+export async function getSSHStatus(
+  baseUrl: string,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+): Promise<SSHStatus> {
+  return apiRequest<SSHStatus>(baseUrl, fetcher, "/ssh-status", {
+    signal,
+    action: "Get SSH reachability",
+  });
+}
+
 export async function createSSHConfig(
   baseUrl: string,
   fetcher: Fetcher,
@@ -561,6 +579,44 @@ export interface RemoteEnvInfo {
   torch_version?: string | null;
   ffmpeg?: boolean;
   torchcodec_error?: string | null;
+}
+
+export interface RewardModelStatus {
+  success: boolean;
+  message?: string;
+  models?: { repo_id: string; present: boolean; size?: string }[];
+  ready?: boolean;
+  downloading?: boolean;
+  finished?: boolean;
+  failed?: boolean;
+  hub_cache_size?: string;
+  log_path?: string;
+  log_tail?: string;
+}
+
+export async function getRewardModelStatus(
+  baseUrl: string,
+  fetcher: Fetcher,
+  configId: string,
+): Promise<RewardModelStatus> {
+  return apiRequest<RewardModelStatus>(baseUrl, fetcher, "/ssh-configs/reward-model-status", {
+    method: "POST",
+    body: { config_id: configId },
+    action: "Check scoring model on pod",
+  });
+}
+
+export async function startRewardModelDownload(
+  baseUrl: string,
+  fetcher: Fetcher,
+  configId: string,
+  useCnMirror = true,
+): Promise<{ success: boolean; message: string; log_path?: string }> {
+  return apiRequest(baseUrl, fetcher, "/ssh-configs/download-reward-model", {
+    method: "POST",
+    body: { config_id: configId, use_cn_mirror: useCnMirror },
+    action: "Download scoring model on pod",
+  });
 }
 
 export async function checkSSHRemoteEnv(

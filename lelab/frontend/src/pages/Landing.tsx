@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ChevronsUpDown, RotateCw, Rocket, Database, Brain, Loader2, FlaskConical } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -34,6 +34,7 @@ import {
 import { isHostedSpace } from "@/lib/isHostedSpace";
 import { useApi } from "@/contexts/ApiContext";
 import { listJobs, JobRecord } from "@/lib/jobsApi";
+import { groupImportedByRun, modelStepOf, variantsOf, ModelGroup } from "@/lib/modelGroups";
 
 const ON_SPACE = isHostedSpace();
 
@@ -81,10 +82,16 @@ const Landing = () => {
   const [deployModalOpen, setDeployModalOpen] = useState(false);
   const [deployJob, setDeployJob] = useState<JobRecord | null>(null);
   const [deployStep, setDeployStep] = useState<number | null>(null);
+  const [deployGroup, setDeployGroup] = useState<ModelGroup | null>(null);
   const [deployPopoverOpen, setDeployPopoverOpen] = useState(false);
   const [evalModalOpen, setEvalModalOpen] = useState(false);
   const [evalJob, setEvalJob] = useState<JobRecord | null>(null);
+  const [evalGroup, setEvalGroup] = useState<ModelGroup | null>(null);
   const [evalPopoverOpen, setEvalPopoverOpen] = useState(false);
+
+  // Collapse per-step imported jobs into one entry per training run so the
+  // Deploy/Eval pickers mirror the model cards' checkpoint grouping.
+  const modelGroups = useMemo(() => groupImportedByRun(importedModels), [importedModels]);
 
   useEffect(() => {
     listJobs(baseUrl, fetchWithHeaders, 100).then((jobs) => {
@@ -339,7 +346,7 @@ const Landing = () => {
           <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2">
             <h3 className="font-semibold text-lg text-left h-10 flex items-center gap-2">
               <Database className="h-5 w-5 text-purple-400" />
-              录制 Recording
+              数据集 Dataset
             </h3>
             <DatasetPicker
               datasets={datasets}
@@ -357,12 +364,12 @@ const Landing = () => {
                   {datasetsLoading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      加载数据集…
+                      Loading datasets…
                     </>
                   ) : datasets.length === 0 ? (
-                    "暂无数据集，点击创建…"
+                    "No datasets — click to create…"
                   ) : (
-                    "选择或创建数据集…"
+                    "Select or create dataset…"
                   )}
                 </span>
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
@@ -372,10 +379,12 @@ const Landing = () => {
           <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2">
             <h3 className="font-semibold text-lg text-left h-10 flex items-center gap-2">
               <RotateCw className="h-5 w-5 text-blue-400" />
-              续录 Resume Recording
+              续录 Resuming
             </h3>
             <ResumeDatasetPicker
               datasets={datasets}
+              getRepoId={(d) => d.repo_id}
+              isSelectable={(d) => d.source === "local" || d.source === "both"}
               loading={datasetsLoading}
               onSelect={handleResumeDataset}
             >
@@ -387,12 +396,12 @@ const Landing = () => {
                   {datasetsLoading ? (
                     <>
                       <Loader2 className="h-4 w-4 animate-spin" />
-                      加载数据集…
+                      Loading datasets…
                     </>
                   ) : datasets.filter((d) => d.source === "local" || d.source === "both").length === 0 ? (
-                    "暂无本地数据集，请先录制…"
+                    "No local datasets — record one first…"
                   ) : (
-                    "选择数据集以继续…"
+                    "Select dataset to resume…"
                   )}
                 </span>
                 <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
@@ -408,7 +417,7 @@ const Landing = () => {
               onClick={handleTrainingClick}
               className="w-full bg-green-500 hover:bg-green-600 text-white"
             >
-              训练 Training
+              Training
             </Button>
           </div>
           <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2">
@@ -426,9 +435,9 @@ const Landing = () => {
                 >
                   <span className="truncate text-gray-300 flex items-center gap-2">
                     {importedModels.length === 0 ? (
-                      "暂无本地模型，请先导入…"
+                      "No local models — import one first…"
                     ) : (
-                      "选择模型…"
+                      "Select model…"
                     )}
                   </span>
                   <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
@@ -441,19 +450,21 @@ const Landing = () => {
                       未找到模型。
                     </CommandEmpty>
                     <CommandGroup>
-                      {importedModels.map((model) => (
+                      {modelGroups.map((g) => (
                         <CommandItem
-                          key={model.id}
-                          value={model.name}
+                          key={g.base}
+                          value={g.base}
                           onSelect={() => {
-                            setDeployJob(model);
-                            setDeployStep(0);
+                            const latest = g.members[0];
+                            setDeployJob(latest);
+                            setDeployGroup(g);
+                            setDeployStep(modelStepOf(latest.name));
                             setDeployModalOpen(true);
                             setDeployPopoverOpen(false);
                           }}
                           className="text-gray-300 hover:bg-gray-700 hover:text-white"
                         >
-                          <span className="truncate">{model.name}</span>
+                          <span className="truncate">{g.base}</span>
                         </CommandItem>
                       ))}
                     </CommandGroup>
@@ -476,7 +487,7 @@ const Landing = () => {
                   className="w-full justify-between bg-gray-800 border-purple-600/50 text-white hover:bg-purple-900/20 hover:border-purple-500"
                 >
                   <span className="truncate text-purple-300 flex items-center gap-2">
-                    {importedModels.length === 0 ? "暂无本地模型，请先导入…" : "选择模型以评测…"}
+                    {importedModels.length === 0 ? "No local models — import one first…" : "Select model to evaluate…"}
                   </span>
                   <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
                 </Button>
@@ -488,18 +499,19 @@ const Landing = () => {
                       未找到模型。
                     </CommandEmpty>
                     <CommandGroup>
-                      {importedModels.map((model) => (
+                      {modelGroups.map((g) => (
                         <CommandItem
-                          key={model.id}
-                          value={model.name}
+                          key={g.base}
+                          value={g.base}
                           onSelect={() => {
-                            setEvalJob(model);
+                            setEvalJob(g.members[0]);
+                            setEvalGroup(g);
                             setEvalModalOpen(true);
                             setEvalPopoverOpen(false);
                           }}
                           className="text-gray-300 hover:bg-gray-700 hover:text-white"
                         >
-                          <span className="truncate">{model.name}</span>
+                          <span className="truncate">{g.base}</span>
                         </CommandItem>
                       ))}
                     </CommandGroup>
@@ -521,6 +533,7 @@ const Landing = () => {
         open={evalModalOpen}
         onOpenChange={setEvalModalOpen}
         job={evalJob}
+        group={evalGroup ? evalGroup.members : undefined}
       />
 
       <UsageInstructionsModal
@@ -564,6 +577,7 @@ const Landing = () => {
           robot={selectedRecord}
           jobId={deployJob.id}
           initialStep={deployStep}
+          variants={deployGroup ? variantsOf(deployGroup) : undefined}
         />
       ) : null}
     </div>

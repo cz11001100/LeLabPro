@@ -153,6 +153,7 @@ def _build_camera_configs(cameras: dict, default_backend) -> dict:
         NetworkCameraConfig,
         camera_source,
         install_camera_factory_hook,
+        normalize_rotation,
         probe,
         redact,
     )
@@ -173,12 +174,18 @@ def _build_camera_configs(cameras: dict, default_backend) -> dict:
             fps = stream["fps"] or camera_data.get("fps") or 30
             width = stream["width"] or camera_data.get("width") or 640
             height = stream["height"] or camera_data.get("height") or 480
+            rotation = normalize_rotation(camera_data.get("rotation", 0))
             camera_configs[camera_name] = NetworkCameraConfig(
-                index_or_path=str(source), fps=fps, width=width, height=height
+                index_or_path=str(source),
+                fps=fps,
+                width=width,
+                height=height,
+                rotation=rotation,
             )
+            cfg = camera_configs[camera_name]
             logger.info(
                 f"✅ CAMERA CONFIG: {camera_name} -> NetworkCameraConfig("
-                f"url={redact(source)}, {width}x{height}@{fps}fps probed from the stream)"
+                f"url={redact(source)}, {cfg.width}x{cfg.height}@{fps}fps, rotation={rotation})"
             )
             continue
 
@@ -641,43 +648,60 @@ def handle_get_dataset_info(request: DatasetInfoRequest) -> dict[str, Any]:
         uploaded_marker = dataset_root / ".uploaded_to_hub"
         source = "both" if uploaded_marker.exists() else "local"
 
-        # Recover single_task: info.json rarely stores it; fall back to the
-        # first row of tasks.parquet (the task text every episode was recorded with).
-        single_task = info.get("single_task")
-        if not single_task:
-            tasks_parquet = dataset_root / "meta" / "tasks.parquet"
-            if tasks_parquet.exists():
-                try:
-                    tasks_df = pd.read_parquet(tasks_parquet)
-                    if not tasks_df.empty:
-                        single_task = tasks_df.iloc[0].name if tasks_df.index.name == "task" else str(tasks_df.iloc[0]["task"] if "task" in tasks_df.columns else tasks_df.index[0])
-                except Exception:
-                    pass
-        if not single_task:
-            single_task = "Unknown task"
+        # Every task description the dataset actually contains, with how many
+        # episodes carry it. Reporting only the first one mislabelled the dataset:
+        # a recording session switches task text whenever the user retargets.
+        tasks: list[dict[str, Any]] = []
+        task_names: list[str] = []
+        tasks_parquet = dataset_root / "meta" / "tasks.parquet"
+        if tasks_parquet.exists():
+            try:
+                tasks_df = pd.read_parquet(tasks_parquet)
+                if tasks_df.index.name == "task":
+                    task_names = [str(t) for t in tasks_df.index]
+                elif "task" in tasks_df.columns:
+                    task_names = [str(t) for t in tasks_df["task"]]
+            except Exception as e:
+                logger.debug("Could not read tasks.parquet for %s: %s", request.dataset_repo_id, e)
 
         # Per-episode frame counts, so the UI can show what each row actually is
         # instead of total_frames / num_episodes repeated on every line — with
         # episodes ranging from 2 to 338 frames the average identifies nothing.
         episodes: list[dict[str, int]] = []
+        task_counts: dict[str, int] = {}
         ep_parquets = sorted((dataset_root / "meta" / "episodes").glob("chunk-*/file-*.parquet"))
         if ep_parquets:
             try:
-                df = pd.concat(
-                    [pd.read_parquet(p, columns=["episode_index", "length"]) for p in ep_parquets]
-                )
+                shards = []
+                for shard in ep_parquets:
+                    try:
+                        shards.append(pd.read_parquet(shard, columns=["episode_index", "length", "tasks"]))
+                    except Exception:  # a dataset recorded without per-episode task lists
+                        shards.append(pd.read_parquet(shard, columns=["episode_index", "length"]))
+                df = pd.concat(shards)
                 episodes = [
                     {"index": int(row.episode_index), "length": int(row.length)}
                     for row in df.sort_values("episode_index").itertuples()
                 ]
+                if "tasks" in df.columns:
+                    for value in df["tasks"]:
+                        name = value[0] if len(value) else ""
+                        if name:
+                            task_counts[str(name)] = task_counts.get(str(name), 0) + 1
             except Exception as e:
                 logger.debug("Could not read per-episode lengths for %s: %s", request.dataset_repo_id, e)
+
+        for name in task_names:
+            tasks.append({"task": name, "episodes": task_counts.get(name, 0)})
+        for name, count in task_counts.items():
+            if name not in task_names:
+                tasks.append({"task": name, "episodes": count})
 
         return {
             "success": True,
             "dataset_repo_id": request.dataset_repo_id,
             "num_episodes": info.get("total_episodes", 0),
-            "single_task": single_task,
+            "tasks": tasks,
             "fps": info.get("fps", 0),
             "features": list(info.get("features", {}).keys()),
             "total_frames": info.get("total_frames", 0),
@@ -940,9 +964,45 @@ def _prune_stale_hub_files(hub_api, repo_id: str, root_path: Path) -> list[str]:
 
 
 _VIDEO_UPLOAD_ATTEMPTS = 3
+_UPLOAD_CONNECT_TIMEOUT_S = 10
+_UPLOAD_READ_TIMEOUT_S = 30
 
 
-def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files, on_file) -> None:
+def _pin_upload_timeouts() -> None:
+    """Make a dead connection raise instead of parking the upload thread forever.
+
+    huggingface_hub's LFS part uploads call `http_backoff("PUT", ...)` with no
+    `timeout=`, so requests waits forever. When the local HTTP proxy accepts the
+    CONNECT and then loses its upstream, the socket neither errors nor closes: the
+    thread parks, no exception reaches the retry loop, and the progress bar freezes
+    mid-file (measured: 19 minutes on a 57MB video with 0 bytes sent).
+    """
+    from huggingface_hub.utils import configure_http_backend
+
+    try:
+        from huggingface_hub.utils._http import _default_backend_factory as _base_factory
+    except ImportError:  # private helper; a plain session differs only in its adapter
+
+        def _base_factory():
+            import requests
+
+            return requests.Session()
+
+    def _factory():
+        session = _base_factory()
+        request = session.request
+
+        def _request_with_timeout(method, url, **kwargs):
+            kwargs.setdefault("timeout", (_UPLOAD_CONNECT_TIMEOUT_S, _UPLOAD_READ_TIMEOUT_S))
+            return request(method, url, **kwargs)
+
+        session.request = _request_with_timeout
+        return session
+
+    configure_http_backend(backend_factory=_factory)
+
+
+def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files, on_progress) -> None:
     """Upload the packed mp4s serially, retrying each one before giving up.
 
     `upload_folder` hands the whole batch to `create_commit`'s default five-thread
@@ -950,12 +1010,14 @@ def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files,
     network carries: the batch died after 350s on
     `videos/observation.images.up/chunk-000/file-003.mp4` while the identical file
     finished alone in 11s. Uploading a file is idempotent, so a retry re-runs only
-    that file.
+    that file, and files already committed are skipped by the Hub.
     """
     ordered = sorted(video_files, key=lambda p: p.stat().st_size)
+    total = len(ordered)
     for done, path in enumerate(ordered, start=1):
         path_in_repo = path.relative_to(root_path).as_posix()
         for attempt in range(1, _VIDEO_UPLOAD_ATTEMPTS + 1):
+            on_progress(done - 1, total, path_in_repo, attempt)
             try:
                 hub_api.upload_file(
                     path_or_fileobj=str(path),
@@ -970,10 +1032,15 @@ def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files,
                     raise
                 sleep_s = 5 * attempt
                 logger.warning(
-                    "Upload attempt %d/%d failed for %s (%s); retrying in %ds", attempt, _VIDEO_UPLOAD_ATTEMPTS, path_in_repo, e, sleep_s
+                    "Upload attempt %d/%d failed for %s (%s); retrying in %ds",
+                    attempt,
+                    _VIDEO_UPLOAD_ATTEMPTS,
+                    path_in_repo,
+                    e,
+                    sleep_s,
                 )
                 time.sleep(sleep_s)
-        on_file(done, path_in_repo)
+        on_progress(done, total, path_in_repo, 0)
 
 
 def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
@@ -1013,6 +1080,8 @@ def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
 
             os.environ["HF_HUB_DISABLE_XET"] = "1"
             hf_constants.HF_HUB_DISABLE_XET = True
+
+        _pin_upload_timeouts()
 
         update_progress("Preparing dataset...", percent=5)
         repair_local_dataset(request.dataset_repo_id)
@@ -1073,23 +1142,28 @@ def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
         if video_files:
             update_progress("Uploading videos...", current=data_progress, total=total_files, percent=55)
 
-            def _video_uploaded(done: int, name: str) -> None:
-                fraction = done / len(video_files)
+            def _video_progress(completed: int, total: int, name: str, attempt: int) -> None:
+                # Naming the file and the attempt is what lets you tell a slow
+                # upload from one that died mid-transfer.
+                label = f"Uploading videos ({completed}/{total})"
+                if attempt:
+                    label += f" — {Path(name).name}" + (f" (retry {attempt})" if attempt > 1 else "")
                 update_progress(
-                    f"Uploading videos ({done}/{len(video_files)})",
-                    current=data_progress + done,
+                    label,
+                    current=data_progress + completed,
                     total=total_files,
-                    percent=55 + int(34 * fraction),
+                    percent=55 + int(34 * completed / total),
                 )
 
-            _push_videos_one_by_one(hub_api, request.dataset_repo_id, root_path, video_files, _video_uploaded)
+            _push_videos_one_by_one(hub_api, request.dataset_repo_id, root_path, video_files, _video_progress)
 
         stale = _prune_stale_hub_files(hub_api, request.dataset_repo_id, root_path)
         if stale:
             logger.info("Pruned %d stale Hub files: %s", len(stale), ", ".join(stale[:8]))
             update_progress("Pruned stale remote files", current=data_progress, total=total_files, percent=55)
 
-        update_progress("Uploading dataset card...", current=total_files - 1, total=total_files, percent=90)        # Build the dataset card manually — create_lerobot_dataset_card expects
+        update_progress("Uploading dataset card...", current=total_files - 1, total=total_files, percent=90)
+        # Build the dataset card manually — create_lerobot_dataset_card expects
         # an Info object with .to_dict(), but we have a plain dict from info.json
         from huggingface_hub import DatasetCard, DatasetCardData
 

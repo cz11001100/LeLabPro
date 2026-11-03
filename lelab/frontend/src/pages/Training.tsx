@@ -421,7 +421,7 @@ const ConfigurationMode: React.FC = () => {
                   </>
                 ) : (
                   <>
-                    <Play className="w-5 h-5 mr-2" /> 开始训练 Start Training
+                    <Play className="w-5 h-5 mr-2" /> Start Training
                   </>
                 )}
               </Button>

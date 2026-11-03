@@ -14,6 +14,9 @@ interface Props {
   onChange: (step: number) => void;
   disabled?: boolean;
   placeholder?: string;
+  // Override the trigger styling (e.g. full-width to match a form grid);
+  // defaults to the compact fixed-width chip used on the job/model cards.
+  triggerClassName?: string;
 }
 
 export const CheckpointDropdown: React.FC<Props> = ({
@@ -22,6 +25,7 @@ export const CheckpointDropdown: React.FC<Props> = ({
   onChange,
   disabled,
   placeholder = "Select checkpoint",
+  triggerClassName = "bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 w-[132px] shrink-0",
 }) => {
   // step 0 is the sentinel for an imported single-model checkpoint (lerobot
   // never saves at step 0), so it has no meaningful step number — show
@@ -35,7 +39,7 @@ export const CheckpointDropdown: React.FC<Props> = ({
       disabled={disabled || checkpoints.length === 0}
     >
       <SelectTrigger
-        className="bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 w-[132px] shrink-0"
+        className={triggerClassName}
         onClick={(e) => e.stopPropagation()}
       >
         <SelectValue placeholder={placeholder} />

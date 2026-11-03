@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
-import { Loader2, Merge } from "lucide-react";
+import { ChevronDown, ChevronRight, Loader2, Merge } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
@@ -62,6 +62,7 @@ const MergeSection: React.FC = () => {
     [datasets],
   );
   const [picked, setPicked] = useState<string[]>([]);
+  const [open, setOpen] = useState(false);
   const [target, setTarget] = useState("");
   const [check, setCheck] = useState<MergeCheck | null>(null);
   const [state, setState] = useState<MergeState | null>(null);
@@ -159,13 +160,29 @@ const MergeSection: React.FC = () => {
 
   return (
     <div className="bg-gray-900 border border-gray-700 rounded-lg p-6 mt-8">
-      <div className="flex items-center gap-2 mb-4">
+      <div
+        role="button"
+        tabIndex={0}
+        aria-expanded={open}
+        onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            setOpen((v) => !v);
+          }
+        }}
+        className="flex items-center gap-2 mb-4 cursor-pointer select-none"
+      >
         <Merge className="w-5 h-5 text-blue-400" />
         <h2 className="text-xl font-semibold text-white">合并数据集</h2>
-        <span className="text-sm text-gray-500 ml-2">训练只吃一个数据集</span>
+        {open ? (
+          <ChevronDown className="w-4 h-4 text-gray-500 ml-auto" />
+        ) : (
+          <ChevronRight className="w-4 h-4 text-gray-500 ml-auto" />
+        )}
       </div>
 
-      {local.length === 0 ? (
+      {!open ? null : local.length === 0 ? (
         <p className="text-sm text-gray-500">本地还没有数据集。</p>
       ) : (
         <>
@@ -205,7 +222,7 @@ const MergeSection: React.FC = () => {
               variant="outline"
               className="border-gray-600 text-gray-200 hover:bg-gray-800"
             >
-              检查
+              Check
             </Button>
             <Button
               onClick={runMerge}
@@ -213,7 +230,7 @@ const MergeSection: React.FC = () => {
               className="bg-blue-600 hover:bg-blue-700 text-white disabled:opacity-40"
             >
               {state?.running || busy ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : null}
-              {state?.running ? `合并中 ${Math.round(state.elapsed_s ?? 0)}s` : "开始合并"}
+              {state?.running ? `Merging ${Math.round(state.elapsed_s ?? 0)}s` : "Start Merge"}
             </Button>
           </div>
 

@@ -90,6 +90,7 @@ const Recording = () => {
     null
   );
   const [recordingSessionStarted, setRecordingSessionStarted] = useState(false);
+  const [reconnectChecked, setReconnectChecked] = useState(false);
 
   const [optimisticPhase, setOptimisticPhase] = useState<Phase | null>(null);
   const [showStopConfirm, setShowStopConfirm] = useState(false);
@@ -177,13 +178,19 @@ const Recording = () => {
         }
       } catch {
         // ignore
+      } finally {
+        setReconnectChecked(true);
       }
     };
     checkActiveRecording();
   }, [baseUrl, fetchWithHeaders, recordingSessionStarted]);
 
-  // Redirect if no config provided (but only if no active recording)
+  // Redirect if no config provided (but only if no active recording). Waiting
+  // for the reconnect check is what makes the "Go to" chip on the home page
+  // actually land here: without it the guard fires on the first render, while
+  // the status request is still in flight, and bounces straight back home.
   useEffect(() => {
+    if (!reconnectChecked) return;
     if (!recordingConfig && !backendStatus?.recording_active) {
       toast({
         title: "No Configuration",
@@ -280,10 +287,14 @@ const Recording = () => {
           const datasetInfo = {
             dataset_repo_id:
               status.dataset_repo_id || recordingConfig.dataset_repo_id,
-            single_task: recordingConfig.single_task,
+            tasks: [
+              {
+                task: recordingConfig.single_task,
+                episodes: status.saved_episodes || 0,
+              },
+            ],
             num_episodes: recordingConfig.num_episodes,
             saved_episodes: status.saved_episodes || 0,
-            session_elapsed_seconds: status.session_elapsed_seconds || 0,
           };
           navigate("/upload", { state: { datasetInfo } });
         }

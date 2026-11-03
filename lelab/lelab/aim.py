@@ -146,21 +146,21 @@ def _render(frame, ball, est_human, est_model, out_path: Path, title: str):
 
 
 def probe(dataset, predict_item, indices: list[int], fit_result: dict, colors: list[str],
-          out_dir: Path) -> dict:
+          out_dir: Path, labels: dict | None = None) -> dict:
     """Overlay the policy's implied aim point on the true target position.
 
     ``predict_item(item)`` returns ``([T, D] predicted chunk, state vector)``.
     """
     import numpy as np
 
-    from .saliency import _to_uint8_hwc, find_ball
+    from .saliency import _to_uint8_hwc, _where, find_ball
 
     out_dir.mkdir(parents=True, exist_ok=True)
     camera = fit_result["camera"]
     horizon = fit_result["horizon"]
     rows = []
 
-    for slot, index in enumerate(indices):
+    for index in indices:
         item = dataset[int(index)]
         frame = _to_uint8_hwc(item[camera])
         ball = find_ball(frame, colors)
@@ -176,14 +176,16 @@ def probe(dataset, predict_item, indices: list[int], fit_result: dict, colors: l
 
         err_model = float(np.hypot(est_model[0] - ball["cx"], est_model[1] - ball["cy"]))
         err_human = float(np.hypot(est_human[0] - ball["cx"], est_human[1] - ball["cy"])) if est_human else None
-        name = f"aim_{slot}.png"
+        # Numbered by row, not by input slot: skipped frames must not shift
+        # aim_N away from the saliency_N that shares its frame.
+        name = f"aim_{len(rows)}.png"
         _render(
             frame,
             ball,
             est_human,
             est_model,
             out_dir / name,
-            f"frame {index} · model aim off by {err_model:.0f}px"
+            f"{_where(labels, index)} · model aim off by {err_model:.0f}px"
             + (f" · human {err_human:.0f}px" if err_human is not None else ""),
         )
         rows.append(

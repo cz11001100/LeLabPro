@@ -37,7 +37,11 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from .utils.config import setup_calibration_files, setup_follower_calibration_file
+from .utils.config import (
+    LEADER_CONFIG_PATH,
+    setup_calibration_files,
+    setup_follower_calibration_file,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -67,9 +71,9 @@ class InferenceRequest(BaseModel):
     # dagger only: record the policy frames too, so one episode holds both the
     # model's attempt and the human correction (hybrid episode).
     record_autonomous: bool = False
-    # dagger, corrections-only: close the round as soon as one correction is
-    # saved, then let LeLab start the next trial. Needs n_runs > 1.
-    auto_advance: bool = False
+    # dagger only: a correction left open would hang the rig, since `duration_s`
+    # now budgets policy driving time rather than wall clock.
+    max_correction_s: int = 30
     leader_port: str = ""
     leader_config: str = ""
 
@@ -85,6 +89,10 @@ _inference_rollout_started_at: float | None = None
 _inference_meta: dict[str, Any] = {}
 _inference_remaining_runs: int = 0
 _inference_current_run: int = 0
+# Counts automatic retries after a run dies during setup (before its main loop).
+# Serial/camera bring-up occasionally drops one packet ("no status packet" /
+# "failed to open camera"); those are transient and self-heal on a fresh process.
+_inference_setup_retries: int = 0
 _inference_restart_config: dict[str, Any] = {}
 # Set while "this round succeeded, start the next" is in flight: the status poll
 # must not race it for the restart, and the page must not bounce home during the
@@ -94,8 +102,25 @@ _inference_end_in_progress: bool = False
 # and the dying process's host+GPU memory may not be reclaimed for a moment.
 # Respawning the next run immediately intermittently kills it during native
 # init — before Python prints anything, leaving a 0-byte log with no error.
-# This cooldown lets those resources release between consecutive runs.
-_RESTART_COOLDOWN_S = 5.0
+# A fixed cooldown alone proved insufficient (a 3rd consecutive run still died),
+# and overlapping processes can trip the userspace OOM killer, so we also wait
+# for host memory to recover.
+_RESTART_COOLDOWN_S = 6.0
+_RESTART_MEM_WAIT_S = 20.0
+_RESTART_MIN_AVAIL_FRAC = 0.5
+# When the last rollout exited, so a manual start right after a teardown can
+# wait for the cameras/serial port to be released instead of dying in native
+# init with a 0-byte log.
+_inference_last_exit_at: float = 0.0
+# Rest between continuous rounds — long enough to walk home, short enough that
+# the operator can reset the scene without the run looking stuck.
+_ROUND_REST_S = 3.0
+# Estimated time the strategy spends interpolating home between rounds; only
+# used to size the reported total duration so the hung detector doesn't fire.
+_ROUND_HOME_S = 3.0
+# How many times to auto-retry a run that died during setup (transient serial/
+# camera bring-up glitches) before reporting failure.
+_MAX_SETUP_RETRIES = 3
 # Guards mutations to the globals above; held only for the short critical
 # sections in start/stop/status. Reentrant because handle_inference_status
 # calls handle_start_inference to auto-restart the next run while it already
@@ -131,7 +156,7 @@ _ROLLOUT_START_MARKER = "Rollout setup complete"
 def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
     """Tee the subprocess's stdout to the log file and watch for the
     rollout-start marker."""
-    global _inference_rollout_started_at
+    global _inference_rollout_started_at, _inference_setup_retries
     try:
         for raw in iter(proc.stdout.readline, b""):
             try:
@@ -145,6 +170,8 @@ def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
                 pass
             if _inference_rollout_started_at is None and _ROLLOUT_START_MARKER in line:
                 _inference_rollout_started_at = time.time()
+                # Setup succeeded — reset the transient-failure retry budget.
+                _inference_setup_retries = 0
                 logger.info(
                     "Inference rollout main loop started after %.1fs of setup",
                     _inference_rollout_started_at - (_inference_started_at or _inference_rollout_started_at),
@@ -281,7 +308,19 @@ def _rollout_inference_args(policy_path: str, force_rtc: bool = False) -> list[s
     policy_type = cfg.get("type")
     needs_rtc = bool(cfg.get("use_relative_actions")) or policy_type == "groot"
     if force_rtc and not needs_rtc:
-        args = ["--inference.type=rtc", "--inference.rtc.execution_horizon=10", "--inference.rtc.max_guidance_weight=10.0"]
+        # RTC guides only the first `execution_horizon` steps of a new chunk, and
+        # the queue drops the first `ceil(latency / frame_period)` steps because
+        # the robot already spent that long executing the old chunk. On this rig
+        # SmolVLA takes ~0.35s per chunk ≈ 11 steps at 30fps, so a horizon of 10
+        # was discarded entirely and RTC had nothing left to steer. Keep the
+        # horizon comfortably above the measured delay and let the queue run down
+        # to it before replanning.
+        args = [
+            "--inference.type=rtc",
+            "--inference.rtc.execution_horizon=20",
+            "--inference.rtc.max_guidance_weight=10.0",
+            "--inference.queue_threshold=20",
+        ]
         return args
     if not needs_rtc:
         return []
@@ -317,7 +356,7 @@ def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
         kind, source = camera_source(cfg)
         if kind == "network":
             fields = {"type": "network", "index_or_path": f'"{source}"'}
-            for key in ("width", "height", "fps"):
+            for key in ("width", "height", "fps", "rotation"):
                 if cfg.get(key) is not None:
                     fields[key] = cfg[key]
             body = ", ".join(f"{k}: {v}" for k, v in fields.items())
@@ -343,11 +382,27 @@ _CAPTURE_MODES = ("base", "dagger", "highlight", "sentry")
 # The keys travel to the subprocess through a trigger file because a Popen'd
 # rollout has neither a TTY nor a global keyboard hook.
 _MODE_KEYS: dict[str, dict[str, str]] = {
-    "dagger": {"pause": "space", "correct": "tab", "stop": "esc"},
+    "dagger": {
+        "pause": "space",
+        "correct": "tab",
+        "stop": "esc",
+        # LeLab-only verbs, handled by the subprocess bridge: 'start' opens the
+        # next episode from the rest screen; 'success' commits the take and
+        # 'fail' drops it (counting one failure). Both park the session back on
+        # the rest screen with the arm at its start pose.
+        "start": "start",
+        "takeover": "takeover",
+        "success": "success",
+        "fail": "fail",
+    },
     "highlight": {"save": "s", "stop": "esc"},
 }
 _TAKEOVER_KEY_FILE = "takeover_key"
 _TAKEOVER_STATE_FILE = "takeover_state.json"
+# Dropped by the server to end ONLY the current round of a continuous base
+# session; the subprocess returns home, rests and starts the next round in the
+# same process (no model reload).
+_ROUND_END_FILE = "round_end"
 
 
 def _read_takeover_state() -> dict[str, Any]:
@@ -367,12 +422,54 @@ def _hf_default_user() -> str | None:
 
 
 def _read_dataset_info(root: Path) -> dict[str, Any] | None:
-    """Existing dataset's meta/info.json, or None when the dataset is new."""
+    """Existing dataset's meta/info.json, or None when the dataset is new.
+
+    "Existing" means lerobot can load it from disk alone. A directory holding
+    only `info.json` is a stub left by a run that died between creating the
+    dataset and saving its first episode; the metadata loader rejects it and
+    falls back to pulling `meta/` from the Hub, which an offline inference
+    subprocess turns into SIGABRT (-6) with nothing but a traceback in the log.
+    Treating a stub as new lets the capture recreate it.
+    """
+    meta = root / "meta"
+    if not (meta / "info.json").is_file():
+        return None
+    tasks = (meta / "tasks.parquet").is_file() or (meta / "tasks.jsonl").is_file()
+    stats = (meta / "stats.json").is_file() or (meta / "episodes_stats.jsonl").is_file()
+    episodes = (meta / "episodes").is_dir() or (meta / "episodes.jsonl").is_file()
+    if not (tasks and stats and episodes):
+        logger.info("Dataset %s holds only a stub meta/ — recreating it", root)
+        return None
     try:
-        info = json.loads((root / "meta" / "info.json").read_text())
+        info = json.loads((meta / "info.json").read_text())
     except (OSError, ValueError):
         return None
     return info if isinstance(info, dict) else None
+
+
+def _clear_dataset_stub(root: Path) -> bool:
+    """Move a failed run's leftover dataset directory aside.
+
+    lerobot's create() uses ``exist_ok=False``, so a stub holding only a
+    half-written ``meta/`` blocks the name forever — and it cannot be resumed
+    either: with no tasks/stats/episodes there is nothing to load. Renaming it
+    (rather than deleting) keeps whatever the run did write recoverable.
+    Refuses to touch anything that might hold real episodes.
+    """
+    try:
+        entries = {p.name for p in root.iterdir()}
+        meta_entries = {p.name for p in (root / "meta").iterdir()} if (root / "meta").is_dir() else set()
+    except OSError:
+        return False
+    if entries - {"meta", ".cache"} or meta_entries - {"info.json"}:
+        return False
+    aside = root.with_name(f"{root.name}.stub-{time.strftime('%Y%m%d_%H%M%S')}")
+    try:
+        root.rename(aside)
+    except OSError:
+        return False
+    logger.info("Dataset %s held only a stub meta/ — moved aside to %s", root, aside.name)
+    return True
 
 
 def _detect_leader(request: "InferenceRequest") -> tuple[str, str]:
@@ -415,16 +512,15 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
     from lerobot.utils.constants import HF_LEROBOT_HOME
 
     name = request.dataset_repo_id.strip()
-    user = _hf_default_user()
+    # Capture always runs with push_to_hub=false, so the org segment is only a
+    # local directory namespace — fall back to "local" when not signed into HF
+    # instead of refusing to start.
+    user = _hf_default_user() or "local"
     if not name:
-        if not user:
-            return [], {}, "No HF account detected, so the dataset can't be auto-named. Type a dataset repo id."
         # Day-stable, so repeated rounds of one collection session land in the
         # same dataset instead of forking a new one per launch.
         name = f"{user}/rollout_{time.strftime('%m%d')}"
     if "/" not in name:
-        if not user:
-            return [], {}, f"Dataset '{name}' needs a user/org prefix."
         name = f"{user}/{name}"
     org, _, tail = name.partition("/")
     root = Path(HF_LEROBOT_HOME) / name
@@ -452,22 +548,30 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
                 name, root, existing = f"{org}/{cand.name}", cand, info
                 break
 
-    # One correction per round when auto-advance is on: lerobot's own loop ends
-    # the session once it has saved its target, so the round closes the moment
-    # the operator finishes and LeLab starts the next trial. Hybrid recording
-    # has no such counter — episodes rotate on wall-clock — so there the round
-    # is closed by "本轮成功" or by the duration instead.
-    per_round = (
-        1
-        if (request.auto_advance and mode == "dagger" and not request.record_autonomous)
-        else request.num_episodes
-    )
+    if existing is None and root.exists() and not _clear_dataset_stub(root):
+        return [], {}, (
+            f"数据集目录 {root} 已存在但元数据不完整（上次启动中断留下的空壳），"
+            "lerobot 无法在其中新建。请换一个数据集名字，或手动删掉该目录后重试。"
+        )
+
+    # 段数上限 is the dataset's TOTAL, not this process's budget: a resumed
+    # dataset only has to record what it is still missing. lerobot counts the
+    # episodes it saves itself, so hand it the remainder.
+    already = int((existing or {}).get("total_episodes") or 0)
+    remaining = max(1, request.num_episodes - already)
+    if already:
+        logger.info("Resuming %s with %d/%d episodes already saved", name, already, request.num_episodes)
+
+    # lerobot's own loop closes the session once it has saved its target, so
+    # `remaining` is the take budget for ONE process: the operator marks each
+    # take success/failure and the recorder rolls straight into the next one
+    # without reloading the model.
     args = [
         f"--dataset.repo_id={name}",
         f"--dataset.root={root}",
         f"--dataset.single_task={request.task}",
         "--dataset.push_to_hub=false",
-        f"--dataset.num_episodes={per_round}",
+        f"--dataset.num_episodes={request.num_episodes}",
     ]
     resolved_leader = ""
     if existing is not None:
@@ -499,12 +603,41 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
             leader_id, _ = setup_calibration_files(leader_config, request.follower_config)
         except (FileNotFoundError, OSError) as exc:
             return [], {}, f"Leader calibration unavailable: {exc}"
+        # Pre-flight: the rollout subprocess runs with stdin closed, so it
+        # cannot complete lerobot's interactive leader calibration. If the
+        # leader has no usable calibration under the id we're about to pass,
+        # lerobot falls through to the interactive path and the subprocess
+        # aborts (exit -6) against a 0-byte log. Catch it here with a message.
+        leader_cal = Path(LEADER_CONFIG_PATH) / f"{leader_id}.json"
+        if not leader_cal.is_file():
+            return [], {}, (
+                f"主臂(id={leader_id})没有标定文件，纠正采集无法在无交互的子进程里完成标定。"
+                f"请先在遥操/标定界面标定主臂（生成 {leader_cal.name}），"
+                f"或在部署时重新选择已标定的机器人（如 001）后重试。"
+            )
+        # A degenerate calibration (range_min == range_max, e.g. all-2047 from a
+        # prior failed headless attempt) trips the same abort — reject it too.
+        try:
+            _data = json.loads(leader_cal.read_text())
+            _bad = [
+                name for name, m in _data.items()
+                if isinstance(m, dict)
+                and m.get("range_min") is not None
+                and m.get("range_min") == m.get("range_max")
+            ]
+            if _bad:
+                return [], {}, (
+                    f"主臂标定 {leader_cal.name} 里这些关节 range_min==range_max（{', '.join(_bad)}），"
+                    f"像是上次无交互标定写坏的。请在遥操/标定界面重新标定主臂后重试。"
+                )
+        except (ValueError, OSError):
+            pass  # unreadable → let lerobot surface it at connect time
         args += [
             "--teleop.type=so101_leader",
             f"--teleop.port={resolved_leader}",
             f"--teleop.id={leader_id}",
             "--strategy.type=dagger",
-            f"--strategy.num_episodes={per_round}",
+            f"--strategy.num_episodes={remaining}",
             f"--strategy.record_autonomous={'true' if request.record_autonomous else 'false'}",
         ]
         if request.record_autonomous:
@@ -522,8 +655,6 @@ def _build_capture_args(request: "InferenceRequest") -> tuple[list[str], dict[st
             "dataset_root": str(root),
             "appending": existing is not None,
             "num_episodes": request.num_episodes,
-            "episodes_per_round": per_round,
-            "auto_advance": bool(request.auto_advance),
             "record_autonomous": bool(request.record_autonomous),
             "leader_port": resolved_leader,
         },
@@ -562,7 +693,7 @@ def handle_inference_takeover(action: str) -> dict[str, Any]:
     # buffer still holds what it *saw* and what it *chose* to do — the one piece
     # a correction episode doesn't record. Archive it automatically so the
     # divergence point survives without the operator remembering a second button.
-    if action == "pause":
+    if action in ("pause", "takeover"):
         threading.Thread(target=handle_inference_snapshot, daemon=True).start()
 
     return {"success": True, "message": f"Sent '{key}' to the {mode} strategy", "key": key}
@@ -655,6 +786,29 @@ def _classify_outcome(rc: int | None, rollout_started: bool, error_text: str | N
     return "failed"
 
 
+# Failures during bring-up that commonly self-heal on a fresh process: a servo
+# drops one packet while torque is enabled, or a camera is still busy from the
+# previous run.
+_TRANSIENT_SETUP_MARKERS = (
+    "no status packet",
+    "failed to write",
+    # A bus that just re-enumerated (USB reset/replug) can miss one id on the
+    # handshake. The servo answers on the next connect; a retry is enough.
+    "motor check failed",
+    "missing motor ids",
+    "failed to open opencvcamera",
+    "timed out waiting for frame",
+    "read thread alive",
+    "connection reset",
+    "resource temporarily unavailable",
+)
+
+
+def _error_is_transient(error_text: str | None) -> bool:
+    low = (error_text or "").lower()
+    return any(marker in low for marker in _TRANSIENT_SETUP_MARKERS)
+
+
 def _apply_v4l2_camera_controls(cameras: dict[str, dict[str, Any]]) -> None:
     """Same fix record.py applies after camera connect (shared lelab.v4l2 so
     train and inference see identical exposure/white balance). Controls are
@@ -690,7 +844,9 @@ def _inference_camera_capture(cameras: dict[str, dict[str, Any]]) -> None:
     for cam_key, cam_cfg in cameras.items():
         kind, source = camera_source(cam_cfg)
         if kind == "network":
-            _inference_cams[cam_key] = preview_stream(str(source))
+            _inference_cams[cam_key] = preview_stream(
+                str(source), rotation=int(cam_cfg.get("rotation", 0) or 0)
+            )
             logger.info("🌐 Preview stream opened for %s (%s)", cam_key, redact(source))
             continue
 
@@ -746,24 +902,29 @@ def inference_camera_frames(cam_key: str, fps: float = 5.0):
     a brief pause in the writer shows as a still image instead of a blank tile —
     a silent stream is indistinguishable from a dead one in the browser.
 
-    The secondary cv2 open (which loses on this machine, but is the only option
-    when the subprocess never publishes) is deliberately delayed: the cameras
-    must stay owned by the rollout while it is producing frames.
+    Frames come only from the preview JPEG the rollout subprocess publishes —
+    the server never opens the cameras itself, because that races the
+    subprocess's exclusive V4L2 open.
     """
     interval = 1.0 / fps
     preview_file = _PREVIEW_DIR / f"{cam_key}.jpg"
     last_mtime = 0.0
     last_frame: bytes | None = None
-    last_new_frame_at = 0.0
 
     while inference_active:
         frame: bytes | None = None
         try:
             mtime = preview_file.stat().st_mtime
-            if mtime >= (_inference_started_at or 0.0) - 1.0 and mtime > last_mtime:
+            # Seed with the first available frame regardless of age: opening the
+            # MJPEG response silently and then staying quiet through the ~15–20s
+            # setup phase makes browsers show a blank tile (some drop the
+            # connection and never reconnect). After the seed, only fresh frames
+            # (written since this run started) replace it.
+            if mtime > last_mtime and (
+                last_frame is None or mtime >= (_inference_started_at or 0.0) - 1.0
+            ):
                 last_frame = preview_file.read_bytes()
                 last_mtime = mtime
-                last_new_frame_at = time.time()
         except OSError:
             pass
         frame = last_frame
@@ -773,22 +934,19 @@ def inference_camera_frames(cam_key: str, fps: float = 5.0):
                 frame = _inference_cam_frames.get(cam_key)
 
         if frame is None:
-            started = _inference_rollout_started_at or 0.0
-            if started and time.time() - started > _PREVIEW_STALL_S:
-                _start_inference_camera_capture()
+            # Do NOT fall back to opening the cameras from the server here: the
+            # rollout subprocess owns them exclusively, and a secondary open
+            # races its own connect() — that race is what made every
+            # auto-restarted run fail with "Failed to open OpenCVCamera(N)"
+            # (the browser keeps the preview <img> open, so at run 2 the
+            # generator immediately hits the stall timeout and grabs the
+            # device first). The subprocess publishes preview JPEGs; during the
+            # setup phase just wait for the first one.
             time.sleep(interval)
             continue
 
         yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
         time.sleep(interval)
-        # The writer went quiet: we are replaying a still image, so try the
-        # secondary open to get a live picture back.
-        if (
-            _inference_cam_thread is None
-            and last_new_frame_at
-            and time.time() - last_new_frame_at > _PREVIEW_STALL_S
-        ):
-            _start_inference_camera_capture()
 
 
 def _stop_inference_cameras() -> None:
@@ -805,12 +963,49 @@ def _stop_inference_cameras() -> None:
     _inference_cam_stop.clear()
 
 
+def _wait_for_restart_ready(prev_proc: subprocess.Popen | None = None) -> None:
+    """Pause before respawning so the previous run's resources are free.
+
+    Fixed sleep alone was not enough (a 3rd consecutive run still died with a
+    0-byte log). After the floor we poll MemAvailable so an overlapping respawn
+    neither fights for the serial port/cameras nor gets SIGKILLed by the
+    userspace OOM killer.
+    """
+    time.sleep(_RESTART_COOLDOWN_S)
+    if prev_proc is not None:
+        with contextlib.suppress(Exception):
+            prev_proc.wait(timeout=5)
+    try:
+        meminfo = Path("/proc/meminfo")
+        if not meminfo.exists():
+            return
+        deadline = time.time() + _RESTART_MEM_WAIT_S
+        while time.time() < deadline:
+            total = available = 0
+            for line in meminfo.read_text().splitlines():
+                if line.startswith("MemAvailable:"):
+                    available = int(line.split()[1])
+                elif line.startswith("MemTotal:"):
+                    total = int(line.split()[1])
+            if total and available / total >= _RESTART_MIN_AVAIL_FRAC:
+                break
+            time.sleep(1.0)
+    except Exception:
+        pass
+
+
 def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
     """Start a one-shot rollout subprocess. Returns a dict — the route
     layer turns it into a JSON response or HTTPException as appropriate."""
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
     global _inference_remaining_runs, _inference_current_run, _inference_restart_config
+    global _inference_setup_retries, _inference_last_exit_at
+
+    # A fresh operator-initiated session (no run in flight) resets the transient
+    # setup-retry budget; internal retries/restarts keep their count.
+    if _inference_current_run == 0:
+        _inference_setup_retries = 0
 
     # Mutex with teleop and recording: all three drive the same serial bus.
     from . import record as _record, teleoperate as _teleoperate
@@ -856,6 +1051,12 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
                 inference_active = False
             return {"success": False, "status_code": 400, "message": capture_error}
 
+        _mode = capture_meta.get("capture_mode", "base")
+        # Base inference runs every requested round inside ONE subprocess so the
+        # model loads (and hardware connects) only once. Dagger already loops
+        # episodes internally, so only base uses this continuous-rounds path.
+        base_rounds = request.n_runs if (_mode == "base" and request.n_runs > 1) else 1
+
         # Capture sessions may span rounds: a restart reuses the same dataset
         # because _build_capture_args resolves the stamped directory lerobot
         # created on the first round.
@@ -884,12 +1085,24 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             f"--robot.port={request.follower_port}",
             f"--robot.id={follower_id}",
             f"--task={request.task}",
-            f"--duration={request.duration_s}",
+            # A capture session is bounded by 段数上限 and the per-episode
+            # ceiling, not by wall clock: the rest screen waits on the operator.
+            f"--duration={0 if _mode == 'dagger' else request.duration_s}",
             *_rollout_inference_args(policy_path, force_rtc=request.rtc),
             *capture_args,
         ]
         if request.cameras:
             cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
+        if base_rounds > 1:
+            cmd.extend([f"--lelab.rounds={base_rounds}", f"--lelab.rest_s={_ROUND_REST_S}"])
+        if _mode == "dagger":
+            cmd.extend(
+                [
+                    f"--lelab.max_correction_s={request.max_correction_s}",
+                    # The modal's 时长 means "per episode" while capturing.
+                    f"--lelab.per_episode_s={request.duration_s}",
+                ]
+            )
 
         log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "inference_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
@@ -900,12 +1113,20 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         # on an old button press or report an old phase.
         with contextlib.suppress(OSError):
             _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
-            for stale in (_TAKEOVER_KEY_FILE, _TAKEOVER_STATE_FILE):
+            for stale in (_TAKEOVER_KEY_FILE, _TAKEOVER_STATE_FILE, _ROUND_END_FILE):
                 (_PREVIEW_DIR / stale).unlink(missing_ok=True)
 
         env = os.environ.copy()
         env["PYTHONUNBUFFERED"] = "1"
         env.update(_hf_offline_env(policy_path))
+        # A rollout that exited moments ago can still own the cameras and the
+        # serial port; starting on top of it dies in native init before Python
+        # prints anything, which the page can only report as an empty log.
+        since_exit = time.time() - _inference_last_exit_at
+        if 0 <= since_exit < _RESTART_COOLDOWN_S:
+            wait_s = _RESTART_COOLDOWN_S - since_exit
+            logger.info("Previous rollout exited %.1fs ago — waiting %.1fs before start", since_exit, wait_s)
+            time.sleep(wait_s)
         # Feed a single newline into stdin so SOFollower.calibrate()'s
         # `input("Press ENTER to use the calibration file ...")` returns "" and
         # writes the existing calibration to the motors instead of hanging
@@ -948,15 +1169,25 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         _inference_proc = proc
         _inference_started_at = time.time()
         _inference_rollout_started_at = None
+        total_duration = (
+            base_rounds * (request.duration_s + _ROUND_REST_S + _ROUND_HOME_S)
+            if base_rounds > 1
+            else request.duration_s
+        )
         _inference_meta = {
             "policy_ref": request.policy_ref,
-            "duration_s": request.duration_s,
+            "duration_s": total_duration,
+            "rounds": base_rounds,
+            "round_duration": request.duration_s,
+            "rest_s": _ROUND_REST_S,
             "log_path": str(log_path),
             "cameras": dict(request.cameras),
             **capture_meta,
         }
         _inference_current_run = 1
-        _inference_remaining_runs = max(0, request.n_runs - 1)
+        # A continuous-round session runs every round in its own subprocess, so
+        # the server has nothing to restart.
+        _inference_remaining_runs = 0 if base_rounds > 1 else max(0, request.n_runs - 1)
         _inference_restart_config = {
             "follower_port": request.follower_port,
             "follower_config": request.follower_config,
@@ -972,7 +1203,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "dataset_fps": request.dataset_fps,
             "num_episodes": request.num_episodes,
             "record_autonomous": request.record_autonomous,
-            "auto_advance": request.auto_advance,
+            "max_correction_s": request.max_correction_s,
             "leader_port": request.leader_port,
             "leader_config": request.leader_config,
         }
@@ -984,6 +1215,7 @@ def handle_stop_inference() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
     global _inference_remaining_runs, _inference_current_run, _inference_restart_config
+    global _inference_last_exit_at
 
     with _state_lock:
         if not inference_active or _inference_proc is None:
@@ -1003,6 +1235,8 @@ def handle_stop_inference() -> dict[str, Any]:
             proc.wait()
     except Exception as exc:
         logger.exception("Stop inference: %s", exc)
+    finally:
+        _inference_last_exit_at = time.time()
 
     with _state_lock:
         inference_active = False
@@ -1018,11 +1252,71 @@ def handle_stop_inference() -> dict[str, Any]:
 def _capture_status_fields(meta: dict[str, Any]) -> dict[str, Any]:
     """Capture-session fields every status response carries, so the UI can show
     which dataset is being written and which strategy phase we're in."""
+    state = _read_takeover_state()
+    repo = meta.get("dataset_repo_id")
+    # A state file left by the previous session reports another repo; ignore it.
+    if state.get("repo_id") and repo and state["repo_id"] != repo:
+        state = {k: v for k, v in state.items() if k not in ("episodes", "repo_id")}
+    # Policy load takes ~20s, during which the subprocess has published nothing
+    # yet — the page would show "0 集" for a dataset that already holds
+    # episodes, so read the count off disk until the writer takes over.
+    if "episodes" not in state:
+        root = meta.get("dataset_root")
+        info = _read_dataset_info(Path(root)) if root else None
+        if info is not None:
+            state = {**state, "episodes": int(info.get("total_episodes") or 0)}
+    stats = _persist_take_stats(state, str(state.get("repo_id") or repo or ""))
     return {
         "capture_mode": meta.get("capture_mode", "base"),
-        "dataset_repo_id": meta.get("dataset_repo_id"),
-        "takeover": _read_takeover_state(),
+        "dataset_repo_id": repo,
+        "episode_target": meta.get("num_episodes"),
+        "takeover": state,
+        # Lifetime counters for this capture dataset, folded in from the child.
+        "take_stats": stats,
     }
+
+
+def _persist_take_stats(state: dict[str, Any], repo: str) -> dict[str, Any]:
+    """Fold the subprocess's per-take counters into the dataset's running totals.
+
+    A capture session is one process that records many takes, so the counters
+    live in the child and only the child sees the phase transitions. The server
+    polls them and adds the *delta* since the last poll — a fresh session resets
+    the child's counters to zero, which shows up as a negative delta and is read
+    as "this session started over".
+    """
+    takes = state.get("takes")
+    if takes is None or not repo:
+        return {}
+
+    with _state_lock:
+        prev = dict(_inference_meta.get("last_take_counts") or {})
+        corrected = int(state.get("corrected_takes") or 0)
+        failures = int(state.get("failures") or 0)
+        delta_takes = int(takes) - int(prev.get("takes") or 0)
+        delta_corrected = corrected - int(prev.get("corrected") or 0)
+        delta_failures = failures - int(prev.get("failures") or 0)
+        if delta_takes < 0:  # new subprocess, counters restarted
+            delta_takes, delta_corrected, delta_failures = int(takes), corrected, failures
+        _inference_meta["last_take_counts"] = {
+            "takes": int(takes),
+            "corrected": corrected,
+            "failures": failures,
+        }
+
+    from .rollout_eval import add_take_stats
+
+    try:
+        return add_take_stats(
+            repo,
+            takes=max(0, delta_takes),
+            corrected=max(0, min(delta_corrected, max(0, delta_takes))),
+            failures=max(0, delta_failures),
+            policy_ref=str(_inference_meta.get("policy_ref") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - stats must never break a session
+        logger.info("Take stats not recorded for %s: %s", repo, exc)
+        return {}
 
 
 def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
@@ -1037,6 +1331,7 @@ def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
     global _inference_remaining_runs, _inference_current_run, _inference_end_in_progress
+    global _inference_last_exit_at
 
     with _state_lock:
         if not inference_active or _inference_proc is None:
@@ -1046,6 +1341,32 @@ def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
         proc = _inference_proc
         mode = str(_inference_meta.get("capture_mode") or "base")
         current_run = _inference_current_run or 1
+        # Continuous base session: "本轮成功" marks THIS trial done. Signal the
+        # subprocess to end only the current round and keep running (home, rest,
+        # next round) instead of killing it and reloading the model.
+        if mode == "base" and int(_inference_meta.get("rounds", 1) or 1) > 1:
+            try:
+                _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+                (_PREVIEW_DIR / _ROUND_END_FILE).write_text("1")
+            except OSError as exc:
+                return {"success": False, "status_code": 500, "message": f"标记失败: {exc}"}
+            return {"success": True, "message": "已标记成功，进入休整，准备下一轮", "advanced": True}
+        # A capture session is ONE continuous recorder: marking a trial as
+        # success must not tear it down (that would reload the model and lose
+        # the dataset handle). Close only the correction in progress — the
+        # strategy saves that episode, walks home and keeps recording.
+        if mode in _MODE_KEYS and advance:
+            phase = _read_takeover_state().get("phase", "")
+            key = None
+            if mode == "dagger" and phase == "correcting":
+                key = "tab"
+            elif mode == "highlight" and phase == "recording":
+                key = "s"
+            if key is not None:
+                with contextlib.suppress(OSError):
+                    _PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+                    (_PREVIEW_DIR / _TAKEOVER_KEY_FILE).write_text(key)
+            return {"success": True, "message": "已标记成功，继续采集", "advanced": True}
         _inference_end_in_progress = True
 
     exited = False
@@ -1071,6 +1392,7 @@ def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
     finally:
         with _state_lock:
             _inference_end_in_progress = False
+            _inference_last_exit_at = time.time()
             inference_active = False
             _inference_proc = None
             _inference_started_at = None
@@ -1079,7 +1401,10 @@ def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
             _inference_current_run = 0
         _stop_inference_cameras()
 
-    if not advance:
+    # Reaching this point for a capture mode means the operator asked to close
+    # the whole session (advance=False): the recorder finalises its dataset on
+    # its own shutdown path. Only plain base trials advance to a fresh round.
+    if not advance or mode in _MODE_KEYS:
         with _state_lock:
             _inference_remaining_runs = 0
             _inference_restart_config = {}
@@ -1094,8 +1419,8 @@ def handle_inference_end_round(advance: bool = True) -> dict[str, Any]:
         remaining_after = _inference_remaining_runs
         config = dict(_inference_restart_config)
 
-    # Let the serial port, cameras and GPU memory of the previous run release.
-    time.sleep(_RESTART_COOLDOWN_S)
+    # Let the serial port, cameras and GPU/host memory of the previous run release.
+    _wait_for_restart_ready()
     result = handle_start_inference(InferenceRequest(**config))
     if not result.get("success"):
         with _state_lock:
@@ -1121,6 +1446,7 @@ def handle_inference_status() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
     global _inference_rollout_started_at, _inference_meta
     global _inference_remaining_runs, _inference_current_run, _inference_restart_config
+    global _inference_setup_retries, _inference_last_exit_at
 
     total_runs = _inference_current_run + _inference_remaining_runs
 
@@ -1148,6 +1474,7 @@ def handle_inference_status() -> dict[str, Any]:
             }
         if proc is not None and proc.poll() is not None:
             rc = proc.returncode
+            _inference_last_exit_at = time.time()
             logger.info("Inference subprocess exited rc=%s (run %d/%d)",
                         rc, _inference_current_run, total_runs)
             finished_meta = _inference_meta
@@ -1163,15 +1490,47 @@ def handle_inference_status() -> dict[str, Any]:
             # (or at least ran through the main loop).
             error = _extract_error_from_log(finished_meta.get("log_path")) if rc else None
             outcome = _classify_outcome(rc, finished_rollout_started is not None, error)
+            # Transient bring-up failure (servo dropped a packet while torque was
+            # enabled, or a camera was still busy): retry a fresh subprocess a
+            # few times before surfacing it. These self-heal on a clean process.
+            if (
+                outcome == "failed"
+                and finished_rollout_started is None
+                and _inference_setup_retries < _MAX_SETUP_RETRIES
+                and _inference_restart_config
+                and _error_is_transient(error)
+            ):
+                _inference_setup_retries += 1
+                logger.warning(
+                    "Transient setup failure — retrying (%d/%d): %s",
+                    _inference_setup_retries, _MAX_SETUP_RETRIES, error,
+                )
+                _wait_for_restart_ready(proc)
+                inference_active = False
+                result = handle_start_inference(InferenceRequest(**_inference_restart_config))
+                if result.get("success"):
+                    return {
+                        "inference_active": True,
+                        "started_at": _inference_started_at,
+                        "rollout_started_at": None,
+                        "elapsed_s": 0,
+                        "rollout_elapsed_s": 0,
+                        "duration_s": finished_meta.get("duration_s"),
+                        "policy_ref": finished_meta.get("policy_ref"),
+                        "log_path": result.get("log_path"),
+                        "current_run": _inference_current_run,
+                        "total_runs": total_runs,
+                        "camera_names": list(finished_meta.get("cameras", {}).keys()),
+                    }
+                logger.warning("Setup retry could not start: %s", result.get("message"))
             if _inference_remaining_runs > 0 and outcome != "failed" and _inference_restart_config:
                 _inference_remaining_runs -= 1
                 next_current = _inference_current_run + 1
                 remaining_after = _inference_remaining_runs
                 logger.info("Auto-restarting inference (%d runs remaining)",
                             remaining_after)
-                # Let the previous run's serial port, cameras and memory fully
-                # release before respawning (see _RESTART_COOLDOWN_S).
-                time.sleep(_RESTART_COOLDOWN_S)
+                # Wait for serial/cameras/memory to release before respawning.
+                _wait_for_restart_ready(proc)
                 restart_req = InferenceRequest(**_inference_restart_config)
                 # The previous subprocess has exited; free the slot so
                 # handle_start_inference's active-guard accepts the restart

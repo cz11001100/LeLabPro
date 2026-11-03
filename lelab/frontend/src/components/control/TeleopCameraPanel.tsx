@@ -71,6 +71,7 @@ const TeleopCameraPanel: React.FC = () => {
         deviceId,
         // A stream source previews through the backend instead of getUserMedia.
         url: c.type === "network" || c.url ? c.url : undefined,
+        rotation: c.rotation ?? 0,
       };
     });
   }, [configured, manualAssignments]);
@@ -188,7 +189,7 @@ const TeleopCameraPanel: React.FC = () => {
               className="border-amber-600 text-amber-400 hover:bg-amber-900/20"
             >
               <RefreshCw className="w-4 h-4 mr-2" />
-              刷新权限
+              Refresh Permissions
             </Button>
           </div>
         ) : feeds.length > 0 ? (
@@ -199,6 +200,7 @@ const TeleopCameraPanel: React.FC = () => {
                 <StreamCameraFeed
                   key={`stream:${feed.key}:${reloadKey}`}
                   url={feed.url!}
+                  rotation={feed.rotation}
                   label={feed.name}
                 />
               ))}
@@ -298,7 +300,7 @@ const VisualCameraPicker: React.FC<VisualCameraPickerProps> = ({
           className="h-7 text-xs text-gray-400 hover:text-white"
         >
           <RefreshCw className={`w-3 h-3 mr-1 ${isEnumerating ? "animate-spin" : ""}`} />
-          刷新
+          Refresh
         </Button>
       </div>
 
@@ -322,7 +324,7 @@ const VisualCameraPicker: React.FC<VisualCameraPickerProps> = ({
           >
             {feed.name}
             {pendingRobotCameraId === feed.key && (
-              <span className="text-xs ml-2 text-amber-400">← 选择预览中的摄像头...</span>
+              <span className="text-xs ml-2 text-amber-400">← Choose a camera from the preview…</span>
             )}
           </button>
         ))}
@@ -362,7 +364,7 @@ const VisualCameraPicker: React.FC<VisualCameraPickerProps> = ({
             onClick={() => setPendingRobotCameraId(null)}
             className="text-xs text-gray-500 hover:text-gray-300"
           >
-            取消
+            Cancel
           </Button>
         </div>
       )}
@@ -412,7 +414,7 @@ const CameraPreviewButton: React.FC<CameraPreviewButtonProps> = ({
       </div>
       <div className="absolute inset-0 bg-black/0 group-hover:bg-black/30 transition-colors flex items-center justify-center">
         <span className="opacity-0 group-hover:opacity-100 text-xs text-white bg-amber-600 px-2 py-1 rounded transition-opacity">
-          点击选择
+          Click to select
         </span>
       </div>
       {isPreviewing && (

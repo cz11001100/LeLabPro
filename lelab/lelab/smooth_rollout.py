@@ -101,6 +101,32 @@ _TAKEOVER_KEY_FILE = _PREVIEW_DIR / "takeover_key"
 _TAKEOVER_STATE_FILE = _PREVIEW_DIR / "takeover_state.json"
 _TAKEOVER_POLL_S = 0.1
 _STATE_WRITE_S = 0.3
+# LeLab's own verbs. 'start' opens the next episode; 'success'/'fail' close the
+# one in progress — the strategy only has a key for closing a correction, so the
+# bridge translates them into that event and arms the flags (discard / failure
+# count) that decide what the closing does with the buffered frames.
+_START_KEY = "start"
+_TAKEOVER_KEY = "takeover"
+_SUCCESS_KEY = "success"
+_FAIL_KEY = "fail"
+_CORRECTION_KEY = "tab"  # toggles the correction on and off
+_RESUME_KEY = "space"
+# LeLab session phases shown in the UI. 'ready' is the between-episode rest
+# screen: the arm is parked at its start pose and the policy sends nothing until
+# the operator opens the next episode.
+_SOFT_START_TICKS = 10  # ~0.3s at 30fps gliding out of the rest pose
+_PHASE_READY = "ready"
+_PHASE_RUNNING = "running"
+# Set when LeLab itself pauses the strategy to park the session, so the leader's
+# smooth handover is skipped — see `_enter_ready`.
+_SKIP_HANDOVER = threading.Event()
+
+
+def _as_float(value) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 class _LeLabKeyListener:
@@ -143,16 +169,41 @@ class _LeLabKeyListener:
         self._stop.set()
 
 
-def _install_takeover_input() -> None:
+def _install_takeover_input(strategy, ctx) -> None:
     """Point the recording strategies at the file bridge instead of a keyboard.
 
     lerobot's factory returns an *already started* listener, so the strategies
     never call ``start()`` themselves — the replacement has to do it here.
+
+    The bridge also owns LeLab's session verbs. 'start' opens the next episode
+    and 'success'/'fail' close the one in progress. Only a *correction* has a
+    boundary inside the strategy, so mid-correction the verb becomes that event
+    (with the save armed to commit or throw away); otherwise the request is
+    queued for the control loop's next tick, because touching the arm or the
+    planner from this listener thread would race the policy for the serial bus.
     """
     from lerobot.rollout.strategies import dagger, highlight
 
     def listener(dispatch, *, controls_help: str = "") -> _LeLabKeyListener:
-        bridge = _LeLabKeyListener(dispatch)
+        strategy.takeover_dispatch = dispatch
+
+        def bridge_dispatch(name: str) -> None:
+            if name == _START_KEY:
+                strategy.start_episode = True
+                return
+            if name == _TAKEOVER_KEY:
+                _takeover_now(strategy, dispatch)
+                return
+            if name in (_SUCCESS_KEY, _FAIL_KEY):
+                _mark_take_end(
+                    strategy,
+                    save=name == _SUCCESS_KEY,
+                    count_failure=name == _FAIL_KEY,
+                )
+                return
+            dispatch(name)
+
+        bridge = _LeLabKeyListener(bridge_dispatch)
         bridge.start()
         logger.info("LeLab takeover bridge active%s", f" ({controls_help})" if controls_help else "")
         return bridge
@@ -161,13 +212,293 @@ def _install_takeover_input() -> None:
         module.create_key_listener = listener
 
 
+def _take_phase(strategy) -> str:
+    phase = getattr(getattr(strategy, "_events", None), "phase", None)
+    return getattr(phase, "value", "") or ""
+
+
+def _pending_frame_count(dataset) -> int:
+    """Frames buffered for the episode in progress (0 when nothing is pending)."""
+    try:
+        buffer = getattr(getattr(dataset, "writer", None), "episode_buffer", None)
+        return int(buffer["size"]) if buffer else 0
+    except Exception:
+        return 0
+
+
+def _close_take_episode(strategy, ctx, *, save: bool) -> None:
+    """Commit or drop the buffered frames of the take that just ended.
+
+    RA-BC weights a frame by `progress[t + chunk_size] - progress[t]` clamped to
+    its own episode, so an episode shorter than the policy's chunk gives every
+    frame the same clamped future — the per-frame signal collapses to one number
+    per episode. Warn loudly instead of quietly filling the dataset with those.
+    """
+    dataset = getattr(ctx.data, "dataset", None)
+    try:
+        frames = _pending_frame_count(dataset)
+        if dataset is not None and frames:
+            if save:
+                dataset.save_episode()
+                strategy.last_episode_frames = frames
+                logger.info("LeLab: take saved (episodes: %d, %d frames)", dataset.num_episodes, frames)
+                _stop_at_target(strategy, ctx, dataset)
+                chunk = int(getattr(getattr(ctx.policy.policy, "config", None), "chunk_size", 0) or 0)
+                if chunk and frames < chunk:
+                    logger.warning(
+                        "本集只有 %d 帧，短于 RA-BC 的 chunk_size=%d：进度差全被夹到集尾，"
+                        "这一集的逐帧权重会退化成一个常数",
+                        frames,
+                        chunk,
+                    )
+            else:
+                dataset.clear_episode_buffer()
+                logger.info("LeLab: take discarded (%d frames), nothing saved", frames)
+    except Exception:
+        logger.warning("Could not close the episode for this take", exc_info=True)
+
+
+def _stop_at_target(strategy, ctx, dataset) -> None:
+    """End the session once the dataset holds the target number of episodes.
+
+    lerobot only enforces this in corrections-only mode, where its loop counts
+    the episodes it saves; hybrid recording rotates on video size instead, so
+    without this a resumed dataset would keep growing past the total the
+    operator asked for.
+    """
+    target = int(getattr(getattr(ctx.runtime.cfg, "dataset", None), "num_episodes", 0) or 0)
+    if not target or dataset.num_episodes < target:
+        return
+    stop = getattr(getattr(strategy, "_events", None), "stop_recording", None)
+    if stop is not None:
+        logger.info("LeLab: dataset reached its %d-episode target — closing the session", target)
+        stop.set()
+
+
+def _finish_take(strategy, ctx, *, save: bool) -> None:
+    """Close the take from the control loop, then park the session."""
+    _close_take_episode(strategy, ctx, save=save)
+    _enter_ready(strategy, ctx)
+
+
+def _walk_home(strategy, ctx) -> None:
+    moving = getattr(strategy, "moving_guard", None)
+    if moving is not None:
+        moving.set()
+    try:
+        strategy._return_to_initial_position(ctx.hardware)
+    except Exception:
+        logger.warning("Could not walk the follower home at the take boundary", exc_info=True)
+    finally:
+        if moving is not None:
+            moving.clear()
+
+
+def _enter_ready(strategy, ctx, *, home: bool = True) -> None:
+    """Park the session between episodes: arm at its start pose, policy silent.
+
+    lerobot has no idle phase, so this borrows PAUSED — whose control branch
+    keeps re-sending an action — and pins that action to the initial position.
+    The leader's smooth handover is suppressed on the way in: nobody is taking
+    over yet, and steering the leader under hands that are not on it is exactly
+    what this screen exists to avoid.
+    """
+    hold = getattr(strategy, "paused_hold", None)
+    if hold is not None and ctx.hardware.initial_position:
+        hold.clear()
+        hold.update(ctx.hardware.initial_position)
+    dispatch = getattr(strategy, "takeover_dispatch", None)
+    if dispatch is not None and _take_phase(strategy) == "autonomous":
+        _SKIP_HANDOVER.set()
+        dispatch(_RESUME_KEY)
+    if home:
+        _walk_home(strategy, ctx)
+    # lerobot re-torques the leader when a correction ends. Left like that it
+    # sits locked through the rest screen and then drops the moment 开始下一集
+    # releases it — that fall is the "violent motion" before inference starts.
+    teleop = ctx.hardware.teleop
+    if teleop is not None and home:
+        try:
+            teleop.disable_torque()
+        except Exception:
+            logger.warning("Could not release the leader at the take boundary", exc_info=True)
+    strategy.lelab_phase = _PHASE_READY
+    strategy.episode_started_at = None
+    strategy.soft_start_ticks = 0
+
+
+def _begin_episode(strategy, ctx) -> None:
+    """Open the next episode: released hold, fresh plan, policy driving."""
+    hold = getattr(strategy, "paused_hold", None)
+    if hold is not None:
+        hold.clear()
+    _reset_planner(strategy)
+    dispatch = getattr(strategy, "takeover_dispatch", None)
+    if dispatch is not None and _take_phase(strategy) == "paused":
+        dispatch(_RESUME_KEY)
+    strategy.lelab_phase = _PHASE_RUNNING
+    strategy.episode_started_at = time.monotonic()
+    strategy.soft_start_ticks = _SOFT_START_TICKS
+    # One attempt counter per episode opened; `take_corrected` is raised by the
+    # phase hook if a human has to intervene during this one.
+    strategy.takes = int(getattr(strategy, "takes", 0)) + 1
+    strategy.take_corrected = False
+    dataset = getattr(ctx.data, "dataset", None)
+    logger.info("LeLab: episode %d starting", (dataset.num_episodes if dataset is not None else 0) + 1)
+
+
+def _reset_planner(strategy) -> None:
+    """Drop the cached action chunk so the next take re-plans from scratch.
+
+    Without this the leftover chunk keeps playing out right after the walk-home,
+    so the arm drives back toward where the last take ended and the new episode
+    reads as a continuation instead of a fresh attempt.
+    """
+    try:
+        engine = getattr(strategy, "_engine", None)
+        if engine is not None:
+            engine.reset()
+        interpolator = getattr(strategy, "_interpolator", None)
+        if interpolator is not None:
+            interpolator.reset()
+        strategy._cached_obs_processed = None
+    except Exception:
+        logger.warning("Planner reset at the take boundary failed", exc_info=True)
+
+
+def _install_episode_discard(strategy, ctx) -> None:
+    """Let the operator throw away the take in progress and redo it.
+
+    A correction is committed the instant it ends, so 're-record this episode'
+    has to intercept that save: drop the buffered frames instead of appending an
+    episode, and hand the episode budget back so the discarded take doesn't
+    consume a slot. Without it the only way out of a botched take was deleting
+    the episode afterwards in the dataset editor.
+    """
+    dataset = ctx.data.dataset
+    if dataset is None:
+        return
+    original_save = dataset.save_episode
+
+    def save_episode(*args, **kwargs):
+        if getattr(strategy, "discard_episode", False):
+            strategy.discard_episode = False
+            try:
+                if dataset.has_pending_frames():
+                    dataset.clear_episode_buffer()
+                budget = getattr(strategy.config, "num_episodes", None)
+                if isinstance(budget, int):
+                    strategy.config.num_episodes = budget + 1
+                logger.info("LeLab: take discarded — ready to re-record this episode")
+                return
+            except Exception:
+                logger.warning("Episode discard failed; saving instead", exc_info=True)
+        if not args and not kwargs:
+            try:
+                if not dataset.has_pending_frames():
+                    # Teardown's final save after a take that was already closed
+                    # would append a zero-length episode.
+                    logger.debug("LeLab: no pending frames — skipping empty episode save")
+                    return
+            except Exception:
+                logger.debug("Pending-frame check failed; saving anyway", exc_info=True)
+        return original_save(*args, **kwargs)
+
+    dataset.save_episode = save_episode
+
+
+_TAKEOVER_TORQUE_RETRIES = 4
+_TAKEOVER_TORQUE_RETRY_S = 0.12
+
+
+def _harden_takeover_bus(ctx) -> None:
+    """Keep a dropped status packet on the leader bus from ending the session.
+
+    Entering a correction re-enables torque on the leader so it can be slid
+    under the follower; those writes go out with no retry, so one transient
+    'Incorrect status packet' propagates out of the control loop, parks the
+    follower at its start pose and exits with code 1. The torque writes are
+    idempotent, so retrying them — and dropping the optional smooth handover
+    on final failure — turns a crash into a takeover that simply isn't
+    centred under the follower.
+    """
+    from lerobot.rollout.strategies import dagger
+
+    teleop = ctx.hardware.teleop
+    if teleop is None:
+        return
+
+    def retry(name):
+        original = getattr(teleop, name, None)
+        if original is None:
+            return
+
+        def wrapped():
+            for attempt in range(_TAKEOVER_TORQUE_RETRIES):
+                try:
+                    original()
+                    if attempt:
+                        logger.info("Teleop %s recovered after %d retries", name, attempt)
+                    return
+                except Exception as exc:
+                    logger.debug("Teleop %s attempt %d failed: %s", name, attempt + 1, exc)
+                    time.sleep(_TAKEOVER_TORQUE_RETRY_S * (attempt + 1))
+            logger.warning("Teleop %s still failing after %d tries — continuing anyway",
+                           name, _TAKEOVER_TORQUE_RETRIES)
+
+        setattr(teleop, name, wrapped)
+
+    for _name in ("enable_torque", "disable_torque"):
+        retry(_name)
+
+    orig_smooth_move = dagger.teleop_smooth_move_to
+
+    def smooth_move(target_teleop, target_pos, **kwargs):
+        # LeLab parked the session (no operator on the leader): skip the
+        # handover instead of steering the leader on its own.
+        if _SKIP_HANDOVER.is_set():
+            _SKIP_HANDOVER.clear()
+            logger.debug("Leader handover skipped (session parked)")
+            return
+        try:
+            orig_smooth_move(target_teleop, target_pos, **kwargs)
+        except Exception as exc:
+            logger.warning("Smooth takeover handover skipped: %s", exc)
+
+    dagger.teleop_smooth_move_to = smooth_move
+    logger.info("Takeover bus hardening active (torque retries + handover guard)")
+
+
 def _start_state_writer(strategy, ctx) -> None:
     """Publish the strategy phase and episode counter for the UI to poll."""
 
     def writer() -> None:
         while True:
             time.sleep(_STATE_WRITE_S)
-            state: dict = {"mode": getattr(getattr(strategy, "config", None), "type", "")}
+            config = getattr(strategy, "config", None)
+            state: dict = {"mode": getattr(config, "type", "")}
+            failed = getattr(strategy, "failed_takes", None)
+            if failed is not None:
+                state["failures"] = int(failed)
+            takes = getattr(strategy, "takes", None)
+            if takes is not None:
+                state["takes"] = int(takes)
+                state["corrected_takes"] = int(getattr(strategy, "corrected_takes", 0) or 0)
+            # LeLab's own session phase drives the 修整页 ↔ 本集页 switch; the
+            # strategy phase above only says where DAgger's state machine is.
+            if getattr(strategy, "lelab_phase", None) is not None:
+                state["session_phase"] = strategy.lelab_phase
+            started = getattr(strategy, "episode_started_at", None)
+            if started is not None:
+                state["episode_elapsed_s"] = round(time.monotonic() - started, 1)
+            last_frames = getattr(strategy, "last_episode_frames", None)
+            if last_frames is not None:
+                state["last_episode_frames"] = int(last_frames)
+                chunk = getattr(getattr(getattr(ctx, "policy", None), "policy", None), "config", None)
+                state["rabc_chunk_size"] = int(getattr(chunk, "chunk_size", 0) or 0)
+            policy_s = getattr(strategy, "policy_time_s", None)
+            if policy_s is not None:
+                state["policy_s"] = round(float(policy_s), 1)
             phase = getattr(getattr(strategy, "_events", None), "phase", None)
             if phase is not None:
                 state["phase"] = getattr(phase, "value", str(phase))
@@ -383,20 +714,394 @@ def _start_preview_publisher(ctx) -> None:
     logger.info("LeLab inference preview publisher started (dir=%s)", _PREVIEW_DIR)
 
 
+def _install_take_rounding(strategy, ctx) -> None:
+    """Run the recording session as 录制 does: rest screen, episode, rest.
+
+    DAgger's PAUSED branch re-sends the *pre-correction* action each tick, so a
+    move at the take boundary would be undone instantly — the hold is overridden
+    with the initial pose while the operator resets the scene (the homing move is
+    exempt, otherwise it degenerates into a jump). Requests raised outside a
+    correction are serviced from the control loop's own tick, because walking the
+    arm or resetting the planner from the listener thread would race the policy.
+    """
+    from lerobot.rollout.strategies.dagger import DAggerPhase
+
+    hardware = ctx.hardware
+    robot = hardware.robot_wrapper
+    events = getattr(strategy, "_events", None)
+    if robot is None or events is None or not hardware.initial_position:
+        return
+
+    hold: dict = {}
+    moving = threading.Event()
+    strategy.paused_hold = hold
+    strategy.moving_guard = moving
+    original_send_action = robot.send_action
+
+    last_cmd: dict = {}
+
+    def send_action_with_hold(action, *args, **kwargs):
+        if hold and not moving.is_set() and events.phase == DAggerPhase.PAUSED:
+            action = hold
+        else:
+            ramp = int(getattr(strategy, "soft_start_ticks", 0) or 0)
+            if ramp > 0 and last_cmd:
+                # Glide out of the rest pose. The policy's first chunk often
+                # points well above home (it drives to its training start), and
+                # snapping straight onto it reads as the arm "standing up".
+                alpha = 1.0 - ramp / _SOFT_START_TICKS
+                blended = {}
+                for key, value in action.items():
+                    base = _as_float(last_cmd.get(key))
+                    target = _as_float(value)
+                    blended[key] = (
+                        base * (1.0 - alpha) + target * alpha
+                        if base is not None and target is not None
+                        else value
+                    )
+                action = blended
+                strategy.soft_start_ticks = ramp - 1
+        last_cmd.clear()
+        for key, value in action.items():
+            as_float = _as_float(value)
+            if as_float is not None:
+                last_cmd[key] = as_float
+        return original_send_action(action, *args, **kwargs)
+
+    robot.send_action = send_action_with_hold
+
+    original_apply = strategy._apply_transition
+
+    def apply_transition(old_phase, new_phase, engine, interpolator, ctx_, prev_action):
+        hold.clear()
+        if new_phase == DAggerPhase.CORRECTING and not getattr(strategy, "take_corrected", False):
+            # One takeover per take, however many times they pause and resume it:
+            # the number the UI reports is "how many attempts needed a human".
+            strategy.take_corrected = True
+            strategy.corrected_takes = int(getattr(strategy, "corrected_takes", 0)) + 1
+        # 开始 (PAUSED→CORRECTING) needs no extra work: lerobot releases the
+        # leader's torque there, which is exactly what "开始" means now that the
+        # takeover step already aligned it under the follower.
+        original_apply(old_phase, new_phase, engine, interpolator, ctx_, prev_action)
+        if new_phase == DAggerPhase.PAUSED:
+            parked = getattr(strategy, "pending_park", None)
+            strategy.pending_park = None
+            if old_phase == DAggerPhase.CORRECTING:
+                # Hybrid recording has no per-correction boundary in lerobot (its
+                # episodes rotate on video size), so close the episode here. In
+                # corrections-only mode the strategy saves it right after this
+                # call, and the discard flag is left for that save to consume.
+                if getattr(strategy.config, "record_autonomous", False):
+                    save = not getattr(strategy, "discard_episode", False)
+                    strategy.discard_episode = False
+                    _close_take_episode(strategy, ctx, save=save)
+            elif parked is not None:
+                _close_take_episode(strategy, ctx, save=parked)
+            else:
+                # The operator's own "take over" pause: hold everything in place
+                # and wait for them to start the correction.
+                return
+            _enter_ready(strategy, ctx)
+
+    strategy._apply_transition = apply_transition
+
+    original_consume = events.consume_transition
+
+    def consume_transition():
+        transition = original_consume()
+        if transition is not None:
+            return transition
+        # First tick only: the loop's own `events.reset()` clears the phase
+        # queue, so parking before it would simply be undone.
+        if getattr(strategy, "lelab_phase", None) is None:
+            _enter_ready(strategy, ctx, home=False)
+            return None
+        if getattr(strategy, "start_episode", False):
+            strategy.start_episode = False
+            _begin_episode(strategy, ctx)
+            return None
+        pending = getattr(strategy, "pending_take_end", None)
+        if pending is None:
+            return None
+        if _take_phase(strategy) == "autonomous":
+            # Ask the state machine to park and let the boundary run when the
+            # pause lands. Finishing here would leave this tick in its AUTONOMOUS
+            # branch, which replays the leftover chunk and drags the arm back over
+            # the walk-home — the "returns then jumps to where I pressed" bug.
+            strategy.pending_take_end = None
+            strategy.pending_park = pending
+            _SKIP_HANDOVER.set()
+            dispatch = getattr(strategy, "takeover_dispatch", None)
+            if dispatch is not None:
+                dispatch(_RESUME_KEY)
+            return None
+        strategy.pending_take_end = None
+        _finish_take(strategy, ctx, save=pending)
+        return None
+
+    events.consume_transition = consume_transition
+    logger.info("Session rounding active (修整页 ↔ 本集, save-or-drop per episode)")
+
+
+def _takeover_now(strategy, dispatch) -> None:
+    """Pause the policy and bring the leader onto the follower's pose.
+
+    Taking over is one confirm (then 开始 just releases the leader): the leader
+    is smoothly driven to where the follower is holding, so the operator's hand
+    lands in the right place. Parking the session between episodes suppresses
+    that alignment — nobody is there to take over.
+    """
+    if _take_phase(strategy) != "autonomous":
+        # 开始 was just pressed: the phase flip is consumed on the next tick.
+        # Wait it out instead of dropping the click.
+        deadline = time.monotonic() + 1.0
+        while _take_phase(strategy) != "autonomous" and time.monotonic() < deadline:
+            if getattr(strategy, "lelab_phase", None) != _PHASE_RUNNING:
+                return
+            time.sleep(0.02)
+        if _take_phase(strategy) != "autonomous":
+            return
+    dispatch(_RESUME_KEY)
+
+
+def _mark_take_end(strategy, *, save: bool, count_failure: bool = False) -> None:
+    """Close the take in progress: commit or drop it, optionally count a failure.
+
+    Mid-correction the closing goes through the strategy's own event (it owns the
+    episode boundary there); anywhere else the request is queued for the control
+    loop, which is the only thread allowed to move the arm or reset the planner.
+    """
+    if count_failure:
+        strategy.failed_takes = int(getattr(strategy, "failed_takes", 0)) + 1
+        logger.info("LeLab failure marked (total: %d)", strategy.failed_takes)
+    if _take_phase(strategy) == "correcting":
+        strategy.discard_episode = not save
+        dispatch = getattr(strategy, "takeover_dispatch", None)
+        if dispatch is not None:
+            dispatch(_CORRECTION_KEY)
+    else:
+        strategy.pending_take_end = save
+
+
+def _start_session_watchdog(strategy, ctx, max_correction_s: float, per_episode_s: float) -> None:
+    """Cap how long a correction or an unjudged episode may run.
+
+    Neither lerobot's duration nor an operator's click bounds these any more: a
+    correction nobody closed, or an episode left running while the operator steps
+    away, would hold the rig indefinitely. A correction that hits its cap is kept
+    - the human did teach something - while an episode that times out without a
+    verdict is treated exactly like the failure button: dropped, and counted.
+    """
+    if max_correction_s <= 0 and per_episode_s <= 0:
+        return
+
+    def loop() -> None:
+        correcting_since: float | None = None
+        shutdown = ctx.runtime.shutdown_event
+        while not shutdown.is_set():
+            time.sleep(0.2)
+            now = time.monotonic()
+            if _take_phase(strategy) == "correcting":
+                if correcting_since is None:
+                    correcting_since = now
+                elif max_correction_s > 0 and now - correcting_since >= max_correction_s:
+                    correcting_since = None
+                    logger.info("Correction hit its %.0fs cap - saving the take", max_correction_s)
+                    _mark_take_end(strategy, save=True)
+            else:
+                correcting_since = None
+            started = getattr(strategy, "episode_started_at", None)
+            if (
+                per_episode_s > 0
+                and started is not None
+                and getattr(strategy, "lelab_phase", None) == _PHASE_RUNNING
+                and now - started >= per_episode_s
+            ):
+                strategy.episode_started_at = None
+                logger.info("Episode hit its %.0fs limit - marking it failed", per_episode_s)
+                _mark_take_end(strategy, save=False, count_failure=True)
+
+    threading.Thread(target=loop, name="lelab-session-watchdog", daemon=True).start()
+    logger.info(
+        "Session watchdog armed (correction %.0fs / episode %.0fs)", max_correction_s, per_episode_s
+    )
+
+
+def _start_memory_reclaimer(interval_s: float = 10.0) -> None:
+    """Periodically hand freed heap back to the OS during multi-episode capture.
+
+    lerobot's dagger saves episodes back-to-back in *this* process. Python frees
+    each episode's numpy frames after save_episode(), but glibc keeps them in its
+    arena, so RSS climbs (~700MB/episode measured) until the kernel OOM-kills the
+    run mid-save — the same failure record.py fixed for recording. The rollout
+    subprocess never trimmed, so a long capture session could die after a few
+    episodes. Reuse the recording path's gc + libc malloc_trim on a timer.
+    """
+    try:
+        from .record import _release_free_memory
+    except Exception:
+        logger.warning("Memory reclaimer unavailable", exc_info=True)
+        return
+
+    def loop() -> None:
+        while True:
+            time.sleep(interval_s)
+            try:
+                _release_free_memory()
+            except Exception:
+                pass
+
+    threading.Thread(target=loop, name="lelab-mem-reclaim", daemon=True).start()
+    logger.info("LeLab memory reclaimer started (every %.0fs)", interval_s)
+
+
+_DEFAULT_ROUND_REST_S = 3.0
+# A correction left open would otherwise hang the rig forever now that the
+# session's duration only budgets policy driving time.
+_DEFAULT_MAX_CORRECTION_S = 30.0
+_ROUND_END_FILE = "round_end"
+
+
+def _run_one_round(strategy, ctx, round_end: Path) -> None:
+    """Run one base round, ending early when the operator marks success.
+
+    Mirrors BaseStrategy.run's control loop but also breaks when the server
+    drops a ``round_end`` file: "mark this trial as success" should finish THIS
+    round (then home + rest) without tearing down the process, so the model is
+    never reloaded. A hard stop still goes through ``shutdown_event``.
+    """
+    from lerobot.rollout.strategies.core import send_next_action
+    from lerobot.utils.robot_utils import precise_sleep
+
+    engine = strategy._engine
+    cfg = ctx.runtime.cfg
+    robot = ctx.hardware.robot_wrapper
+    interpolator = strategy._interpolator
+    interval = interpolator.get_control_interval(cfg.fps)
+    start = time.perf_counter()
+    engine.resume()
+    logger.info("Base strategy control loop started")
+    while not ctx.runtime.shutdown_event.is_set():
+        if round_end.exists():
+            try:
+                round_end.unlink()
+            except OSError:
+                pass
+            logger.info("Round ended early: operator marked success")
+            return
+        loop_start = time.perf_counter()
+        if cfg.duration > 0 and (time.perf_counter() - start) >= cfg.duration:
+            logger.info("Duration limit reached (%.0fs)", cfg.duration)
+            return
+        obs = robot.get_observation()
+        obs_processed = strategy._process_observation_and_notify(ctx.processors, obs)
+        if strategy._handle_warmup(cfg.use_torch_compile, loop_start, interval):
+            continue
+        action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
+        if hasattr(strategy, "_log_telemetry"):
+            strategy._log_telemetry(obs_processed, action_dict, ctx.runtime)
+        dt = time.perf_counter() - loop_start
+        if (sleep_t := interval - dt) > 0:
+            precise_sleep(sleep_t)
+        else:
+            logger.warning(
+                "Record loop is running slower (%.1f Hz) than the target FPS (%.0f Hz).",
+                1 / dt,
+                cfg.fps,
+            )
+
+
+def _settle(ctx, seconds: float) -> None:
+    """Rest between rounds, so the operator can reset the scene.
+
+    Gives the arm time to stop at home, the cameras/USB buffers to settle, and
+    a moment to put the ball back before the next round starts. Interruptible so
+    a stop doesn't wait out the whole settle.
+    """
+    if seconds <= 0:
+        return
+    logger.info("LeLab rest between rounds: %.0fs", seconds)
+    deadline = time.time() + seconds
+    event = getattr(getattr(ctx, "runtime", None), "shutdown_event", None)
+    while time.time() < deadline:
+        if event is not None and event.is_set():
+            return
+        time.sleep(min(0.2, max(0.0, deadline - time.time())))
+
+
 def main() -> None:
     opts = _parse_and_strip_lelab_args()
     alpha = opts.get("smooth_alpha", 0.6)
+    rounds = max(1, int(opts.get("rounds", 1) or 1))
+    rest_s = max(0.0, float(opts.get("rest_s", _DEFAULT_ROUND_REST_S) or 0.0))
+    max_correction_s = float(opts.get("max_correction_s", _DEFAULT_MAX_CORRECTION_S) or 0.0)
+    # Per-episode ceiling for the 修整 flow: 0 disables it.
+    per_episode_s = float(opts.get("per_episode_s", 0.0) or 0.0)
 
     import lerobot.scripts.lerobot_rollout as lr
+
+    # LeLab names capture datasets itself (from the dialog input) and manages
+    # reuse via --dataset.root + --resume, so lerobot's per-create timestamp
+    # stamping only makes the name long and diverge from what the user typed
+    # (e.g. "rollout_1028_3" → "rollout_1028_3_20261028_163026"). Disable it.
+    try:
+        from lerobot.configs.dataset import DatasetRecordConfig
+
+        DatasetRecordConfig.stamp_repo_id = lambda self: None
+    except Exception:
+        logger.warning("Could not disable dataset repo_id stamping", exc_info=True)
 
     orig_build = lr.build_rollout_context
     snapshot_buffer = SnapshotBuffer()
     _start_snapshot_watcher(snapshot_buffer)
+    _start_memory_reclaimer()
+    try:
+        (_PREVIEW_DIR / _ROUND_END_FILE).unlink(missing_ok=True)
+    except OSError:
+        pass
     ctx_holder: dict = {}
 
     def build_with_smoothing(cfg, shutdown_event):
         ctx = orig_build(cfg, shutdown_event)
         ctx_holder["ctx"] = ctx
+        # A slow camera (this rig's icspring stalls past lerobot's 200ms
+        # async_read budget) raises TimeoutError mid-loop and kills the whole
+        # rollout. Reuse the recording path's escalating-timeout + last-frame
+        # fallback so a brief stall doesn't end the session.
+        try:
+            from .record import _harden_camera_reads
+
+            _harden_camera_reads(ctx.hardware.robot_wrapper._robot)
+        except Exception:
+            logger.warning("Could not harden camera reads for rollout", exc_info=True)
+        try:
+            _harden_takeover_bus(ctx)
+        except Exception:
+            logger.warning("Could not harden the takeover bus", exc_info=True)
+        # Say out loud which smoothing path this run actually took: RTC guidance
+        # lives inside the policy (rtc_processor), not in the engine, so an RTC
+        # engine with a processor-less policy silently behaves like sync.
+        engine_name = type(ctx.policy.inference).__name__
+        rtc_processor = getattr(ctx.policy.policy, "rtc_processor", None)
+        if rtc_processor is not None and engine_name != "RTCInferenceEngine":
+            logger.warning("Policy has an RTC processor but engine is %s — guidance unused", engine_name)
+        elif engine_name == "RTCInferenceEngine" and rtc_processor is None:
+            logger.warning("RTC engine without a policy RTC processor — guidance inactive")
+        else:
+            rtc_cfg = getattr(getattr(ctx.policy.policy, "config", None), "rtc_config", None)
+            detail = ""
+            if rtc_cfg is not None:
+                detail = (
+                    f" (horizon={getattr(rtc_cfg, 'execution_horizon', '?')},"
+                    f" guidance={getattr(rtc_cfg, 'max_guidance_weight', '?')})"
+                )
+            logger.info(
+                "Inference engine: %s%s | RTC guidance: %s | LeLab chunk smoothing: %s",
+                engine_name,
+                detail,
+                "on" if rtc_processor is not None else "off",
+                "off" if alpha >= 1.0 else f"alpha={alpha:.2f}",
+            )
         keys = list(ctx.data.ordered_action_keys)
         passthrough = [i for i, k in enumerate(keys) if "gripper" in k.lower()]
         if alpha < 1.0:
@@ -422,14 +1127,52 @@ def main() -> None:
         # Recording strategies take their cues from a keyboard listener, which a
         # server-spawned subprocess has no access to; route them to the UI instead.
         if getattr(strategy_cfg, "type", "base") != "base":
-            _install_takeover_input()
-            _start_state_writer(strategy, ctx_holder.get("ctx"))
+            ctx = ctx_holder.get("ctx")
+            _install_takeover_input(strategy, ctx)
+            _start_state_writer(strategy, ctx)
             # Sentry/Highlight call `_background_push` on their own without
             # consulting `dataset.push_to_hub`, which would upload every few
             # episodes even though LeLab keeps capture sessions local.
-            dataset_cfg = getattr(ctx_holder.get("ctx").runtime.cfg, "dataset", None)
+            dataset_cfg = getattr(ctx.runtime.cfg, "dataset", None)
             if dataset_cfg is not None and not dataset_cfg.push_to_hub:
                 strategy._background_push = lambda dataset, cfg: None
+            # "This take is over" is the operator's round boundary: commit or
+            # drop the frames, put the arm back where the attempt started, and
+            # let the next one run on its own.
+            if getattr(strategy_cfg, "type", "") == "dagger" and ctx is not None:
+                _install_take_rounding(strategy, ctx)
+                _install_episode_discard(strategy, ctx)
+                _start_session_watchdog(strategy, ctx, max_correction_s, per_episode_s)
+        # Continuous rounds for plain inference: keep ONE process (one model
+        # load, one hardware connect) and loop `duration` rounds, returning home
+        # and resting between them instead of tearing down and respawning.
+        if getattr(strategy_cfg, "type", "base") == "base" and rounds > 1:
+            round_end_path = _PREVIEW_DIR / _ROUND_END_FILE
+
+            def run_rounds(ctx, _strategy=strategy):
+                for r in range(rounds):
+                    if ctx.runtime.shutdown_event.is_set():
+                        break
+                    logger.info("LeLab round %d/%d starting", r + 1, rounds)
+                    _run_one_round(_strategy, ctx, round_end_path)
+                    if r == rounds - 1 or ctx.runtime.shutdown_event.is_set():
+                        break
+                    try:
+                        if _strategy._engine is not None:
+                            _strategy._engine.reset()
+                        if _strategy._interpolator is not None:
+                            _strategy._interpolator.reset()
+                        _strategy._cached_obs_processed = None
+                    except Exception:
+                        logger.warning("Engine reset between rounds failed", exc_info=True)
+                    try:
+                        _strategy._return_to_initial_position(ctx.hardware)
+                    except Exception:
+                        logger.warning("Return-to-home between rounds failed", exc_info=True)
+                    _settle(ctx, rest_s)
+                    logger.info("LeLab round %d/%d done", r + 1, rounds)
+
+            strategy.run = run_rounds
         return strategy
 
     lr.build_rollout_context = build_with_smoothing

@@ -97,6 +97,34 @@ _DAGGER_TRANSITIONS: dict[tuple[DAggerPhase, str], DAggerPhase] = {
 }
 
 
+class _PolicyClock:
+    """Trial budget measured in *policy driving* seconds only.
+
+    The operator's phases — pausing to take over, teaching a correction, and the
+    walk-home between takes — should not eat the configured duration, so every
+    tick charges the span it just ran under to that phase and only autonomous
+    time counts down.
+    """
+
+    def __init__(self, strategy: "DAggerStrategy") -> None:
+        self.active_s = 0.0
+        self._strategy = strategy
+        self._stamp = time.perf_counter()
+        self._phase = DAggerPhase.AUTONOMOUS
+
+    def tick(self, phase: DAggerPhase) -> float:
+        """Charge the span since the last call to the phase it ran under."""
+        now = time.perf_counter()
+        if self._phase == DAggerPhase.AUTONOMOUS:
+            self.active_s += now - self._stamp
+        self._stamp = now
+        self._phase = phase
+        # Published for a UI that shows the budget the operator is actually
+        # spending, rather than wall-clock that keeps running while paused.
+        self._strategy.policy_time_s = self.active_s
+        return self.active_s
+
+
 class DAggerEvents:
     """Thread-safe container for DAgger input device events.
 
@@ -237,6 +265,8 @@ class DAggerStrategy(RolloutStrategy):
     """
 
     config: DAggerStrategyConfig
+    # Seconds the policy has actually spent driving; see _PolicyClock.
+    policy_time_s: float = 0.0
 
     def __init__(self, config: DAggerStrategyConfig):
         super().__init__(config)
@@ -346,7 +376,7 @@ class DAggerStrategy(RolloutStrategy):
 
         last_action: dict[str, Any] | None = None
         record_tick = 0
-        start_time = time.perf_counter()
+        policy_clock = _PolicyClock(self)
         episode_start = time.perf_counter()
         episodes_since_push = 0
         episode_duration_s = self._episode_duration_s
@@ -357,8 +387,11 @@ class DAggerStrategy(RolloutStrategy):
                 while not events.stop_recording.is_set() and not ctx.runtime.shutdown_event.is_set():
                     loop_start = time.perf_counter()
 
-                    if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
-                        logger.info("Duration limit reached (%.0fs)", cfg.duration)
+                    # `duration` budgets policy driving only: time spent paused,
+                    # teaching a correction or walking home is the operator's.
+                    policy_s = policy_clock.tick(events.phase)
+                    if cfg.duration > 0 and policy_s >= cfg.duration:
+                        logger.info("Policy time limit reached (%.0fs)", cfg.duration)
                         break
 
                     # Process transitions
@@ -502,7 +535,7 @@ class DAggerStrategy(RolloutStrategy):
         engine.resume()
 
         last_action: dict[str, Any] | None = None
-        start_time = time.perf_counter()
+        policy_clock = _PolicyClock(self)
         record_tick = 0
         recorded = 0
         logger.info(
@@ -518,8 +551,11 @@ class DAggerStrategy(RolloutStrategy):
                 ):
                     loop_start = time.perf_counter()
 
-                    if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
-                        logger.info("Duration limit reached (%.0fs)", cfg.duration)
+                    # `duration` budgets policy driving only: time spent paused,
+                    # teaching a correction or walking home is the operator's.
+                    policy_s = policy_clock.tick(events.phase)
+                    if cfg.duration > 0 and policy_s >= cfg.duration:
+                        logger.info("Policy time limit reached (%.0fs)", cfg.duration)
                         break
 
                     # Process transitions

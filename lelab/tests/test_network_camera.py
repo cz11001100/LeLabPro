@@ -407,7 +407,7 @@ def test_register_preview_source_returns_probe_and_key(client, monkeypatch: pyte
             return None
 
     monkeypatch.setattr(nc, "probe", lambda url: {"width": 1920, "height": 1080, "fps": 25})
-    monkeypatch.setattr(nc, "preview_stream", lambda url: DeadStream())
+    monkeypatch.setattr(nc, "preview_stream", lambda url, rotation=0: DeadStream())
     # A feed with no frames must close on its own, or the request thread is held
     # for as long as the browser keeps the <img> open.
     monkeypatch.setattr(nc, "MAX_PREVIEW_MISSES", 3)
@@ -429,3 +429,89 @@ def test_preview_feed_requires_a_registered_key(client) -> None:
     response = client.get("/network-camera-feed?key=deadbeef")
 
     assert response.status_code == 404
+
+
+# ---- rotation ---------------------------------------------------------------
+def test_normalize_rotation_snaps_to_quarter_turns() -> None:
+    from lelab.network_camera import normalize_rotation
+
+    assert normalize_rotation(0) == 0
+    assert normalize_rotation(90) == 90
+    assert normalize_rotation(-90) == 270
+    assert normalize_rotation(450) == 90
+    assert normalize_rotation(45) == 0  # non-quarter values fall back to 0
+    assert normalize_rotation(None) == 0
+    assert normalize_rotation("180") == 180
+
+
+def test_swap_dimensions_only_for_quarter_turns() -> None:
+    from lelab.network_camera import swap_dimensions
+
+    assert swap_dimensions(0, 1920, 1080) == (1920, 1080)
+    assert swap_dimensions(180, 1920, 1080) == (1920, 1080)
+    assert swap_dimensions(90, 1920, 1080) == (1080, 1920)
+    assert swap_dimensions(270, 1920, 1080) == (1080, 1920)
+
+
+def test_apply_rotation_swaps_shape(tmp_path) -> None:
+    pytest = __import__("pytest")
+    cv2 = pytest.importorskip("cv2")
+    import numpy as np
+
+    from lelab.network_camera import apply_rotation
+
+    frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+    frame[0:100, :] = 255  # mark the top edge so we can see which way is "up"
+    rotated = apply_rotation(frame, 90)
+
+    assert rotated.shape == (1920, 1080, 3)
+    # 90° clockwise moves the top strip to the right edge.
+    assert rotated[:, -100:, :].mean() > 200
+
+
+def test_network_camera_config_swaps_width_height_for_rotation() -> None:
+    from lelab.network_camera import NetworkCameraConfig
+
+    cfg = NetworkCameraConfig(
+        index_or_path="http://host/video", width=1920, height=1080, fps=25, rotation=90
+    )
+
+    # The dataset's image features have to describe what the recorder actually
+    # writes; a rotated frame swaps the axis.
+    assert (cfg.width, cfg.height) == (1080, 1920)
+    assert cfg.rotation == 90
+
+
+def test_build_camera_configs_passes_rotation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from lelab import record as rec_mod
+    import lelab.network_camera as nc
+
+    monkeypatch.setattr(nc, "probe", lambda url: {"width": 1920, "height": 1080, "fps": 25})
+
+    cameras = {
+        "up": {
+            "type": "network",
+            "url": "http://host/video",
+            "rotation": 90,
+        }
+    }
+
+    cfgs = rec_mod._build_camera_configs(cameras, default_backend=None)
+
+    assert cfgs["up"].rotation == 90
+    # The stored width/height reflect the rotated output, not the raw stream.
+    assert (cfgs["up"].width, cfgs["up"].height) == (1080, 1920)
+
+
+def test_register_source_returns_rotation(client, monkeypatch: pytest.MonkeyPatch) -> None:
+    import lelab.network_camera as nc
+
+    monkeypatch.setattr(nc, "probe", lambda url: {"width": 1920, "height": 1080, "fps": 25})
+
+    response = client.post("/network-camera-source", json={"url": URL, "rotation": 90})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["rotation"] == 90
+    # Server swaps axes so the UI preview chip matches what will be recorded.
+    assert (body["width"], body["height"]) == (1080, 1920)

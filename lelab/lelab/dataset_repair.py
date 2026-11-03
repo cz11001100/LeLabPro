@@ -276,6 +276,12 @@ def _write_episodes(root: Path, rows: list[dict[str, Any]]) -> None:
     shutil.rmtree(staging, ignore_errors=True)
     path = staging / "chunk-000" / "file-000.parquet"
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Every row lands in this one shard, and lerobot's editor follows the rows' own
+    # pointers to find them, so they have to agree with where they are written.
+    for row in rows:
+        if "meta/episodes/chunk_index" in row:
+            row["meta/episodes/chunk_index"] = 0
+            row["meta/episodes/file_index"] = 0
     pq.write_table(pa.Table.from_pylist(rows), path, compression="snappy", use_dictionary=True)
 
     # Rebuilding the index is the last step of a repair, and losing the old one to
@@ -283,6 +289,98 @@ def _write_episodes(root: Path, rows: list[dict[str, Any]]) -> None:
     if episodes_dir.exists():
         shutil.rmtree(episodes_dir)
     os.replace(staging, episodes_dir)
+
+
+def normalize_episode_self_pointers(root: Path) -> int:
+    """Point each episode row at the metadata shard that actually holds it.
+
+    lerobot's episode editor opens ``meta/episodes/chunk-NNN/file-NNN.parquet`` using
+    the ``meta/episodes/chunk_index`` / ``meta/episodes/file_index`` columns carried
+    inside the rows themselves (`dataset_tools._load_episode_with_stats`). Merging
+    copies those columns straight out of the source datasets, so a merged dataset
+    points at shards it never wrote and deleting a single episode dies with
+    FileNotFoundError on a path that does not exist. Returns the number of rows fixed.
+    """
+    import os
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    episodes_dir = root / "meta" / "episodes"
+    if not episodes_dir.exists():
+        return 0
+
+    columns = ("meta/episodes/chunk_index", "meta/episodes/file_index")
+    fixed = 0
+    for path in sorted(episodes_dir.rglob("*.parquet")):
+        chunk_idx, file_idx = _chunk_file(path)
+        wanted = {columns[0]: chunk_idx, columns[1]: file_idx}
+        table = pq.read_table(path)
+        stale = [
+            c
+            for c in columns
+            if c in table.column_names and any(int(v) != wanted[c] for v in table[c].to_pylist())
+        ]
+        if not stale:
+            continue
+        for col in stale:
+            field_index = table.column_names.index(col)
+            const = pa.array([wanted[col]] * table.num_rows, type=table.schema.field(field_index).type)
+            table = table.set_column(field_index, table.schema.field(field_index), const)
+        staging = path.with_name(path.name + ".pointers")
+        pq.write_table(table, staging, compression="snappy", use_dictionary=True)
+        os.replace(staging, path)
+        fixed += table.num_rows
+        logger.info("Rewrote %s self-pointers in %s", len(stale), path.name)
+    return fixed
+
+
+def normalize_episode_metadata(root: Path) -> str:
+    """Make a dataset's episode index self-consistent, and say what changed."""
+    info = json.loads((root / "meta" / "info.json").read_text())
+    pointers = normalize_episode_self_pointers(root)
+    columns = drop_orphan_episode_stat_columns(root, info)
+    return f"{pointers} row pointer(s) and {columns} orphan stats column(s) fixed"
+
+
+def drop_orphan_episode_stat_columns(root: Path, info: dict[str, Any]) -> int:
+    """Delete per-episode stats columns for features the dataset does not have.
+
+    Merging datasets recorded by different sessions unions their episode metadata,
+    so a rollout source leaves `stats/intervention/*` behind in a dataset whose
+    `info.json` has no `intervention` feature. Half the rows then carry lists and
+    half carry None, and lerobot's writer dies rebuilding the index with
+    "Table schema does not match schema used to create file" because a batch of
+    None values infers a `null` column type. Returns the number of columns dropped.
+    """
+    import os
+
+    import pyarrow.parquet as pq
+
+    features = set(info.get("features", {}))
+    episodes_dir = root / "meta" / "episodes"
+    if not episodes_dir.exists():
+        return 0
+
+    dropped = 0
+    for path in sorted(episodes_dir.rglob("*.parquet")):
+        table = pq.read_table(path)
+        orphans = []
+        for name in table.column_names:
+            if not name.startswith("stats/"):
+                continue
+            key = name[len("stats/") :].rsplit("/", 1)[0]
+            if key not in features:
+                orphans.append(name)
+        if not orphans:
+            continue
+        table = table.drop_columns(orphans)
+        staging = path.with_name(path.name + ".orphans")
+        pq.write_table(table, staging, compression="snappy", use_dictionary=True)
+        os.replace(staging, path)
+        dropped += len(orphans)
+        logger.info("Dropped %d orphan stats columns from %s: %s", len(orphans), path.name, ", ".join(orphans[:3]))
+    return dropped
 
 
 def check_dataset_health(repo_id: str) -> dict[str, Any]:
@@ -757,6 +855,7 @@ def delete_episodes_via_rebuild(root: Path, repo_id: str, episode_indices: list[
     try:
         from .utils.video_backend import video_backend
 
+        normalize_episode_metadata(root)
         src = LeRobotDataset(repo_id, root=root, video_backend=video_backend())
     except Exception as e:
         _update_repair_progress(active=False, completed=False, error=str(e), phase="Cannot open dataset")

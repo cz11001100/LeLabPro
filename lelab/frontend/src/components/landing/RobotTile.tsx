@@ -112,7 +112,7 @@ const RobotTile: React.FC<RobotTileProps> = ({
                     : "bg-yellow-500 hover:bg-yellow-600 text-white"
                 }`}
               >
-                遥操作 Teleoperation
+                Teleoperation
               </Button>
             </div>
           </TooltipTrigger>

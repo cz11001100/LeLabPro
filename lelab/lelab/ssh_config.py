@@ -197,11 +197,32 @@ def delete_ssh_config(config_id: str) -> bool:
     return True
 
 
+def _tcp_reachable(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Cheap liveness probe before paying paramiko's handshake timeout.
+
+    A stopped pod usually leaves the port closed (RST) or blackholed; the RST
+    case fails in milliseconds, and the blackholed one costs `timeout` instead
+    of the 10 s a full SSH connect would burn.
+    """
+    import socket
+
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def test_ssh_connection(config_id: str) -> dict:
     """Try to connect and run a trivial command. Returns {success, message}."""
     cfg = get_ssh_config(config_id)
     if cfg is None:
         return {"success": False, "message": "Config not found"}
+    if not _tcp_reachable(cfg.host, cfg.port):
+        return {
+            "success": False,
+            "message": f"端口 {cfg.port} 连不上（{cfg.host}）——实例可能已停止，或重开后换了 host/port",
+        }
     try:
         import paramiko
     except ImportError:

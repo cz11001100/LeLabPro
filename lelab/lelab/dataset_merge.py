@@ -170,6 +170,11 @@ def handle_merge(request: MergeRequest) -> dict[str, Any]:
                     "status_code": 500,
                     "message": f"去掉 {source['repo_id']} 的多余列失败：{err[-300:]}",
                 }
+            # lerobot's remove_feature drops the column from the data and from
+            # info.json but leaves `stats/<feature>/*` in meta/episodes. Those
+            # orphans then get unioned into the merge and make the result
+            # un-editable, so clear them from the source while we are here.
+            _normalize(Path(source["root"]), source["repo_id"])
 
     log_dir = Path.home() / ".cache" / "huggingface" / "lerobot" / "merge_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -184,6 +189,8 @@ def handle_merge(request: MergeRequest) -> dict[str, Any]:
     def pump() -> None:
         code = proc.wait()
         handle.close()
+        if code == 0:
+            _normalize(_cache_root() / request.target_repo_id, request.target_repo_id)
         with _merge_lock:
             _merge_state.update({"running": False, "exit_code": code, "finished_at": time.time()})
         logger.info("Merge finished (rc=%s) -> %s", code, request.target_repo_id)
@@ -228,3 +235,19 @@ def _run_blocking(cmd: list[str], timeout: int = 900) -> tuple[int, str]:
     except subprocess.TimeoutExpired:
         return -1, f"timed out after {timeout}s"
     return proc.returncode, (proc.stderr or proc.stdout or "")
+
+
+def _normalize(root: Path, repo_id: str) -> None:
+    """Tidy the episode index lerobot leaves inconsistent.
+
+    `aggregate` copies each source row's `meta/episodes/{chunk,file}_index` into the
+    merged dataset instead of pointing them at the shard it actually wrote, so a
+    merged set cannot be edited afterwards — lerobot's editor follows those columns
+    and opens files that were never created.
+    """
+    from .dataset_repair import normalize_episode_metadata
+
+    try:
+        logger.info("Episode metadata %s: %s", repo_id, normalize_episode_metadata(root))
+    except Exception as exc:  # tidying must not fail a merge that worked
+        logger.warning("Could not normalize episode metadata for %s: %s", repo_id, exc)

@@ -58,10 +58,10 @@ const DatasetCombobox: React.FC<Props> = ({ datasets, loading, value, onChange }
           className="bg-gray-800 border-gray-600 text-white"
         />
         <Button onClick={submitCustom} disabled={!REPO_ID_RE.test(customValue.trim())}>
-          使用
+          Use
         </Button>
         <Button variant="ghost" onClick={() => setCustomMode(false)}>
-          取消
+          Cancel
         </Button>
       </div>
     );
@@ -77,7 +77,7 @@ const DatasetCombobox: React.FC<Props> = ({ datasets, loading, value, onChange }
             aria-expanded={open}
             className="w-full justify-between bg-gray-800 border-gray-600 text-white hover:bg-gray-700"
           >
-            {value ?? (loading ? "加载数据集…" : "选择数据集…")}
+            {value ?? (loading ? "Loading datasets…" : "Select dataset…")}
             <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
           </Button>
         </PopoverTrigger>
@@ -102,7 +102,7 @@ const DatasetCombobox: React.FC<Props> = ({ datasets, loading, value, onChange }
                   className="text-purple-300 aria-selected:bg-gray-700"
                 >
                   <Pencil className="mr-2 h-4 w-4" />
-                  手动输入 Hub 数据集 ID…
+                  Enter Hub dataset ID manually…
                 </CommandItem>
               </CommandGroup>
             </CommandList>
@@ -114,7 +114,7 @@ const DatasetCombobox: React.FC<Props> = ({ datasets, loading, value, onChange }
         onClick={() => setCustomMode(true)}
         className="mt-1 text-xs text-purple-300 hover:text-purple-200 underline"
       >
-        手动输入 Hub 数据集 ID（org/repo）…
+        Enter Hub dataset ID manually (org/repo)…
       </button>
     </div>
   );
