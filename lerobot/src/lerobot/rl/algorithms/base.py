@@ -28,7 +28,7 @@ from huggingface_hub.errors import HfHubHTTPError
 from safetensors.torch import load_file as load_safetensors, save_file as save_safetensors
 from torch.optim import Optimizer
 
-from lerobot.types import BatchType
+from lerobot.lerobot_types import BatchType
 from lerobot.utils.hub import HubMixin
 
 from .configs import RLAlgorithmConfig, TrainingStats
@@ -192,8 +192,6 @@ class RLAlgorithm(HubMixin, abc.ABC):
                     revision=revision,
                     cache_dir=cache_dir,
                     force_download=force_download,
-                    proxies=proxies,
-                    resume_download=resume_download,
                     token=token,
                     local_files_only=local_files_only,
                 )

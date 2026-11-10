@@ -141,14 +141,14 @@ from .utils.hf_auth import cached_whoami, handle_hf_auth_status, handle_hf_login
 from .utils.system import (
     handle_get_cuda_status,
     handle_get_policy_extra,
+    handle_get_trackio_extra,
     handle_get_training_extra,
-    handle_get_wandb_extra,
     handle_install_policy_extra,
     handle_install_policy_extra_status,
+    handle_install_trackio_extra,
+    handle_install_trackio_extra_status,
     handle_install_training_extra,
     handle_install_training_extra_status,
-    handle_install_wandb_extra,
-    handle_install_wandb_extra_status,
     warn_if_cuda_mismatch,
 )
 
@@ -1500,7 +1500,7 @@ class SSHConfigBody(BaseModel):
     key_path: str | None = None
     remote_python: str = "python"
     remote_workdir: str | None = None
-    wandb_api_key: str | None = None
+    hf_token: str | None = None
     use_cn_mirror: bool = False
 
 
@@ -1549,7 +1549,7 @@ def ssh_configs_create(body: SSHConfigBody):
             key_path=body.key_path,
             remote_python=body.remote_python,
             remote_workdir=body.remote_workdir,
-            wandb_api_key=body.wandb_api_key,
+            hf_token=body.hf_token,
             use_cn_mirror=body.use_cn_mirror,
         )
         return result.model_dump()
@@ -1570,7 +1570,7 @@ def ssh_configs_update(config_id: str, body: SSHConfigBody):
             key_path=body.key_path,
             remote_python=body.remote_python,
             remote_workdir=body.remote_workdir,
-            wandb_api_key=body.wandb_api_key,
+            hf_token=body.hf_token,
             use_cn_mirror=body.use_cn_mirror,
             config_id=config_id,
         )
@@ -1726,22 +1726,22 @@ def install_training_extra_status():
     return handle_install_training_extra_status()
 
 
-@app.get("/system/wandb-extra")
-def get_wandb_extra():
-    """Return whether the `wandb` package is importable in this lelab process."""
-    return handle_get_wandb_extra()
+@app.get("/system/trackio-extra")
+def get_trackio_extra():
+    """Return whether the `trackio` package is importable in this lelab process."""
+    return handle_get_trackio_extra()
 
 
-@app.post("/system/wandb-extra/install")
-def install_wandb_extra():
-    """Spawn `pip install wandb` as a background subprocess. No-op if already running."""
-    return handle_install_wandb_extra()
+@app.post("/system/trackio-extra/install")
+def install_trackio_extra():
+    """Spawn `pip install trackio` as a background subprocess. No-op if already running."""
+    return handle_install_trackio_extra()
 
 
-@app.get("/system/wandb-extra/install-status")
-def install_wandb_extra_status():
-    """Return current wandb install state plus any pending log lines (drained on read)."""
-    return handle_install_wandb_extra_status()
+@app.get("/system/trackio-extra/install-status")
+def install_trackio_extra_status():
+    """Return current trackio install state plus any pending log lines (drained on read)."""
+    return handle_install_trackio_extra_status()
 
 
 @app.get("/system/policy-extra/{policy_type}")

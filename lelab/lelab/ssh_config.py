@@ -49,7 +49,7 @@ class SSHConfig(BaseModel):
     key_path: str | None = None
     remote_python: str = "python"
     remote_workdir: str | None = None
-    wandb_api_key: str | None = None
+    hf_token: str | None = None
     use_cn_mirror: bool = False
 
 
@@ -65,7 +65,7 @@ class SSHConfigPublic(BaseModel):
     key_path: str | None
     remote_python: str
     remote_workdir: str | None
-    has_wandb_api_key: bool
+    has_hf_token: bool
     use_cn_mirror: bool
 
 
@@ -75,6 +75,18 @@ def _load_all() -> list[dict]:
     try:
         data = json.loads(_SSH_CONFIGS_PATH.read_text())
         if isinstance(data, list):
+            # Hosts saved while LeLab tracked runs with W&B still carry that
+            # key. It is a different credential from an HF token, so drop it
+            # rather than let a dead secret sit in the file forever.
+            dropped = False
+            for raw in data:
+                if raw.pop("wandb_api_key", None) is not None:
+                    dropped = True
+            if dropped:
+                try:
+                    _save_all(data)
+                except Exception as exc:
+                    logger.warning("Failed to clean legacy SSH configs: %s", exc)
             return data
     except Exception as exc:
         logger.warning("Failed to read SSH configs: %s", exc)
@@ -102,7 +114,7 @@ def list_ssh_configs() -> list[SSHConfigPublic]:
                     key_path=cfg.key_path,
                     remote_python=cfg.remote_python,
                     remote_workdir=cfg.remote_workdir,
-                    has_wandb_api_key=cfg.wandb_api_key is not None,
+                    has_hf_token=cfg.hf_token is not None,
                     use_cn_mirror=cfg.use_cn_mirror,
                 )
             )
@@ -141,7 +153,7 @@ def save_ssh_config(
     key_path: str | None = None,
     remote_python: str = "python",
     remote_workdir: str | None = None,
-    wandb_api_key: str | None = None,
+    hf_token: str | None = None,
     use_cn_mirror: bool = False,
     config_id: str | None = None,
 ) -> SSHConfigPublic:
@@ -161,7 +173,7 @@ def save_ssh_config(
                     key_path=key_path,
                     remote_python=remote_python,
                     remote_workdir=remote_workdir,
-                    wandb_api_key=wandb_api_key if wandb_api_key is not None else existing.wandb_api_key,
+                    hf_token=hf_token if hf_token is not None else existing.hf_token,
                     use_cn_mirror=use_cn_mirror,
                 )
                 configs[i] = updated.model_dump()
@@ -180,7 +192,7 @@ def save_ssh_config(
         key_path=key_path,
         remote_python=remote_python,
         remote_workdir=remote_workdir,
-        wandb_api_key=wandb_api_key,
+        hf_token=hf_token,
         use_cn_mirror=use_cn_mirror,
     )
     configs.append(cfg.model_dump())
@@ -266,6 +278,6 @@ def _to_public(cfg: SSHConfig) -> SSHConfigPublic:
         key_path=cfg.key_path,
         remote_python=cfg.remote_python,
         remote_workdir=cfg.remote_workdir,
-        has_wandb_api_key=cfg.wandb_api_key is not None,
+        has_hf_token=cfg.hf_token is not None,
         use_cn_mirror=cfg.use_cn_mirror,
     )

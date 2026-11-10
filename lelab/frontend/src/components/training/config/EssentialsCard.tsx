@@ -14,7 +14,7 @@ import {
 import { ConfigComponentProps } from '../types';
 import DatasetCombobox from '@/components/replay/DatasetCombobox';
 import { DatasetItem } from '@/lib/replayApi';
-import WandbInstallDialog from '../WandbInstallDialog';
+import TrackioInstallDialog from '../TrackioInstallDialog';
 import { useApi } from '@/contexts/ApiContext';
 
 interface EssentialsCardProps extends ConfigComponentProps {
@@ -24,31 +24,31 @@ interface EssentialsCardProps extends ConfigComponentProps {
 
 const EssentialsCard: React.FC<EssentialsCardProps> = ({ config, updateConfig, datasets, datasetsLoading }) => {
   const { baseUrl, fetchWithHeaders } = useApi();
-  const [wandbDialogOpen, setWandbDialogOpen] = useState(false);
-  const [wandbInstallHint, setWandbInstallHint] = useState('pip install wandb');
+  const [trackioDialogOpen, setTrackioDialogOpen] = useState(false);
+  const [trackioInstallHint, setTrackioInstallHint] = useState('pip install trackio');
 
-  const handleWandbToggle = async (checked: boolean) => {
+  const handleTrackioToggle = async (checked: boolean) => {
     if (!checked) {
-      updateConfig('wandb_enable', false);
+      updateConfig('trackio_enable', false);
       return;
     }
-    // Check availability before flipping the switch on. If wandb isn't
+    // Check availability before flipping the switch on. If trackio isn't
     // importable in this lelab process, surface the same install flow used
     // for the training extra (accelerate) instead of letting the user start
     // a run that will fail.
     try {
-      const r = await fetchWithHeaders(`${baseUrl}/system/wandb-extra`);
+      const r = await fetchWithHeaders(`${baseUrl}/system/trackio-extra`);
       const data: { available: boolean; install_hint: string } = await r.json();
       if (data.available) {
-        updateConfig('wandb_enable', true);
+        updateConfig('trackio_enable', true);
       } else {
-        setWandbInstallHint(data.install_hint);
-        setWandbDialogOpen(true);
+        setTrackioInstallHint(data.install_hint);
+        setTrackioDialogOpen(true);
       }
     } catch {
       // Backend unreachable — let the user proceed; training start will
-      // surface the real error if wandb is genuinely missing.
-      updateConfig('wandb_enable', true);
+      // surface the real error if trackio is genuinely missing.
+      updateConfig('trackio_enable', true);
     }
   };
 
@@ -145,33 +145,33 @@ const EssentialsCard: React.FC<EssentialsCardProps> = ({ config, updateConfig, d
 
           <div className="flex items-center space-x-3 pt-6">
             <Switch
-              id="wandb_enable"
-              checked={config.wandb_enable}
-              onCheckedChange={handleWandbToggle}
+              id="trackio_enable"
+              checked={config.trackio_enable}
+              onCheckedChange={handleTrackioToggle}
               className="data-[state=checked]:bg-green-500"
             />
-            <Label htmlFor="wandb_enable" className="text-slate-300">
-              启用 Weights & Biases
+            <Label htmlFor="trackio_enable" className="text-slate-300">
+              启用 Trackio
             </Label>
           </div>
         </div>
 
-        <WandbInstallDialog
-          open={wandbDialogOpen}
-          onOpenChange={setWandbDialogOpen}
-          installHint={wandbInstallHint}
+        <TrackioInstallDialog
+          open={trackioDialogOpen}
+          onOpenChange={setTrackioDialogOpen}
+          installHint={trackioInstallHint}
         />
 
-        {config.wandb_enable && (
+        {config.trackio_enable && (
           <div>
-            <Label htmlFor="wandb_project" className="text-slate-300">
-              W&B 项目名 Project Name
+            <Label htmlFor="trackio_project" className="text-slate-300">
+              Trackio 项目名 Project Name
             </Label>
             <Input
-              id="wandb_project"
-              value={config.wandb_project || ''}
+              id="trackio_project"
+              value={config.trackio_project || ''}
               onChange={(e) =>
-                updateConfig('wandb_project', e.target.value || undefined)
+                updateConfig('trackio_project', e.target.value || undefined)
               }
               placeholder="my-robotics-project"
               className="bg-slate-900 border-slate-600 text-white rounded-lg"

@@ -24,13 +24,12 @@ export interface TrainingConfig {
   resume: boolean;
   resume_from_job_id?: string;
 
-  // Weights & Biases
-  wandb_enable: boolean;
-  wandb_project?: string;
-  wandb_entity?: string;
-  wandb_notes?: string;
-  wandb_mode?: string;
-  wandb_disable_artifact: boolean;
+  // Trackio
+  trackio_enable: boolean;
+  trackio_project?: string;
+  trackio_space_id?: string;
+  trackio_private: boolean;
+  trackio_disable_artifact: boolean;
 
   // Policy-specific parameters
   policy_device?: string;

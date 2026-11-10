@@ -121,8 +121,6 @@ class JobRecord(BaseModel):
     hf_flavor: str | None = None
     hf_repo_id: str | None = None
     hf_job_url: str | None = None
-    # Captured from training stdout the first time wandb prints the run URL.
-    wandb_run_url: str | None = None
     # Number of checkpoints currently visible (local: filesystem; cloud:
     # Hub repo). Filled in by JobRegistry.list/get; persisted as zero.
     checkpoint_count: int = 0
@@ -137,6 +135,26 @@ class JobRecord(BaseModel):
     # export_checkpoint. Persisted so the job card can keep showing a
     # "已下载到本地" status across reloads and server restarts.
     exported_steps: list[int] = []
+
+    @property
+    def trackio_run_url(self) -> str | None:
+        """Where to watch this run's Trackio logs, or None for local-only runs.
+
+        Trackio logs to a local SQLite database and prints no URL; the one
+        reachable link is the Space it syncs to, whose address is derived from
+        the space id rather than scraped from stdout.
+        """
+        if not self.config.trackio_enable:
+            return None
+        return trackio_space_url(self.config.trackio_space_id)
+
+
+def trackio_space_url(space_id: str | None) -> str | None:
+    if not space_id or "/" not in space_id:
+        return None
+    namespace, name = space_id.split("/", 1)
+    subdomain = f"{namespace}-{name}".lower().replace("_", "-").replace(".", "-")
+    return f"https://{subdomain}.hf.space/"
 
 
 class JobCheckpoint(BaseModel):
@@ -185,21 +203,10 @@ class JobRunner(Protocol):
     def is_running(self) -> bool: ...
     def returncode(self) -> int | None: ...
     def stream_log_lines(self) -> list[LogLine]: ...
-    def wandb_run_url(self) -> str | None: ...
 
 
 # tqdm progress: "Training:   1%|▏         | 125/10000 [02:02<2:36:10,  1.05step/s]"
 _TQDM_RE = re.compile(r"Training:\s*\d+%[^|]*\|[^|]*\|\s*(\d+)/(\d+)\s*\[(?:[\d:]+)<([\d:]+)")
-
-# Wandb prints something like "wandb: 🚀 View run at https://wandb.ai/<entity>/<project>/runs/<id>"
-# when it boots. We capture the first URL of that shape we see.
-_WANDB_URL_RE = re.compile(r"https://wandb\.ai/[^\s/]+/[^\s/]+/runs/[A-Za-z0-9]+")
-
-
-def extract_wandb_run_url(line: str) -> str | None:
-    match = _WANDB_URL_RE.search(line)
-    return match.group(0) if match else None
-
 
 def _parse_duration(s: str) -> float | None:
     """Parse tqdm's HH:MM:SS or MM:SS into seconds. Returns None on '?'."""
@@ -274,7 +281,6 @@ class SubprocessJobRunner:
         self._stop_event = threading.Event()
         self._log_file_path = log_file_path
         self._log_file = None  # type: ignore[assignment]
-        self._wandb_run_url: str | None = None
 
     def _open_log_file(self) -> None:
         """Open the persistent log sink (one JSON line per consumed line).
@@ -351,9 +357,6 @@ class SubprocessJobRunner:
             pass
         return out
 
-    def wandb_run_url(self) -> str | None:
-        return self._wandb_run_url
-
     # -- internals --
 
     def _on_line(self, line: str) -> None:
@@ -373,10 +376,6 @@ class SubprocessJobRunner:
                 if not stripped:
                     continue
                 parse_metrics_into(stripped, self._metrics)
-                if self._wandb_run_url is None:
-                    url = extract_wandb_run_url(stripped)
-                    if url is not None:
-                        self._wandb_run_url = url
                 self._on_line(stripped)
                 log_line = LogLine(timestamp=time.time(), message=stripped)
                 if self._log_file is not None:
@@ -450,7 +449,6 @@ class TailingJobRunner:
         # Replay everything that's already on disk so the parser catches up
         # on metrics, then tail from the current EOF.
         self._tail_offset = 0
-        self._wandb_run_url: str | None = None
 
     def start(self, job_id: str, config: TrainingRequest, output_dir: str) -> None:
         # Required by JobRunner Protocol but irrelevant here; the subprocess
@@ -494,9 +492,6 @@ class TailingJobRunner:
     def pid(self) -> int | None:
         return self._pid
 
-    def wandb_run_url(self) -> str | None:
-        return self._wandb_run_url
-
     # -- internals --
 
     def _tail_loop(self) -> None:
@@ -524,10 +519,6 @@ class TailingJobRunner:
                         except Exception:
                             continue
                         parse_metrics_into(log_line.message, self._metrics)
-                        if self._wandb_run_url is None:
-                            url = extract_wandb_run_url(log_line.message)
-                            if url is not None:
-                                self._wandb_run_url = url
                         if self._log_queue.qsize() >= 1000:
                             with contextlib.suppress(Empty):
                                 self._log_queue.get_nowait()
@@ -939,7 +930,7 @@ class JobRegistry:
         self._on_change: Callable[[], None] | None = None
 
         # Fired from the watchdog at ~1Hz with a compact snapshot of every
-        # running job (id, state, metrics, wandb url, checkpoint count) so
+        # running job (id, state, metrics, trackio url, checkpoint count) so
         # the dashboard keeps the progress bar live without refetching /jobs.
         self._on_progress: Callable[[builtins.list[dict]], None] | None = None
 
@@ -2554,7 +2545,7 @@ print(json.dumps(out))
                     record.remote_unconfirmed = False
                     record.error_message = (
                         f"连续 {record.reconcile_attempts} 次重连 pod 都失败，已停止自动对账。"
-                        "训练状态请查 wandb，或重连后手动重新打开该任务。"
+                        "训练状态请查 Trackio 面板，或重连后手动重新打开该任务。"
                     )
                     self._write_meta(record)
                     continue
@@ -2603,13 +2594,6 @@ print(json.dumps(out))
             if runner is None or record is None:
                 continue
             if runner.is_running():
-                # Pull the wandb run URL once it appears in stdout.
-                if record.wandb_run_url is None:
-                    url = runner.wandb_run_url()
-                    if url is not None:
-                        with self._lock:
-                            record.wandb_run_url = url
-                        self._persist(record, force=True)
                 # Capture the remote PID once it becomes available (SSH runner
                 # sets it asynchronously after the nohup command starts).
                 if record.process_pid is None:
@@ -2629,7 +2613,7 @@ print(json.dumps(out))
                         "id": record.id,
                         "state": record.state,
                         "metrics": record.metrics.model_dump(),
-                        "wandb_run_url": record.wandb_run_url,
+                        "trackio_run_url": record.trackio_run_url,
                         "checkpoint_count": self._count_checkpoints(record),
                     }
                 )
@@ -2649,8 +2633,6 @@ print(json.dumps(out))
             unconfirmed = getattr(runner, "remote_unconfirmed", None)
             unconfirmed = bool(unconfirmed()) if callable(unconfirmed) else False
             with self._lock:
-                if record.wandb_run_url is None:
-                    record.wandb_run_url = runner.wandb_run_url()
                 if lost_reason:
                     record.state = "interrupted"
                     record.error_message = lost_reason

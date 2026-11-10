@@ -59,7 +59,7 @@ const emptySSHForm: SSHConfigInput = {
   key_path: "",
   remote_python: "",
   remote_workdir: "",
-  wandb_api_key: "",
+  hf_token: "",
   use_cn_mirror: true,
 };
 
@@ -248,7 +248,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
         password: sshForm.password || undefined,
         key_path: sshForm.key_path || undefined,
         remote_workdir: sshForm.remote_workdir || undefined,
-        wandb_api_key: sshForm.wandb_api_key || undefined,
+        hf_token: sshForm.hf_token || undefined,
         use_cn_mirror: true,
       };
       if (editingSSHId) {
@@ -286,7 +286,7 @@ const TargetCard: React.FC<TargetCardProps> = ({
       key_path: cfg.key_path ?? "",
       remote_python: cfg.remote_python,
       remote_workdir: cfg.remote_workdir ?? "",
-      wandb_api_key: "",
+      hf_token: "",
       use_cn_mirror: cfg.use_cn_mirror ?? false,
     });
     setSSHCommandText(`ssh${cfg.port !== 22 ? ` -p ${cfg.port}` : ""} ${cfg.username ? `${cfg.username}@` : ""}${cfg.host}`);
@@ -550,14 +550,14 @@ const TargetCard: React.FC<TargetCardProps> = ({
                   />
                 </div>
                 <div>
-                  <Label className="text-xs text-slate-400">wandb API key</Label>
+                  <Label className="text-xs text-slate-400">HF token</Label>
                   <Input
                     type="password"
-                    value={sshForm.wandb_api_key}
+                    value={sshForm.hf_token}
                     onChange={(e) =>
-                      setSSHForm({ ...sshForm, wandb_api_key: e.target.value })
+                      setSSHForm({ ...sshForm, hf_token: e.target.value })
                     }
-                    placeholder={editingSSHId ? "留空则保持当前 key" : ""}
+                    placeholder={editingSSHId ? "留空则保持当前 token" : "留空则用已登录的 HF 账号"}
                     className="bg-slate-900 border-slate-600 text-white text-sm mt-0.5"
                   />
                 </div>
@@ -664,16 +664,16 @@ const TargetCard: React.FC<TargetCardProps> = ({
 
                     <div className="bg-slate-900/50 rounded-lg p-3 border border-slate-700 space-y-2">
                       <Label className="text-xs text-slate-400">
-                        wandb API key（训练前自动登录）
+                        HF token（Trackio 同步 Space 用）
                       </Label>
                       <div className="flex gap-2">
                         <Input
                           type="password"
-                          value={sshForm.wandb_api_key || ""}
+                          value={sshForm.hf_token || ""}
                           onChange={(e) =>
-                            setSSHForm({ ...sshForm, wandb_api_key: e.target.value })
+                            setSSHForm({ ...sshForm, hf_token: e.target.value })
                           }
-                          placeholder={selectedSSH.has_wandb_api_key ? "••••••••（已配置）" : "输入你的 wandb API key"}
+                          placeholder={selectedSSH.has_hf_token ? "••••••••（已配置）" : "留空则用已登录的 HF 账号"}
                           className="bg-slate-900 border-slate-600 text-white text-sm flex-1"
                         />
                         <Button
@@ -681,17 +681,17 @@ const TargetCard: React.FC<TargetCardProps> = ({
                           size="sm"
                           className="text-xs border-green-600 text-green-400 hover:bg-green-600/20"
                           onClick={async () => {
-                            if (!sshForm.wandb_api_key) return;
+                            if (!sshForm.hf_token) return;
                             try {
                               await updateSSHConfig(baseUrl, fetchWithHeaders, selectedSSH.id, {
                                 ...selectedSSH,
-                                wandb_api_key: sshForm.wandb_api_key,
+                                hf_token: sshForm.hf_token,
                               });
                               toast({
                                 title: "已保存",
-                                description: "wandb API key 已保存",
+                                description: "HF token 已保存",
                               });
-                              setSSHForm({ ...sshForm, wandb_api_key: "" });
+                              setSSHForm({ ...sshForm, hf_token: "" });
                             } catch (e) {
                               toast({
                                 title: "保存失败",
@@ -706,10 +706,10 @@ const TargetCard: React.FC<TargetCardProps> = ({
                       </div>
                       <p className="text-xs text-slate-500">
                         从{" "}
-                        <a href="https://wandb.ai/authorize" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">
-                          wandb.ai/authorize
+                        <a href="https://huggingface.co/settings/tokens" target="_blank" rel="noreferrer" className="text-blue-400 hover:underline">
+                          huggingface.co/settings/tokens
                         </a>
-                        {" "}获取你的 API key
+                        {" "}获取你的 Access Token
                       </p>
                     </div>
 

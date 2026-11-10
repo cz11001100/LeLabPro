@@ -7,11 +7,11 @@ import pytest
 
 @pytest.fixture
 def restore_http_backend():
-    from huggingface_hub.utils import configure_http_backend
-    from huggingface_hub.utils._http import _default_backend_factory
+    from huggingface_hub.utils import set_client_factory
+    from huggingface_hub.utils._http import default_client_factory
 
     yield
-    configure_http_backend(backend_factory=_default_backend_factory)
+    set_client_factory(default_client_factory)
 
 
 def test_videos_upload_one_at_a_time_and_report_each_file(tmp_path) -> None:
@@ -105,29 +105,27 @@ def test_a_video_that_never_uploads_fails_loudly(tmp_path, monkeypatch) -> None:
 
 
 def test_a_stalled_connection_raises_instead_of_parking_forever(restore_http_backend) -> None:
-    """huggingface_hub sends LFS parts with no timeout, so a dead proxy tunnel hangs.
+    """huggingface_hub's client is built with `timeout=None`, so a dead proxy tunnel hangs.
 
     Measured on the live server: 19 minutes frozen on a 57MB video with 0 bytes sent
     and no exception for the retry loop to catch.
     """
-    import requests
+    import httpx2
 
     from huggingface_hub.utils import _http
-    from lelab.record import _pin_upload_timeouts
+    from lelab.record import _UPLOAD_CONNECT_TIMEOUT_S, _UPLOAD_READ_TIMEOUT_S, _pin_upload_timeouts
 
     _pin_upload_timeouts()
 
-    passed: dict[str, object] = {}
+    client = _http.get_session()
+    assert isinstance(client, httpx2.Client)
+    # Timeouts live on the client now, not on each request like the requests backend.
+    assert client.timeout.connect == _UPLOAD_CONNECT_TIMEOUT_S
+    assert client.timeout.read == _UPLOAD_READ_TIMEOUT_S
 
-    class Stalled(requests.adapters.HTTPAdapter):
-        def send(self, request, **kwargs):
-            passed.update(kwargs)
-            raise requests.exceptions.ReadTimeout("the proxy stopped forwarding")
+    def stall(request):
+        raise httpx2.ReadTimeout("the proxy stopped forwarding")
 
-    session = _http.get_session()
-    session.mount("https://", Stalled())
-
-    with pytest.raises(requests.exceptions.ReadTimeout):
-        session.put("https://hf-hub-lfs.s3-accelerate.amazonaws.com/part", data=b"payload")
-
-    assert passed["timeout"] == (10, 30)
+    client._transport = httpx2.MockTransport(stall)
+    with pytest.raises(httpx2.ReadTimeout):
+        client.put("https://hf-hub-lfs.s3-accelerate.amazonaws.com/part", content=b"payload")

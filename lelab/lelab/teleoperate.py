@@ -33,8 +33,6 @@ teleoperation_active = False
 teleoperation_thread: threading.Thread | None = None
 current_robot = None
 current_teleop = None
-current_ema_alpha: float | None = None
-_prev_action: dict | None = None
 # Guards the start path; the worker owns disconnect so stop() does not race.
 _state_lock = threading.Lock()
 
@@ -119,7 +117,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     dying silently in the worker thread while the API has already claimed
     success. Only the teleoperation loop runs in the background thread.
     """
-    global teleoperation_active, teleoperation_thread, current_robot, current_teleop, _prev_action, current_ema_alpha
+    global teleoperation_active, teleoperation_thread, current_robot, current_teleop
 
     from . import record as _record, rollout as _rollout
 
@@ -146,16 +144,14 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         )
 
         # Create robot and teleop configs
-        # EMA is applied in the teleop worker loop (software) so it can be
-        # updated in real time via /update-ema, rather than baked into the
-        # lerobot config at creation time.
+        # EMA lives in the robot's send_action, one implementation shared with
+        # recording and rollout; /update-ema reaches it through current_robot.
         robot_config = SO101FollowerConfig(
             port=request.follower_port,
             id=follower_config_name,
-            ema_alpha=None,
+            ema_alpha=request.ema_alpha,
         )
-        current_ema_alpha = request.ema_alpha
-        logger.info(f"Robot config created (EMA handled in worker, alpha={request.ema_alpha})")
+        logger.info(f"Robot config created (EMA alpha={request.ema_alpha})")
 
         teleop_config = SO101LeaderConfig(
             port=request.leader_port,
@@ -204,12 +200,11 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
 
         current_robot = robot
         current_teleop = teleop_device
-        _prev_action = None
 
         # Stream the arms in the background; the worker owns disconnect so stop()
         # does not race the serial bus from the request thread.
         def teleoperation_worker():
-            global teleoperation_active, current_robot, current_teleop, _prev_action
+            global teleoperation_active, current_robot, current_teleop
 
             logger.info("Starting teleoperation loop...")
             try:
@@ -217,17 +212,7 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 broadcast_interval = 0.05  # 20 FPS
 
                 while teleoperation_active:
-                    action = teleop_device.get_action()
-
-                    alpha = current_ema_alpha
-                    if alpha is not None and _prev_action is not None and set(action.keys()) == set(_prev_action.keys()):
-                        action = {
-                            k: int(round(alpha * v + (1 - alpha) * _prev_action[k]))
-                            for k, v in action.items()
-                        }
-                    _prev_action = dict(action) if action else _prev_action
-
-                    robot.send_action(action)
+                    robot.send_action(teleop_device.get_action())
 
                     current_time = time.time()
                     if current_time - last_broadcast_time >= broadcast_interval:
@@ -254,7 +239,6 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 teleoperation_active = False
                 current_robot = None
                 current_teleop = None
-                _prev_action = None
 
         teleoperation_thread = threading.Thread(
             target=teleoperation_worker, name="teleoperation-worker", daemon=True
@@ -276,7 +260,6 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         teleoperation_active = False
         current_robot = None
         current_teleop = None
-        _prev_action = None
         logger.error(f"Failed to start teleoperation: {e}")
         # str(e) is already a user-facing message for the connection failures
         # raised above; the toast title supplies the "error starting" context.
@@ -325,12 +308,10 @@ class UpdateEmaRequest(BaseModel):
 
 def handle_update_ema(request: UpdateEmaRequest) -> dict[str, Any]:
     """Update the EMA alpha for the active teleop session in real time."""
-    global current_ema_alpha
-
-    if not teleoperation_active:
+    if not teleoperation_active or current_robot is None:
         return {"success": False, "message": "No active teleoperation session"}
 
-    current_ema_alpha = request.ema_alpha
+    current_robot.set_ema_alpha(request.ema_alpha)
     logger.info(f"EMA alpha updated to {request.ema_alpha}")
     return {"success": True, "ema_alpha": request.ema_alpha}
 

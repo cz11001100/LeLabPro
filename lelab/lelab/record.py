@@ -971,35 +971,31 @@ _UPLOAD_READ_TIMEOUT_S = 30
 def _pin_upload_timeouts() -> None:
     """Make a dead connection raise instead of parking the upload thread forever.
 
-    huggingface_hub's LFS part uploads call `http_backoff("PUT", ...)` with no
-    `timeout=`, so requests waits forever. When the local HTTP proxy accepts the
-    CONNECT and then loses its upstream, the socket neither errors nor closes: the
-    thread parks, no exception reaches the retry loop, and the progress bar freezes
-    mid-file (measured: 19 minutes on a 57MB video with 0 bytes sent).
+    huggingface_hub's default client is built with `timeout=None`, so an LFS part
+    upload whose proxy accepted CONNECT and then lost its upstream neither errors
+    nor closes: the thread parks, no exception reaches the retry loop, and the
+    progress bar freezes mid-file (measured: 19 minutes on a 57MB video with 0
+    bytes sent).
     """
-    from huggingface_hub.utils import configure_http_backend
+    import httpx2
+    from huggingface_hub.utils import set_client_factory
+    from huggingface_hub.utils._http import default_client_factory
 
-    try:
-        from huggingface_hub.utils._http import _default_backend_factory as _base_factory
-    except ImportError:  # private helper; a plain session differs only in its adapter
-
-        def _base_factory():
-            import requests
-
-            return requests.Session()
+    timeout = httpx2.Timeout(
+        connect=_UPLOAD_CONNECT_TIMEOUT_S,
+        read=_UPLOAD_READ_TIMEOUT_S,
+        write=_UPLOAD_READ_TIMEOUT_S,
+        pool=_UPLOAD_CONNECT_TIMEOUT_S,
+    )
 
     def _factory():
-        session = _base_factory()
-        request = session.request
+        client = default_client_factory()
+        client.timeout = timeout
+        return client
 
-        def _request_with_timeout(method, url, **kwargs):
-            kwargs.setdefault("timeout", (_UPLOAD_CONNECT_TIMEOUT_S, _UPLOAD_READ_TIMEOUT_S))
-            return request(method, url, **kwargs)
-
-        session.request = _request_with_timeout
-        return session
-
-    configure_http_backend(backend_factory=_factory)
+    # Replaces the shared client as a side effect, so the timeout applies even
+    # when a session was already opened earlier in this process.
+    set_client_factory(_factory)
 
 
 def _push_videos_one_by_one(hub_api, repo_id: str, root_path: Path, video_files, on_progress) -> None:

@@ -156,6 +156,9 @@ class Predictor:
             processed = self.pre(batch)
             obs = {k: v for k, v in processed.items() if k != "action"}
             raw = self.policy.predict_action_chunk(obs)
+            if not torch.is_tensor(raw):
+                # 0.7.0 returns a PolicyOutput ({"action", "prediction"}).
+                raw = raw["action"]
             chunk = self.post(raw.to(self.device)).float().cpu()[0]
         return chunk  # [T, D] degrees
 

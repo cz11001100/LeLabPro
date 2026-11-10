@@ -33,8 +33,8 @@ logger = logging.getLogger(__name__)
 TRAINING_AVAILABLE: bool = importlib.util.find_spec("accelerate") is not None
 TRAINING_INSTALL_HINT: str = "pip install accelerate"
 
-WANDB_AVAILABLE: bool = importlib.util.find_spec("wandb") is not None
-WANDB_INSTALL_HINT: str = "pip install wandb"
+TRACKIO_AVAILABLE: bool = importlib.util.find_spec("trackio") is not None
+TRACKIO_INSTALL_HINT: str = "pip install trackio"
 
 
 def _build_install_cmd(package: str) -> list[str]:
@@ -159,7 +159,7 @@ class InstallManager:
 
 
 training_install_manager = InstallManager("accelerate")
-wandb_install_manager = InstallManager("wandb")
+trackio_install_manager = InstallManager("trackio")
 
 
 def handle_get_training_extra() -> dict[str, Any]:
@@ -174,16 +174,16 @@ def handle_install_training_extra_status() -> dict[str, Any]:
     return training_install_manager.get_status()
 
 
-def handle_get_wandb_extra() -> dict[str, Any]:
-    return {"available": WANDB_AVAILABLE, "install_hint": WANDB_INSTALL_HINT}
+def handle_get_trackio_extra() -> dict[str, Any]:
+    return {"available": TRACKIO_AVAILABLE, "install_hint": TRACKIO_INSTALL_HINT}
 
 
-def handle_install_wandb_extra() -> dict[str, Any]:
-    return wandb_install_manager.start()
+def handle_install_trackio_extra() -> dict[str, Any]:
+    return trackio_install_manager.start()
 
 
-def handle_install_wandb_extra_status() -> dict[str, Any]:
-    return wandb_install_manager.get_status()
+def handle_install_trackio_extra_status() -> dict[str, Any]:
+    return trackio_install_manager.get_status()
 
 
 # --------------------------------------------------------------------------- #

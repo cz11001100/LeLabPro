@@ -120,12 +120,11 @@ function configToRequest(c: TrainingConfig): TrainingRequest {
     save_checkpoint: c.save_checkpoint,
     resume: c.resume,
     resume_from_job_id: c.resume_from_job_id,
-    wandb_enable: c.wandb_enable,
-    wandb_project: c.wandb_project,
-    wandb_entity: c.wandb_entity,
-    wandb_notes: c.wandb_notes,
-    wandb_mode: c.wandb_mode,
-    wandb_disable_artifact: c.wandb_disable_artifact,
+    trackio_enable: c.trackio_enable,
+    trackio_project: c.trackio_project,
+    trackio_space_id: c.trackio_space_id,
+    trackio_private: c.trackio_private,
+    trackio_disable_artifact: c.trackio_disable_artifact,
     policy_device: c.policy_device,
     policy_use_amp: c.policy_use_amp,
     policy_pretrained_path: c.policy_pretrained_path,
@@ -195,9 +194,9 @@ const ConfigurationMode: React.FC = () => {
     save_checkpoint: true,
     resume: false,
     resume_from_job_id: undefined,
-    wandb_enable: false,
-    wandb_mode: "online",
-    wandb_disable_artifact: false,
+    trackio_enable: false,
+    trackio_private: false,
+    trackio_disable_artifact: false,
     policy_device: "cuda",
     policy_use_amp: false,
     use_policy_training_preset: true,
@@ -797,14 +796,14 @@ const MonitoringMode: React.FC<{ jobId: string }> = ({ jobId }) => {
                     View on Hub ↗
                   </a>
                 )}
-                {job.wandb_run_url && (
+                {job.trackio_run_url && (
                   <a
-                    href={job.wandb_run_url}
+                    href={job.trackio_run_url}
                     target="_blank"
                     rel="noreferrer"
-                    className="text-xs text-yellow-300 hover:text-yellow-200 underline"
+                    className="text-xs text-emerald-300 hover:text-emerald-200 underline"
                   >
-                    View on W&B ↗
+                    View on Trackio ↗
                   </a>
                 )}
               </div>

@@ -23,13 +23,16 @@ import torch.nn as nn
 import torchvision.transforms.functional as tvf
 from torchvision.transforms.functional import InterpolationMode
 
+from lerobot.utils.device_utils import auto_select_torch_device
 from lerobot.utils.import_utils import _transformers_available, require_package
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoModel, AutoTokenizer
+    from transformers.utils import is_flash_attn_2_available
 else:
     AutoModel = None
     AutoTokenizer = None
+    is_flash_attn_2_available = None
 
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
@@ -107,9 +110,9 @@ class InternVL3Embedder(nn.Module):
         self,
         model_name="OpenGVLab/InternVL3-1B-hf",
         image_size=448,
-        device="cuda",
+        device: str | torch.device | None = None,
         num_language_layers: int | None = 14,
-        model_dtype: str | torch.dtype = "bfloat16",
+        model_dtype: torch.dtype = torch.bfloat16,
         use_flash_attn: bool = True,
         max_text_length: int = 1024,
         enable_gradient_checkpointing: bool = True,
@@ -117,7 +120,7 @@ class InternVL3Embedder(nn.Module):
         hub_kwargs: dict | None = None,
     ):
         super().__init__()
-        self._requested_device = device
+        self._requested_device = device if device is not None else auto_select_torch_device()
         self.image_size = image_size
         self.num_language_layers = num_language_layers
         self.max_text_length = max_text_length
@@ -128,16 +131,15 @@ class InternVL3Embedder(nn.Module):
         require_package("transformers", extra="evo1")
 
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, **hub_kwargs)
-        if isinstance(model_dtype, str):
-            try:
-                model_dtype = getattr(torch, model_dtype)
-            except AttributeError as exc:
-                raise ValueError(f"Unsupported EVO1 vlm_dtype '{model_dtype}'") from exc
         self.model_dtype = model_dtype
 
-        attn_implementation = "flash_attention_2" if (use_flash_attn and _flash_attn_available()) else "eager"
+        attn_implementation = (
+            "flash_attention_2" if (use_flash_attn and is_flash_attn_2_available()) else "eager"
+        )
         if use_flash_attn and attn_implementation == "eager":
-            logger.warning("flash_attn is not installed. Falling back to eager attention.")
+            logger.warning(
+                "Flash Attention 2 is unavailable on this runtime. Falling back to eager attention."
+            )
 
         self.model = AutoModel.from_pretrained(
             model_name,
@@ -359,11 +361,3 @@ class InternVL3Embedder(nn.Module):
     @property
     def device(self) -> torch.device:
         return next(self.model.parameters()).device
-
-
-def _flash_attn_available() -> bool:
-    try:
-        import flash_attn  # noqa: F401
-    except ModuleNotFoundError:
-        return False
-    return True

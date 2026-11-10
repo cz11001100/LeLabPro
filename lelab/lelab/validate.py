@@ -233,6 +233,10 @@ def _predict(policy, preprocessor, postprocessor, batch, device, want_loss: bool
         t0 = time.perf_counter()
         pred = policy.predict_action_chunk(obs)
         elapsed = time.perf_counter() - t0
+        if not torch.is_tensor(pred):
+            # 0.7.0 returns a PolicyOutput ({"action", "prediction"}) for policies
+            # that also emit a prediction.
+            pred = pred["action"]
         pred = postprocessor(pred.to(device))
         loss = None
         if want_loss:

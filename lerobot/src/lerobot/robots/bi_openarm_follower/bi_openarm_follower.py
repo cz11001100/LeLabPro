@@ -17,7 +17,7 @@
 import logging
 from functools import cached_property
 
-from lerobot.types import RobotAction, RobotObservation
+from lerobot.lerobot_types import RobotAction, RobotObservation
 from lerobot.utils.bimanual import BimanualMixin
 from lerobot.utils.decorators import check_if_not_connected
 
@@ -92,6 +92,9 @@ class BiOpenArmFollower(BimanualMixin, Robot):
 
         self.left_arm = OpenArmFollower(left_arm_config)
         self.right_arm = OpenArmFollower(right_arm_config)
+        self.supports_position_hold = (
+            self.left_arm.supports_position_hold and self.right_arm.supports_position_hold
+        )
 
         # Only for compatibility with other parts of the codebase that expect a `robot.cameras` attribute
         self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}

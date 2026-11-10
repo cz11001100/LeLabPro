@@ -500,66 +500,46 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
             )}
           </section>
 
-          {config.wandb_enable && (
+          {config.trackio_enable && (
             <>
               <Separator className="bg-slate-700" />
               <section className="space-y-4">
-                <SectionHeading>Weights & Biases</SectionHeading>
+                <SectionHeading>Trackio</SectionHeading>
                 <div>
-                  <Label htmlFor="wandb_entity" className="text-slate-300">
-                    W&B Entity (optional)
+                  <Label htmlFor="trackio_space_id" className="text-slate-300">
+                    Trackio Space (远端训练必填)
                   </Label>
                   <Input
-                    id="wandb_entity"
-                    value={config.wandb_entity || ''}
+                    id="trackio_space_id"
+                    value={config.trackio_space_id || ''}
                     onChange={(e) =>
-                      updateConfig('wandb_entity', e.target.value || undefined)
+                      updateConfig('trackio_space_id', e.target.value || undefined)
                     }
-                    placeholder="your-username"
+                    placeholder="your-username/trackio-runs"
                     className="bg-slate-900 border-slate-600 text-white rounded-lg"
                   />
-                </div>
-                <div>
-                  <Label htmlFor="wandb_notes" className="text-slate-300">
-                    W&B Notes (optional)
-                  </Label>
-                  <Input
-                    id="wandb_notes"
-                    value={config.wandb_notes || ''}
-                    onChange={(e) =>
-                      updateConfig('wandb_notes', e.target.value || undefined)
-                    }
-                    placeholder="Training run notes..."
-                    className="bg-slate-900 border-slate-600 text-white rounded-lg"
-                  />
-                </div>
-                <div>
-                  <Label htmlFor="wandb_mode" className="text-slate-300">
-                    W&B Mode
-                  </Label>
-                  <Select
-                    value={config.wandb_mode || 'online'}
-                    onValueChange={(value) => updateConfig('wandb_mode', value)}
-                  >
-                    <SelectTrigger id="wandb_mode" className="bg-slate-900 border-slate-600 text-white rounded-lg">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-800 border-slate-600 text-white">
-                      <SelectItem value="online">Online</SelectItem>
-                      <SelectItem value="offline">Offline</SelectItem>
-                      <SelectItem value="disabled">Disabled</SelectItem>
-                    </SelectContent>
-                  </Select>
                 </div>
                 <div className="flex items-center space-x-3">
                   <Switch
-                    id="wandb_disable_artifact"
-                    checked={config.wandb_disable_artifact}
+                    id="trackio_private"
+                    checked={config.trackio_private}
                     onCheckedChange={(checked) =>
-                      updateConfig('wandb_disable_artifact', checked)
+                      updateConfig('trackio_private', checked)
                     }
                   />
-                  <Label htmlFor="wandb_disable_artifact" className="text-slate-300">
+                  <Label htmlFor="trackio_private" className="text-slate-300">
+                    Private Space
+                  </Label>
+                </div>
+                <div className="flex items-center space-x-3">
+                  <Switch
+                    id="trackio_disable_artifact"
+                    checked={config.trackio_disable_artifact}
+                    onCheckedChange={(checked) =>
+                      updateConfig('trackio_disable_artifact', checked)
+                    }
+                  />
+                  <Label htmlFor="trackio_disable_artifact" className="text-slate-300">
                     Disable Artifacts
                   </Label>
                 </div>
@@ -567,7 +547,7 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
             </>
           )}
 
-          {!config.wandb_enable && <Separator className="bg-slate-700" />}
+          {!config.trackio_enable && <Separator className="bg-slate-700" />}
 
           {/* Misc */}
           <section className="space-y-4">

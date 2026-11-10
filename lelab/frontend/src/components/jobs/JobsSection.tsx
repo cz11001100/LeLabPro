@@ -374,7 +374,7 @@ const JobsSection: React.FC = () => {
           ...j,
           state: s.state,
           metrics: s.metrics,
-          wandb_run_url: s.wandb_run_url,
+          trackio_run_url: s.trackio_run_url,
           checkpoint_count: s.checkpoint_count,
         };
       });

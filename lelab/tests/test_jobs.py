@@ -21,18 +21,36 @@ import json as _json
 import pytest
 
 
-def test_extract_wandb_run_url_finds_canonical_url() -> None:
-    from lelab.jobs import extract_wandb_run_url
+def test_trackio_space_url_is_derived_from_the_space_id() -> None:
+    from lelab.jobs import trackio_space_url
 
-    line = "wandb: \U0001f680 View run at https://wandb.ai/me/myproj/runs/abc123 trailing text"
-    assert extract_wandb_run_url(line) == "https://wandb.ai/me/myproj/runs/abc123"
+    # Trackio prints no run URL; the Space address is the only reachable link,
+    # and it is deterministic from the id (subdomain rules live in trackio).
+    assert trackio_space_url("me/my_runs") == "https://me-my-runs.hf.space/"
+    assert trackio_space_url("Me/My.Runs") == "https://me-my-runs.hf.space/"
+    assert trackio_space_url(None) is None
+    assert trackio_space_url("no-namespace") is None
 
 
-def test_extract_wandb_run_url_returns_none_when_absent() -> None:
-    from lelab.jobs import extract_wandb_run_url
+def test_job_record_exposes_a_trackio_url_only_when_enabled() -> None:
+    from lelab.jobs import JobRecord
+    from lelab.train import TrainingRequest
 
-    assert extract_wandb_run_url("nothing here") is None
-    assert extract_wandb_run_url("https://example.com/runs/abc") is None
+    base = dict(id="j1", name="n", state="running", output_dir="/tmp", started_at=0.0)
+    off = JobRecord(config=TrainingRequest(dataset_repo_id="x"), **base)
+    assert off.trackio_run_url is None
+
+    no_space = JobRecord(
+        config=TrainingRequest(dataset_repo_id="x", trackio_enable=True),
+        **base,
+    )
+    assert no_space.trackio_run_url is None
+
+    with_space = JobRecord(
+        config=TrainingRequest(dataset_repo_id="x", trackio_enable=True, trackio_space_id="me/runs"),
+        **base,
+    )
+    assert with_space.trackio_run_url == "https://me-runs.hf.space/"
 
 
 def test_parse_duration_handles_mm_ss_and_hh_mm_ss() -> None:

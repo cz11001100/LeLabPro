@@ -41,7 +41,7 @@ import time
 from pathlib import Path
 from queue import Empty, Queue
 
-from ..jobs import JobRunner, LogLine, TrainingMetrics, extract_wandb_run_url, parse_metrics_into
+from ..jobs import JobRunner, LogLine, TrainingMetrics, parse_metrics_into
 from ..ssh_config import SSHConfig
 from ..ssh_remote_env import (
     CN_PIP_MIRROR,
@@ -163,7 +163,6 @@ class SSHJobRunner:
         self._log_queue: Queue[LogLine] = Queue()
         self._stop_event = threading.Event()
         self._ssh_thread: threading.Thread | None = None
-        self._wandb_run_url: str | None = None
         self._remote_pid: int | None = None
         self._exit_code: int | None = None
         self._ssh_client = None
@@ -246,15 +245,25 @@ class SSHJobRunner:
         # description) would be split or expanded instead of passed through.
         cmd_str = shlex.join(cmd)
 
-        # If wandb is enabled and API key is configured, authenticate via the
-        # environment. `wandb login` was the old path and broke two ways: the
-        # console script is not on PATH in a non-interactive SSH shell (exit 127
-        # killed the whole `&&` chain before training could start), and it needs
-        # a writable netrc. WANDB_API_KEY is read by wandb.init directly.
-        if config.wandb_enable and self._ssh_config.wandb_api_key:
-            api_key = self._ssh_config.wandb_api_key
-            self._secret = api_key
-            cmd_str = f"export WANDB_API_KEY={self._shell_quote(api_key)} && {cmd_str}"
+        # Trackio needs an HF token to create/sync the Space that outlives the
+        # pod. Prefer the host's own token, else fall back to the account LeLab
+        # is already logged in with — otherwise every host would ask for the
+        # same credential again. Exported rather than logged in: the console
+        # script is not on PATH in a non-interactive SSH shell (exit 127 kills
+        # the whole `&&` chain).
+        if config.trackio_enable and config.trackio_space_id:
+            token = self._ssh_config.hf_token
+            if not token:
+                from huggingface_hub import get_token
+
+                token = get_token()
+            if token:
+                self._secret = token
+                cmd_str = f"export HF_TOKEN={self._shell_quote(token)} && {cmd_str}"
+            else:
+                logger.warning(
+                    "Trackio 已启用 Space 同步，但本机未登录 HF 且该主机没配 token；远端只写本地库，pod 结束后看不到曲线"
+                )
 
         # Ensure FFmpeg is available (required by torchcodec for video decoding).
         # This previously ended in `;` with stderr discarded, so a host that could
@@ -433,9 +442,6 @@ class SSHJobRunner:
             pass
         return out
 
-    def wandb_run_url(self) -> str | None:
-        return self._wandb_run_url
-
     def pid(self) -> int | None:
         return self._remote_pid
 
@@ -583,7 +589,7 @@ class SSHJobRunner:
                 self._exit_code = _EXIT_UNKNOWN
                 self._remote_lost_reason = (
                     "远端已找不到这个任务（日志和退出码都不在）——pod 可能已被回收，或 SSH 配置"
-                    "换到了新 pod。真实结束状态请查 wandb；若之前开了 push_to_hub，checkpoint 在 Hub 上。"
+                    "换到了新 pod。真实结束状态请查 Trackio 面板；若之前开了 push_to_hub，checkpoint 在 Hub 上。"
                 )
                 self._log_error(self._remote_lost_reason)
                 return
@@ -607,7 +613,7 @@ class SSHJobRunner:
                 self._remote_unconfirmed = True
                 self._remote_lost_reason = (
                     "监控连接断开后仍读不到远端退出码，任务状态未知——训练可能还在跑，"
-                    "也可能已经停了。请查 wandb，或重新连接 pod 确认进程是否存活。"
+                    "也可能已经停了。请查 Trackio 面板，或重新连接 pod 确认进程是否存活。"
                 )
                 self._log_error(self._remote_lost_reason)
             logger.info("Reattached training finished with exit code %d", self._exit_code)
@@ -747,7 +753,7 @@ class SSHJobRunner:
                 self._remote_unconfirmed = True
                 self._remote_lost_reason = (
                     "监控结束但读不到远端退出码，任务状态未知——训练可能仍在 pod 上运行。"
-                    "请查 wandb，或重连 pod 看进程是否存活。"
+                    "请查 Trackio 面板，或重连 pod 看进程是否存活。"
                 )
                 self._log_error(self._remote_lost_reason)
             logger.info("Remote training finished with exit code %d", self._exit_code)
@@ -1452,10 +1458,6 @@ class SSHJobRunner:
                 "若仍出现，请手动设置 Dataset revision 为当前提交号，或稍后重试等镜像刷新。"
             )
         parse_metrics_into(stripped, self._metrics)
-        if self._wandb_run_url is None:
-            url = extract_wandb_run_url(stripped)
-            if url is not None:
-                self._wandb_run_url = url
         log_line = LogLine(timestamp=time.time(), message=stripped)
         if self._log_file is not None:
             try:

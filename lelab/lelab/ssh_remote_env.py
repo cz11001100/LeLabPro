@@ -455,7 +455,7 @@ def _env_probe_script() -> str:
         "except Exception as e:\n"
         "    r['torchcodec_error'] = repr(e)[:220]\n"
         "r['training_deps_missing'] = []\n"
-        "for m in ('accelerate', 'datasets', 'wandb'):\n"
+        "for m in ('accelerate', 'datasets', 'trackio'):\n"
         "    try:\n"
         "        __import__(m)\n"
         "    except Exception:\n"
@@ -589,7 +589,7 @@ def diagnose_env(data: dict, *, python_used: str, floor=None, local_version=None
     if data.get("lerobot_installed") and missing_deps:
         add("training_deps_missing", "blocking",
             f"训练依赖缺失：{', '.join(missing_deps)}",
-            "运行「安装环境」（会装 accelerate / datasets / wandb / tensorboard）。", True)
+            "运行「安装环境」（会装 accelerate / datasets / trackio / tensorboard）。", True)
 
     missing_pol = data.get("policies_missing") or []
     if missing_pol and data.get("lerobot_installed"):
@@ -1488,7 +1488,7 @@ def install_lerobot_remote_streaming(
             yield step_result(5, "torchcodec", "done", tc_logs, tc_logs[-1] if tc_logs else "ok")
 
         # ── Step 6: Install training deps ───────────────────────────────────
-        deps = ["accelerate", "wandb", "tensorboard"]
+        deps = ["accelerate", "trackio", "tensorboard"]
         yield step_result(6, "Installing training deps...", "running", [])
         deps_cmd = (
             f"{workdir_prefix}{python} -m pip install"
@@ -1507,11 +1507,11 @@ def install_lerobot_remote_streaming(
         if exit_code != 0:
             yield step_result(6, "Training deps install", "failed", deps_logs,
                               f"Training deps install failed (exit {exit_code})",
-                              hint="accelerate/wandb/tensorboard 装不上通常是网络或磁盘；"
-                                   "其中只有 accelerate 是训练必需，可先跳过 wandb/tensorboard 重试。")
+                              hint="accelerate/trackio/tensorboard 装不上通常是网络或磁盘；"
+                                   "其中只有 accelerate 是训练必需，可先跳过 trackio/tensorboard 重试。")
             return
         yield step_result(6, "Training deps installed", "done", deps_logs,
-                          "accelerate, wandb, tensorboard ready")
+                          "accelerate, trackio, tensorboard ready")
 
         # ── Step 7: Verify ──────────────────────────────────────────────────
         yield step_result(7, "Verifying installation...", "running", [])

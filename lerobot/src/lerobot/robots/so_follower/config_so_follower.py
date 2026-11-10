@@ -35,16 +35,27 @@ class SOFollowerConfig:
     # names to the max_relative_target value for that motor.
     max_relative_target: float | dict[str, float] | None = None
 
-    # EMA low-pass filter on goal positions to reduce leader-follower jitter.
-    # smoothed = alpha * raw + (1 - alpha) * prev.  None disables the filter.
-    # Typical range: 0.3 (very smooth, more lag) to 0.7 (light smoothing).
-    ema_alpha: float | None = None
-
     # cameras
     cameras: dict[str, CameraConfig] = field(default_factory=dict)
 
     # Set to `True` for backward compatibility with previous policies/dataset
     use_degrees: bool = True
+
+    # Position-mode PID gains written to Feetech STS3215 motors at connect time.
+    position_p_coefficient: int = 16
+    position_i_coefficient: int = 0
+    position_d_coefficient: int = 32
+
+    # Number of extra attempts when a `sync_read` of the motors fails. Feetech buses can occasionally
+    # return a corrupted status packet ("Incorrect status packet!"), especially when several joints move
+    # at once, which otherwise aborts the control loop. Retries are immediate (no sleep) and only happen on
+    # failure, so the steady-state read cost is unchanged.
+    num_read_retries: int = 2
+
+    # EMA low-pass filter on goal positions to reduce leader-follower jitter.
+    # smoothed = alpha * raw + (1 - alpha) * prev.  None disables the filter.
+    # Typical range: 0.3 (very smooth, more lag) to 0.7 (light smoothing).
+    ema_alpha: float | None = None
 
 
 @RobotConfig.register_subclass("so101_follower")

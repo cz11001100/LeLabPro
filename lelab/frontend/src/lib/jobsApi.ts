@@ -39,12 +39,11 @@ export interface TrainingRequest {
   save_checkpoint: boolean;
   resume: boolean;
   resume_from_job_id?: string;
-  wandb_enable: boolean;
-  wandb_project?: string;
-  wandb_entity?: string;
-  wandb_notes?: string;
-  wandb_mode?: string;
-  wandb_disable_artifact: boolean;
+  trackio_enable: boolean;
+  trackio_project?: string;
+  trackio_space_id?: string;
+  trackio_private: boolean;
+  trackio_disable_artifact: boolean;
   policy_device?: string;
   policy_use_amp: boolean;
   policy_pretrained_path?: string;
@@ -196,7 +195,7 @@ export interface JobRecord {
   hf_flavor: string | null;
   hf_repo_id: string | null;
   hf_job_url: string | null;
-  wandb_run_url: string | null;
+  trackio_run_url: string | null;
   checkpoint_count: number;
   validation_state: ValidationState;
   validation_results: ValidationResults | null;
@@ -210,7 +209,7 @@ export interface JobProgressSnapshot {
   id: string;
   state: JobState;
   metrics: TrainingMetrics;
-  wandb_run_url: string | null;
+  trackio_run_url: string | null;
   checkpoint_count: number;
 }
 
@@ -444,7 +443,7 @@ export interface SSHConfig {
   key_path: string | null;
   remote_python: string;
   remote_workdir: string | null;
-  has_wandb_api_key: boolean;
+  has_hf_token: boolean;
   use_cn_mirror: boolean;
 }
 
@@ -457,7 +456,7 @@ export interface SSHConfigInput {
   key_path?: string;
   remote_python: string;
   remote_workdir?: string;
-  wandb_api_key?: string;
+  hf_token?: string;
   use_cn_mirror?: boolean;
 }
 
