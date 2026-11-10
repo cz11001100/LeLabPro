@@ -32,7 +32,12 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 from lerobot.scripts.lerobot_record import RecordConfig
 from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
-from .dataset_repair import DatasetRepairError, reindex_episodes_to_contiguous, repair_local_dataset
+from .dataset_repair import (
+    DatasetRepairError,
+    episode_alignment_mismatches,
+    reindex_episodes_to_contiguous,
+    repair_local_dataset,
+)
 from .utils.config import setup_calibration_files, with_lelab_tag
 from .utils.devices import safe_disconnect_device
 
@@ -1336,18 +1341,23 @@ def _assert_resume_index_safe(resume_root: Path) -> None:
     # the data disagrees still collides on resume — an episode whose rows landed
     # but whose metadata row did not is exactly what an interrupted save leaves.
     disagrees = data_indices is not None and sorted(set(data_indices)) != unique
+    try:
+        alignment_errors = episode_alignment_mismatches(resume_root)
+    except DatasetRepairError as e:
+        alignment_errors = [str(e)]
 
-    if duplicates or gaps or disagrees:
+    if duplicates or gaps or disagrees or alignment_errors:
         # The gap/duplicate is recoverable by compacting episode indices to a
         # contiguous 0..N-1 range, so heal it instead of blocking the resume.
         # Re-recorded or mid-deleted datasets hit this constantly; failing here
         # forced users into a manual repair they had no way to trigger.
         logger.info(
-            "RESUME: episode index unsafe (meta rows=%s unique=%s max=%s, data agrees=%s) — reindexing",
+            "RESUME: episode index unsafe (meta rows=%s unique=%s max=%s, data agrees=%s, alignment=%s) — reindexing",
             rows,
             n_unique,
             max_idx,
             not disagrees,
+            alignment_errors or "ok",
         )
         try:
             msg = reindex_episodes_to_contiguous(resume_root)
@@ -1356,7 +1366,8 @@ def _assert_resume_index_safe(resume_root: Path) -> None:
             raise RuntimeError(
                 "Cannot safely resume this dataset: its episode indices are not a "
                 f"contiguous 0..N range (rows={rows}, unique={n_unique}, "
-                f"max_index={max_idx}, data agrees={not disagrees}), and automatic "
+                f"max_index={max_idx}, data agrees={not disagrees}, "
+                f"alignment={alignment_errors}), and automatic "
                 "reindexing failed. Record into a NEW dataset instead, or repair "
                 f"this one so episodes are contiguous before resuming. Details: {e}"
             ) from e
@@ -1366,15 +1377,24 @@ def _assert_resume_index_safe(resume_root: Path) -> None:
         if meta_indices is None:
             return
         data_indices = _read_data_episode_indices(resume_root)
-        still_unsafe = not _index_is_contiguous(meta_indices) or (
-            data_indices is not None and sorted(set(data_indices)) != sorted(set(meta_indices))
+        try:
+            remaining_alignment_errors = episode_alignment_mismatches(resume_root)
+        except DatasetRepairError as e:
+            remaining_alignment_errors = [str(e)]
+        still_unsafe = (
+            not _index_is_contiguous(meta_indices)
+            or (
+                data_indices is not None
+                and sorted(set(data_indices)) != sorted(set(meta_indices))
+            )
+            or bool(remaining_alignment_errors)
         )
         if still_unsafe:
             raise RuntimeError(
-                "Cannot safely resume this dataset: episode indices are still not a "
-                f"contiguous 0..N range after reindexing (rows={len(meta_indices)}, "
-                f"unique={len(set(meta_indices))}, data={data_indices}). "
-                "Record into a NEW dataset instead."
+                "Cannot safely resume this dataset: episode data and metadata are still "
+                f"misaligned after reindexing (rows={len(meta_indices)}, "
+                f"unique={len(set(meta_indices))}, data={data_indices}, "
+                f"alignment={remaining_alignment_errors}). Record into a NEW dataset instead."
             )
 
 

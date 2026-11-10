@@ -85,6 +85,75 @@ def _set_aside_unreadable(path: Path) -> None:
     logger.info("Set aside unreadable file: %s", target)
 
 
+def _read_info_or_recover(root: Path) -> tuple[dict[str, Any], bool]:
+    info_path = root / "meta" / "info.json"
+    if info_path.exists():
+        return json.loads(info_path.read_text()), False
+
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lerobot.datasets.dataset_metadata import CODEBASE_VERSION
+    from lerobot.datasets.feature_utils import create_empty_dataset_info
+    from lerobot.utils.constants import DEFAULT_FEATURES
+
+    if any((root / "videos").rglob("*.mp4")):
+        raise DatasetRepairError(
+            f"{root.name}: info.json is missing; video metadata cannot be reconstructed safely"
+        )
+
+    data_files = sorted((root / "data").rglob("*.parquet"), key=_chunk_file)
+    for path in data_files:
+        try:
+            schema = pq.read_schema(path)
+            timing = pq.read_table(path, columns=["episode_index", "timestamp"]).to_pandas()
+            break
+        except Exception:
+            continue
+    else:
+        raise DatasetRepairError(f"{root.name}: no readable data from which to rebuild info.json")
+
+    features = {}
+    for field in schema:
+        if field.name in DEFAULT_FEATURES:
+            continue
+        value_type = field.type
+        if pa.types.is_fixed_size_list(value_type):
+            shape = (value_type.list_size,)
+            value_type = value_type.value_type
+        elif pa.types.is_numeric(value_type) or pa.types.is_boolean(value_type):
+            shape = (1,)
+        else:
+            raise DatasetRepairError(
+                f"{root.name}: cannot infer feature {field.name} with type {field.type}"
+            )
+        features[field.name] = {
+            "dtype": np.dtype(value_type.to_pandas_dtype()).name,
+            "shape": shape,
+            "names": None,
+        }
+
+    episode_index = timing["episode_index"].to_numpy()
+    timestamp = timing["timestamp"].to_numpy()
+    deltas = np.diff(timestamp)
+    deltas = deltas[(deltas > 0) & (episode_index[1:] == episode_index[:-1])]
+    if not len(deltas):
+        raise DatasetRepairError(f"{root.name}: cannot infer fps from the data timestamps")
+    fps = int(round(1 / float(np.median(deltas))))
+    if fps <= 0:
+        raise DatasetRepairError(f"{root.name}: cannot infer a valid fps from the data timestamps")
+
+    info = create_empty_dataset_info(
+        CODEBASE_VERSION,
+        fps,
+        {**features, **DEFAULT_FEATURES},
+        use_videos=False,
+    ).to_dict()
+    info["total_tasks"] = pq.read_metadata(root / "meta" / "tasks.parquet").num_rows
+    return info, True
+
+
 def _episodes_from_data(root: Path) -> tuple[list[dict[str, Any]], list[Path]]:
     """Reconstruct one row per episode from the readable data files.
 
@@ -383,6 +452,54 @@ def drop_orphan_episode_stat_columns(root: Path, info: dict[str, Any]) -> int:
     return dropped
 
 
+def episode_alignment_mismatches(root: Path) -> list[str]:
+    """Compare episode ids and lengths in metadata with the actual data rows."""
+    from collections import Counter
+
+    import pandas as pd
+    import pyarrow.parquet as pq
+
+    meta_paths = sorted((root / "meta" / "episodes").rglob("*.parquet"), key=_chunk_file)
+    if not meta_paths:
+        return ["episode metadata is missing"]
+
+    try:
+        metadata = pd.concat(
+            [pd.read_parquet(path, columns=["episode_index", "length"]) for path in meta_paths],
+            ignore_index=True,
+        )
+        meta_counts = Counter(int(value) for value in metadata["episode_index"])
+        meta_lengths = {}
+        for row in metadata.itertuples():
+            meta_lengths.setdefault(int(row.episode_index), int(row.length))
+        data_lengths: Counter[int] = Counter()
+        for path in sorted((root / "data").rglob("*.parquet"), key=_chunk_file):
+            values = pq.read_table(path, columns=["episode_index"])["episode_index"].to_pylist()
+            data_lengths.update(int(value) for value in values)
+    except Exception as e:
+        raise DatasetRepairError(f"Cannot verify episode alignment: {e}") from e
+
+    problems = []
+    duplicated = sorted(ep for ep, count in meta_counts.items() if count > 1)
+    if duplicated:
+        problems.append(f"duplicate episode metadata: {duplicated[:8]}")
+
+    mismatched = sorted(set(meta_lengths) ^ set(data_lengths))
+    mismatched += sorted(
+        ep
+        for ep in set(meta_lengths) & set(data_lengths)
+        if meta_lengths[ep] != data_lengths[ep]
+    )
+    for ep in mismatched[:8]:
+        problems.append(
+            f"episode {ep}: metadata length={meta_lengths.get(ep, 'missing')}, "
+            f"data rows={data_lengths[ep] if ep in data_lengths else 'missing'}"
+        )
+    if len(mismatched) > 8:
+        problems.append(f"and {len(mismatched) - 8} more misaligned episodes")
+    return problems
+
+
 def check_dataset_health(repo_id: str) -> dict[str, Any]:
     """Check if a local dataset is healthy or corrupted.
 
@@ -447,7 +564,12 @@ def check_dataset_health(repo_id: str) -> dict[str, Any]:
             except Exception:
                 corrupted_video_files.append(str(path.relative_to(root)))
 
-    healthy = episodes_healthy and len(corrupted_data_files) == 0
+    try:
+        alignment_errors = episode_alignment_mismatches(root)
+    except DatasetRepairError as e:
+        alignment_errors = [str(e)]
+
+    healthy = episodes_healthy and len(corrupted_data_files) == 0 and not alignment_errors
     needs_repair = not healthy
 
     # Estimate corrupted episodes from truncated data files
@@ -480,8 +602,9 @@ def check_dataset_health(repo_id: str) -> dict[str, Any]:
         "total_data_files": total_data_files,
         "corrupted_video_files": corrupted_video_files,
         "total_video_files": total_video_files,
+        "alignment_errors": alignment_errors,
         "needs_repair": needs_repair,
-        "error": episodes_error if not healthy else None,
+        "error": (episodes_error or "; ".join(alignment_errors)) if not healthy else None,
     }
     return result
 
@@ -538,7 +661,8 @@ def repair_local_dataset_with_progress(repo_id: str, force: bool = False) -> str
         if root == cache_root or cache_root not in root.parents:
             raise DatasetRepairError(f"Invalid dataset id: {repo_id}")
 
-        if not (root / "meta" / "info.json").exists():
+        info_missing = not (root / "meta" / "info.json").exists()
+        if info_missing and not (root / "data").is_dir():
             _update_repair_progress(active=False, completed=True, percent=100, phase="Dataset not found")
             return None
 
@@ -548,16 +672,15 @@ def repair_local_dataset_with_progress(repo_id: str, force: bool = False) -> str
         except Exception as e:
             logger.info("%s has no usable episode index (%s) — rebuilding", repo_id, e)
             healthy = False
-        if healthy and not force:
+        if healthy and not force and not info_missing:
             _update_repair_progress(active=False, completed=True, percent=100, phase="Dataset is already healthy")
             return None
 
         _update_repair_progress(phase="Reading data files...", percent=15)
-        info = json.loads((root / "meta" / "info.json").read_text())
+        rows, truncated = _episodes_from_data(root)
+        info, info_recovered = _read_info_or_recover(root)
         fps = info["fps"]
         recorded_episodes = info.get("total_episodes", 0)
-
-        rows, truncated = _episodes_from_data(root)
 
         _update_repair_progress(phase="Assigning video files...", percent=30, total=len(info["features"]))
         video_keys = [k for k, v in info["features"].items() if v["dtype"] == "video"]
@@ -584,6 +707,7 @@ def repair_local_dataset_with_progress(repo_id: str, force: bool = False) -> str
             _update_repair_progress(phase="Trimming orphaned data...", percent=60)
             _trim_data(root, rows[-1]["episode_index"])
 
+        if lost > 0 or info_recovered:
             _update_repair_progress(phase="Recomputing statistics (this may take a few minutes)...", percent=65)
             _recompute_stats(root, info, rows)
 
@@ -594,6 +718,13 @@ def repair_local_dataset_with_progress(repo_id: str, force: bool = False) -> str
         info["total_frames"] = sum(row["length"] for row in rows)
         info["splits"] = {"train": f"0:{len(rows)}"}
         (root / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+
+        alignment_errors = episode_alignment_mismatches(root)
+        if alignment_errors:
+            raise DatasetRepairError(
+                "Repair verification failed; do not resume recording or training: "
+                + "; ".join(alignment_errors)
+            )
 
         message = f"Recovered {len(rows)} episode(s)"
         if lost > 0:
@@ -637,20 +768,21 @@ def repair_local_dataset(repo_id: str) -> str | None:
     if root == cache_root or cache_root not in root.parents:
         raise DatasetRepairError(f"Invalid dataset id: {repo_id}")
 
-    if not (root / "meta" / "info.json").exists():
+    info_missing = not (root / "meta" / "info.json").exists()
+    if info_missing and not (root / "data").is_dir():
         return None
 
-    try:
-        load_episodes(root)
-        return None
-    except Exception as e:
-        logger.info("%s has no usable episode index (%s) — rebuilding it from disk", repo_id, e)
-
-    info = json.loads((root / "meta" / "info.json").read_text())
-    fps = info["fps"]
-    recorded_episodes = info.get("total_episodes", 0)
+    if not info_missing:
+        try:
+            load_episodes(root)
+            return None
+        except Exception as e:
+            logger.info("%s has no usable episode index (%s) — rebuilding it from disk", repo_id, e)
 
     rows, truncated = _episodes_from_data(root)
+    info, info_recovered = _read_info_or_recover(root)
+    fps = info["fps"]
+    recorded_episodes = info.get("total_episodes", 0)
     for video_key, feature in info["features"].items():
         if feature["dtype"] == "video":
             del rows[_assign_videos(rows, root, video_key, fps) :]
@@ -671,6 +803,7 @@ def repair_local_dataset(repo_id: str) -> str | None:
         # Episodes the videos don't cover still have their frames in the
         # readable shards; drop them so data, index and stats agree.
         _trim_data(root, rows[-1]["episode_index"])
+    if lost > 0 or info_recovered:
         _recompute_stats(root, info, rows)
 
     _write_episodes(root, rows)
@@ -679,6 +812,13 @@ def repair_local_dataset(repo_id: str) -> str | None:
     info["total_frames"] = sum(row["length"] for row in rows)
     info["splits"] = {"train": f"0:{len(rows)}"}
     (root / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+
+    alignment_errors = episode_alignment_mismatches(root)
+    if alignment_errors:
+        raise DatasetRepairError(
+            "Repair verification failed; do not resume recording or training: "
+            + "; ".join(alignment_errors)
+        )
 
     message = f"Recovered {len(rows)} episode(s) from an interrupted recording of {repo_id}"
     if lost > 0:
@@ -705,6 +845,7 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
     are dropped; DatasetRepairError is raised only when nothing readable is left.
     """
     import os
+    from collections import Counter
 
     import numpy as np
     import pyarrow as pa
@@ -717,6 +858,7 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
     # leaving it in data/ breaks every reader that globs the directory.
     data_files: list[Path] = []
     present: set[int] = set()
+    data_lengths: Counter[int] = Counter()
     for path in sorted((root / "data").rglob("*.parquet"), key=_chunk_file):
         try:
             col = pq.read_table(path, columns=["episode_index"])["episode_index"].to_pylist()
@@ -726,6 +868,7 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
             continue
         data_files.append(path)
         present.update(int(e) for e in col)
+        data_lengths.update(int(e) for e in col)
 
     if not data_files:
         raise DatasetRepairError(
@@ -740,21 +883,25 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
     # gapped index while the data stayed contiguous — so read it too and treat any
     # disagreement as work to do, not just a non-contiguous data index.
     meta_eps: list[int] | None = None
+    meta_lengths: dict[int, int] | None = None
     try:
         import pandas as pd
 
         ep_parquets = sorted((root / "meta" / "episodes").rglob("*.parquet"))
         if ep_parquets:
             mdf = pd.concat(
-                [pd.read_parquet(p, columns=["episode_index"]) for p in ep_parquets],
+                [pd.read_parquet(p, columns=["episode_index", "length"]) for p in ep_parquets],
                 ignore_index=True,
             )
             meta_eps = sorted(int(e) for e in mdf["episode_index"].tolist())
+            meta_lengths = {}
+            for row in mdf.itertuples():
+                meta_lengths.setdefault(int(row.episode_index), int(row.length))
     except Exception as e:
         logger.warning("reindex: could not read episode metadata (%s)", e)
 
-    if data_contiguous and meta_eps == ordered:
-        return None  # data and metadata already agree on a contiguous 0..N-1
+    if data_contiguous and meta_eps == ordered and meta_lengths == dict(data_lengths):
+        return None  # data and metadata agree on both contiguous ids and per-episode lengths
 
     # Renumber the data shards only when the data itself is gapped/duplicated.
     renumbered = 0
@@ -797,6 +944,8 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
             del rows[_assign_videos(rows, root, video_key, fps) :]
     if not rows:
         raise DatasetRepairError(f"{root.name}: no complete episodes to reindex")
+    if len(rows) < len(ordered):
+        _trim_data(root, rows[-1]["episode_index"])
 
     _recompute_stats(root, info, rows)
     _write_episodes(root, rows)
@@ -805,6 +954,13 @@ def reindex_episodes_to_contiguous(root: Path) -> str | None:
     info["total_frames"] = sum(row["length"] for row in rows)
     info["splits"] = {"train": f"0:{len(rows)}"}
     (root / "meta" / "info.json").write_text(json.dumps(info, indent=4))
+
+    alignment_errors = episode_alignment_mismatches(root)
+    if alignment_errors:
+        raise DatasetRepairError(
+            "Reindex verification failed; do not resume recording or training: "
+            + "; ".join(alignment_errors)
+        )
 
     message = (
         f"Reindexed {len(rows)} episode(s) to a contiguous 0..{len(rows) - 1} range "

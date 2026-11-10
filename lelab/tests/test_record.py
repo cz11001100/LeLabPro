@@ -200,6 +200,27 @@ def test_resume_guard_reindexes_when_data_disagrees_with_metadata(lerobot_cache)
     assert _read_resume_episode_indices(root) == [0, 1, 2]
 
 
+def test_resume_guard_rebuilds_when_episode_lengths_disagree(lerobot_cache) -> None:
+    import pandas as pd
+
+    from lelab.dataset_repair import episode_alignment_mismatches
+    from lelab.record import _assert_resume_index_safe
+
+    root = _tiny_dataset("guard_test/length_mismatch")
+    shard = next((root / "meta" / "episodes").rglob("*.parquet"))
+    episodes = pd.read_parquet(shard)
+    episodes.loc[1, "length"] = 99
+    episodes.to_parquet(shard, index=False)
+
+    assert episode_alignment_mismatches(root)
+
+    _assert_resume_index_safe(root)
+
+    assert episode_alignment_mismatches(root) == []
+    repaired = pd.read_parquet(shard)
+    assert repaired["length"].tolist() == [4, 4, 4]
+
+
 def test_release_free_memory_returns_freed_pages_to_the_os() -> None:
     """The recording loop's real bug: Python frees each episode's frames but glibc
     keeps them in its heap, so RSS climbs until the kernel OOM-kills the session.

@@ -397,46 +397,106 @@ class DatasetWriter:
         """Batch save videos for multiple episodes."""
         if end_episode is None:
             end_episode = self._meta.total_episodes
+        if not 0 <= start_episode < end_episode <= self._meta.total_episodes:
+            raise ValueError(
+                f"Invalid batch episode range {start_episode}:{end_episode} "
+                f"for {self._meta.total_episodes} episodes"
+            )
 
         logger.info(
             f"Batch encoding {self._batch_encoding_size} videos for episodes {start_episode} to {end_episode - 1}"
         )
 
-        chunk_idx = self._meta.episodes[start_episode]["data/chunk_index"]
-        file_idx = self._meta.episodes[start_episode]["data/file_index"]
-        episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
-            chunk_index=chunk_idx, file_index=file_idx
-        )
-        episode_df = pd.read_parquet(episode_df_path)
+        # A ParquetWriter has no footer until it is closed, so the just-saved rows cannot be
+        # read back while it is open. Resetting latest_episode makes the next recorded episode
+        # start a fresh metadata shard instead of overwriting this one when the writer reopens.
+        self._meta._close_writer()
+        self._meta.latest_episode = None
+        self._meta.episodes = load_episodes(self._root)
 
-        for ep_idx in range(start_episode, end_episode):
-            logger.info(f"Encoding videos for episode {ep_idx}")
-
-            if (
-                self._meta.episodes[ep_idx]["data/chunk_index"] != chunk_idx
-                or self._meta.episodes[ep_idx]["data/file_index"] != file_idx
-            ):
-                episode_df.to_parquet(episode_df_path)
-                self._meta.episodes = load_episodes(self._root)
-
-                chunk_idx = self._meta.episodes[ep_idx]["data/chunk_index"]
-                file_idx = self._meta.episodes[ep_idx]["data/file_index"]
-                episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
-                    chunk_index=chunk_idx, file_index=file_idx
-                )
-                episode_df = pd.read_parquet(episode_df_path)
-
-            video_ep_metadata = {}
-            for video_key in self._meta.video_keys:
-                video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
-            video_ep_metadata.pop("episode_index")
-            video_ep_df = pd.DataFrame(video_ep_metadata, index=[ep_idx]).convert_dtypes(
-                dtype_backend="pyarrow"
+        episode_indices = [int(index) for index in self._meta.episodes["episode_index"]]
+        expected_indices = list(range(self._meta.total_episodes))
+        if episode_indices != expected_indices:
+            raise RuntimeError(
+                "Cannot encode videos safely: episode metadata must contain each episode_index "
+                f"exactly once in order 0..{self._meta.total_episodes - 1}, but found "
+                f"{episode_indices}. Rebuild the episode table from the data parquet files first."
             )
 
-            episode_df = episode_df.combine_first(video_ep_df)
-            episode_df.to_parquet(episode_df_path)
-            self._meta.episodes = load_episodes(self._root)
+        if start_episode > 0:
+            previous = self._meta.episodes[start_episode - 1]
+            missing_video = [
+                video_key
+                for video_key in self._meta.video_keys
+                if previous.get(f"videos/{video_key}/chunk_index") is None
+            ]
+            if missing_video:
+                raise RuntimeError(
+                    f"Cannot encode episode {start_episode}: episode {start_episode - 1} has no "
+                    f"video metadata for {missing_video}. Rebuild the episode table before recording."
+                )
+            self._meta.latest_episode = {key: [value] for key, value in previous.items()}
+
+        chunk_idx = None
+        file_idx = None
+        episode_df_path = None
+        episode_df = None
+        try:
+            for ep_idx in range(start_episode, end_episode):
+                logger.info(f"Encoding videos for episode {ep_idx}")
+                episode = self._meta.episodes[ep_idx]
+                ep_chunk_idx = episode["meta/episodes/chunk_index"]
+                ep_file_idx = episode["meta/episodes/file_index"]
+
+                if episode_df is None or ep_chunk_idx != chunk_idx or ep_file_idx != file_idx:
+                    chunk_idx, file_idx = ep_chunk_idx, ep_file_idx
+                    episode_df_path = self._root / DEFAULT_EPISODES_PATH.format(
+                        chunk_index=chunk_idx, file_index=file_idx
+                    )
+                    if not episode_df_path.exists():
+                        raise RuntimeError(
+                            f"Episode {ep_idx} points to missing metadata shard {episode_df_path}. "
+                            "Rebuild the episode table before encoding videos."
+                        )
+                    episode_df = pd.read_parquet(episode_df_path)
+
+                video_ep_metadata = {}
+                for video_key in self._meta.video_keys:
+                    video_ep_metadata.update(self._save_episode_video(video_key, ep_idx))
+                encoded_episode_index = video_ep_metadata.pop("episode_index")
+                if int(encoded_episode_index) != ep_idx:
+                    raise RuntimeError(
+                        f"Video encoder returned episode {encoded_episode_index} while writing episode {ep_idx}"
+                    )
+
+                matches = episode_df.index[episode_df["episode_index"] == ep_idx].tolist()
+                if len(matches) != 1:
+                    raise RuntimeError(
+                        f"Episode {ep_idx} has {len(matches)} rows in {episode_df_path}; expected exactly one. "
+                        "No further metadata was written. Rebuild the episode table from data parquet files."
+                    )
+                video_ep_df = pd.DataFrame(video_ep_metadata, index=[0]).convert_dtypes(
+                    dtype_backend="pyarrow"
+                )
+                for column in video_ep_df.columns:
+                    if column.endswith(("/from_timestamp", "/to_timestamp")):
+                        video_ep_df[column] = video_ep_df[column].astype("float64[pyarrow]")
+                    if column in episode_df.columns:
+                        episode_df[column] = episode_df[column].astype(video_ep_df[column].dtype)
+                    else:
+                        episode_df[column] = pd.Series(
+                            pd.NA, index=episode_df.index, dtype=video_ep_df[column].dtype
+                        )
+                episode_df.loc[matches[0], video_ep_df.columns] = video_ep_df.iloc[0]
+
+                staging_path = episode_df_path.with_name(episode_df_path.name + ".encoding")
+                episode_df.to_parquet(staging_path, index=False)
+                staging_path.replace(episode_df_path)
+                self._meta.episodes = load_episodes(self._root)
+                encoded = self._meta.episodes[ep_idx]
+                self._meta.latest_episode = {key: [value] for key, value in encoded.items()}
+        finally:
+            self._meta.latest_episode = None
 
     def _save_episode_data(self, episode_buffer: dict) -> dict:
         """Save episode data to a parquet file."""
@@ -531,7 +591,7 @@ class DatasetWriter:
             or f"videos/{video_key}/chunk_index" not in self._meta.latest_episode
         ):
             chunk_idx, file_idx = 0, 0
-            if self._meta.episodes is not None and len(self._meta.episodes) > 0:
+            if episode_index != 0 and self._meta.episodes is not None and len(self._meta.episodes) > 0:
                 old_chunk_idx = self._meta.episodes[-1][f"videos/{video_key}/chunk_index"]
                 old_file_idx = self._meta.episodes[-1][f"videos/{video_key}/file_index"]
                 chunk_idx, file_idx = update_chunk_file_indices(

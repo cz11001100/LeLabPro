@@ -39,12 +39,20 @@ def lerobot_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """
     home = tmp_path / "lerobot"
     home.mkdir()
+    monkeypatch.setenv("HF_LEROBOT_HOME", str(home))
     monkeypatch.setattr("lerobot.utils.constants.HF_LEROBOT_HOME", home)
     monkeypatch.setattr("lerobot.datasets.dataset_metadata.HF_LEROBOT_HOME", home)
     return home
 
 
-def _record(repo_id: str, *, video: bool, episodes: int = EPISODES) -> Path:
+def _record(
+    repo_id: str,
+    *,
+    video: bool,
+    episodes: int = EPISODES,
+    batch_encoding_size: int = 1,
+    metadata_buffer_size: int = 10,
+) -> Path:
     """Write a small finished dataset and return its root."""
     from lerobot.datasets import LeRobotDataset
 
@@ -59,7 +67,14 @@ def _record(repo_id: str, *, video: bool, episodes: int = EPISODES) -> Path:
             "names": ["h", "w", "c"],
         }
 
-    dataset = LeRobotDataset.create(repo_id, fps=FPS, features=features, use_videos=video)
+    dataset = LeRobotDataset.create(
+        repo_id,
+        fps=FPS,
+        features=features,
+        use_videos=video,
+        batch_encoding_size=batch_encoding_size,
+        metadata_buffer_size=metadata_buffer_size,
+    )
     for episode in range(episodes):
         for frame in range(FRAMES):
             values = np.full(2, episode * FRAMES + frame, dtype=np.float32)
@@ -132,6 +147,238 @@ def test_missing_episode_index_is_rebuilt_from_the_data_files(lerobot_home: Path
     np.testing.assert_allclose(last["action"].numpy(), np.full(2, EPISODES * FRAMES - 1))
     if video:
         assert tuple(last["observation.images.cam"].shape) == (3, 32, 32)
+
+
+def test_missing_info_is_rebuilt_for_numeric_only_dataset(lerobot_home: Path) -> None:
+    from lelab.dataset_repair import repair_local_dataset
+    from lerobot.datasets import LeRobotDataset
+
+    root = _record(REPO_ID, video=False)
+    shutil.rmtree(root / "meta" / "episodes")
+    (root / "meta" / "info.json").unlink()
+
+    message = repair_local_dataset(REPO_ID)
+
+    assert message is not None
+    repaired = LeRobotDataset(REPO_ID)
+    assert repaired.num_episodes == EPISODES
+    assert repaired.num_frames == EPISODES * FRAMES
+    assert repaired.meta.fps == FPS
+    assert (root / "meta" / "stats.json").exists()
+
+
+def test_missing_info_does_not_discard_existing_videos(lerobot_home: Path) -> None:
+    from lelab.dataset_repair import DatasetRepairError, repair_local_dataset
+
+    root = _record(REPO_ID, video=True)
+    shutil.rmtree(root / "meta" / "episodes")
+    (root / "meta" / "info.json").unlink()
+
+    with pytest.raises(DatasetRepairError, match="video metadata"):
+        repair_local_dataset(REPO_ID)
+
+    assert not (root / "meta" / "info.json").exists()
+
+
+def test_forced_repair_restores_stale_info_and_episode_indices(lerobot_home: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lelab.dataset_repair import repair_local_dataset_with_progress
+    from lerobot.datasets import LeRobotDataset
+
+    root = _record(REPO_ID, video=False)
+    info_path = root / "meta" / "info.json"
+    info = json.loads(info_path.read_text())
+    info["total_episodes"] += 1
+    info["total_frames"] += FRAMES
+    info_path.write_text(json.dumps(info))
+
+    episode_path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    episodes = pq.read_table(episode_path).to_pandas().iloc[1:].copy()
+    episodes.loc[episodes.index[-1], "episode_index"] = EPISODES
+    pq.write_table(pa.Table.from_pandas(episodes, preserve_index=False), episode_path)
+
+    repair_local_dataset_with_progress(REPO_ID, force=True)
+
+    repaired = LeRobotDataset(REPO_ID)
+    assert repaired.num_episodes == EPISODES
+    assert repaired.num_frames == EPISODES * FRAMES
+    assert sorted({int(value) for value in repaired.hf_dataset["episode_index"]}) == list(range(EPISODES))
+
+
+def test_forced_repair_fixes_second_shard_shifted_from_episode_44(lerobot_home: Path) -> None:
+    import pandas as pd
+
+    from lelab.dataset_repair import repair_local_dataset_with_progress
+    from lelab.datasets import analyze_dataset
+
+    root = _record(REPO_ID, video=False, episodes=100)
+    episode_path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    episodes = pd.read_parquet(episode_path)
+    first = episodes.iloc[:43].copy()
+    second = episodes.iloc[43:].copy()
+    second["episode_index"] += 1
+    second["meta/episodes/file_index"] = 1
+    first.to_parquet(episode_path, index=False)
+    second_path = episode_path.with_name("file-001.parquet")
+    second.to_parquet(second_path, index=False)
+
+    analysis = analyze_dataset(REPO_ID)
+    assert "episode_metadata_mismatch" in {a["type"] for a in analysis["anomalies"]}
+    assert analysis["statistics"]["total_frames"] == 100 * FRAMES
+
+    repair_local_dataset_with_progress(REPO_ID, force=True)
+
+    repaired = pd.concat(
+        [pd.read_parquet(path) for path in sorted((root / "meta" / "episodes").rglob("*.parquet"))],
+        ignore_index=True,
+    )
+    data = pd.concat(
+        [pd.read_parquet(path) for path in sorted((root / "data").rglob("*.parquet"))],
+        ignore_index=True,
+    )
+    assert repaired["episode_index"].tolist() == list(range(100))
+    assert repaired["length"].tolist() == data.groupby("episode_index").size().tolist()
+    assert "episode_metadata_mismatch" not in {
+        a["type"] for a in analyze_dataset(REPO_ID)["anomalies"]
+    }
+
+
+def test_analysis_detects_length_mismatch_with_unchanged_total_and_span(lerobot_home: Path) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lelab.datasets import analyze_dataset
+
+    root = _record(REPO_ID, video=False, episodes=3)
+    episode_path = next((root / "meta" / "episodes").rglob("*.parquet"))
+    table = pq.read_table(episode_path)
+    lengths = table.schema.field("length")
+    table = table.set_column(
+        table.schema.get_field_index("length"),
+        lengths,
+        pa.array([FRAMES, FRAMES - 2, FRAMES + 2], type=lengths.type),
+    )
+    pq.write_table(table, episode_path)
+
+    analysis = analyze_dataset(REPO_ID)
+    anomaly_types = {a["type"] for a in analysis["anomalies"]}
+
+    assert "episode_metadata_mismatch" in anomaly_types
+    assert "frame_count_mismatch" not in anomaly_types
+    assert "index_range_mismatch" not in anomaly_types
+
+
+def test_batch_video_encoding_keeps_episode_44_aligned_across_shards(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    import pandas as pd
+    from lerobot.datasets.dataset_writer import DatasetWriter
+    from lerobot.datasets.io_utils import load_episodes
+
+    class Meta(SimpleNamespace):
+        def _close_writer(self):
+            pass
+
+    root = tmp_path / "batch"
+    rows = []
+    for ep in range(100):
+        shard = 0 if ep < 43 else 1
+        rows.append({
+            "episode_index": ep,
+            "length": FRAMES,
+            "data/chunk_index": 0,
+            "data/file_index": shard,
+            "dataset_from_index": ep * FRAMES,
+            "dataset_to_index": (ep + 1) * FRAMES,
+            "meta/episodes/chunk_index": 0,
+            "meta/episodes/file_index": shard,
+        })
+    for shard in (0, 1):
+        path = root / f"meta/episodes/chunk-000/file-{shard:03d}.parquet"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame([row for row in rows if row["meta/episodes/file_index"] == shard]).to_parquet(
+            path, index=False
+        )
+
+    writer = DatasetWriter.__new__(DatasetWriter)
+    writer._root = root
+    writer._batch_encoding_size = 100
+    writer._meta = Meta(
+        episodes=load_episodes(root), total_episodes=100, video_keys=["cam"], latest_episode=None
+    )
+
+    def fake_save(video_key: str, ep: int) -> dict:
+        return {
+            "episode_index": ep,
+            f"videos/{video_key}/chunk_index": 0,
+            f"videos/{video_key}/file_index": 0,
+            f"videos/{video_key}/from_timestamp": ep * 0.2,
+            f"videos/{video_key}/to_timestamp": (ep + 1) * 0.2,
+        }
+
+    writer._save_episode_video = fake_save
+    writer._batch_save_episode_video(0, 100)
+
+    episodes = load_episodes(root)
+    assert len(episodes) == 100
+    assert episodes["episode_index"] == list(range(100))
+    np.testing.assert_allclose(episodes["videos/cam/from_timestamp"], np.arange(100) * 0.2)
+    np.testing.assert_allclose(episodes["videos/cam/to_timestamp"], np.arange(1, 101) * 0.2)
+
+
+def test_batched_recording_survives_repeated_metadata_flushes(lerobot_home: Path) -> None:
+    import pandas as pd
+    from lerobot.datasets import LeRobotDataset
+
+    root = _record(
+        REPO_ID,
+        video=True,
+        episodes=6,
+        batch_encoding_size=2,
+        metadata_buffer_size=3,
+    )
+
+    episodes = pd.concat(
+        [pd.read_parquet(path) for path in sorted((root / "meta" / "episodes").rglob("*.parquet"))],
+        ignore_index=True,
+    )
+    assert episodes["episode_index"].tolist() == list(range(6))
+    assert episodes["length"].tolist() == [FRAMES] * 6
+    assert len(list((root / "meta" / "episodes").rglob("*.parquet"))) == 3
+    np.testing.assert_allclose(
+        np.asarray(episodes["videos/observation.images.cam/from_timestamp"], dtype=np.float64),
+        np.arange(6) * FRAMES / FPS,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        np.asarray(episodes["videos/observation.images.cam/to_timestamp"], dtype=np.float64),
+        np.arange(1, 7) * FRAMES / FPS,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+    repaired = LeRobotDataset(REPO_ID)
+    assert repaired.num_episodes == 6
+    assert repaired.num_frames == 6 * FRAMES
+    last = repaired[repaired.num_frames - 1]
+    assert int(last["episode_index"]) == 5
+    assert tuple(last["observation.images.cam"].shape) == (3, 32, 32)
+
+
+def test_failed_repair_verification_is_not_reported_as_success(
+    lerobot_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from lelab.dataset_repair import DatasetRepairError, repair_local_dataset
+
+    root = _record(REPO_ID, video=False)
+    shutil.rmtree(root / "meta" / "episodes")
+    monkeypatch.setattr("lelab.dataset_repair._write_episodes", lambda root, rows: None)
+
+    with pytest.raises(DatasetRepairError, match="Repair verification failed"):
+        repair_local_dataset(REPO_ID)
 
 
 def test_repair_is_idempotent(lerobot_home: Path) -> None:

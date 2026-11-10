@@ -25,7 +25,10 @@ interface DatasetSummaryCardProps {
 const REBUILDABLE = new Set([
   "index_range_mismatch",
   "duplicate_episode_meta",
+  "episode_metadata_mismatch",
+  "episode_count_mismatch",
   "frame_count_mismatch",
+  "missing_info",
 ]);
 
 const DatasetSummaryCard: React.FC<DatasetSummaryCardProps> = ({

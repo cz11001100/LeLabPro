@@ -200,7 +200,25 @@ def analyze_dataset(repo_id: str) -> dict[str, Any]:
 
     info_json = dataset_root / "meta" / "info.json"
     if not info_json.exists():
-        return {"error": "Dataset meta/info.json not found"}
+        if not (dataset_root / "data").is_dir():
+            return {"error": "Dataset meta/info.json not found"}
+        return {
+            "success": True,
+            "statistics": {
+                "episode_count": 0,
+                "episode_length": {"mean": 0, "std": 0, "min": 0, "max": 0, "median": 0},
+                "action_range": {},
+                "camera_fps": {},
+                "total_frames": 0,
+                "videos_checked": 0,
+            },
+            "anomalies": [{
+                "episode": -1,
+                "type": "missing_info",
+                "severity": "high",
+                "message": "meta/info.json is missing. Rebuild it from the data parquet files.",
+            }],
+        }
 
     import json
     from collections import defaultdict
@@ -286,16 +304,49 @@ def analyze_dataset(repo_id: str) -> dict[str, Any]:
             ),
         })
     ep_len = {e["episode_index"]: int(e["length"]) for e in episodes_meta}
+    data_ep_len = {int(ep): int(len(group)) for ep, group in df.groupby("episode_index")}
 
     statistics = {
         "episode_count": len(episodes_meta),
         "episode_length": {"mean": 0, "std": 0, "min": 0, "max": 0},
         "action_range": {},
         "camera_fps": {"default": fps},
-        "total_frames": sum(ep_len.values()),
+        "total_frames": len(df),
     }
 
     anomalies = list(anomalies_dup)
+    misaligned_eps = sorted(set(ep_len) ^ set(data_ep_len))
+    misaligned_eps += sorted(
+        ep for ep in set(ep_len) & set(data_ep_len) if ep_len[ep] != data_ep_len[ep]
+    )
+    if misaligned_eps:
+        details = [
+            f"episode {ep}: meta length={ep_len.get(ep, 'missing')}, "
+            f"data rows={data_ep_len.get(ep, 'missing')}"
+            for ep in misaligned_eps[:5]
+        ]
+        anomalies.append({
+            "episode": misaligned_eps[0],
+            "type": "episode_metadata_mismatch",
+            "severity": "high",
+            "message": (
+                "Episode metadata does not align with the data parquet rows, even though "
+                "the dataset may still open. " + "; ".join(details)
+                + ("; ..." if len(misaligned_eps) > 5 else "")
+                + ". Stop recording/training and use 'Rebuild episode table'."
+            ),
+        })
+
+    if info.get("total_episodes") not in (None, len(data_ep_len)):
+        anomalies.append({
+            "episode": -1,
+            "type": "episode_count_mismatch",
+            "severity": "high",
+            "message": (
+                f"info.json total_episodes={info['total_episodes']} but data parquet "
+                f"contains {len(data_ep_len)} episodes. Rebuild the episode table before resuming."
+            ),
+        })
 
     # Add corrupted file anomalies
     for cf in corrupted_files:
