@@ -475,6 +475,91 @@ export async function listSSHConfigs(
   return body.configs;
 }
 
+/** Scan an SSH target's output dirs for runs started from another machine. */
+export async function discoverRemoteJobs(
+  baseUrl: string,
+  fetcher: Fetcher,
+  configId: string,
+): Promise<{ discovered: number; jobs: JobRecord[] }> {
+  return apiRequest<{ discovered: number; jobs: JobRecord[] }>(
+    baseUrl,
+    fetcher,
+    "/ssh-configs/discover-jobs",
+    { method: "POST", body: { config_id: configId }, action: "Discover remote jobs" },
+  );
+}
+
+export interface PushStatus {
+  running: boolean;
+  job_id?: string;
+  repo_id?: string;
+  size_mb?: number;
+  elapsed_s?: number;
+  done?: boolean;
+  interrupted?: boolean;
+  error?: string | null;
+  // Every job pushed to the Hub in this install, keyed by job id — lets a
+  // freshly mounted card show "already uploaded" without re-pushing.
+  by_job?: Record<string, string>;
+}
+
+export async function pushModelToHub(
+  baseUrl: string,
+  fetcher: Fetcher,
+  body: { job_id: string; repo_id?: string; step?: number | null; token?: string },
+): Promise<{ message: string; repo_id: string }> {
+  return apiRequest(baseUrl, fetcher, "/models/push-to-hub", {
+    method: "POST",
+    body,
+    action: "Push model to Hub",
+  });
+}
+
+export async function getPushStatus(
+  baseUrl: string,
+  fetcher: Fetcher,
+): Promise<PushStatus> {
+  return apiRequest<PushStatus>(baseUrl, fetcher, "/models/push-status", {
+    action: "Get model push status",
+  });
+}
+
+export interface UploadProgress {
+  active: boolean;
+  phase?: "packing" | "uploading" | string;
+  sent?: number;
+  total?: number;
+  percent?: number | null;
+  eta_s?: number | null;
+  rate_bps?: number;
+  name?: string;
+  error?: string | null;
+  /** A transfer that was still running when the server last restarted. */
+  interrupted?: boolean;
+}
+
+/** Checkpoint transfer that happens before a remote training job exists. */
+export async function getUploadProgress(
+  baseUrl: string,
+  fetcher: Fetcher,
+): Promise<UploadProgress> {
+  return apiRequest<UploadProgress>(baseUrl, fetcher, "/jobs/upload-progress", {
+    action: "Get checkpoint upload progress",
+  });
+}
+
+/** Abort the in-flight checkpoint upload (no job has started yet). */
+export async function cancelUpload(
+  baseUrl: string,
+  fetcher: Fetcher,
+): Promise<{ success: boolean; message: string }> {
+  return apiRequest(baseUrl, fetcher, "/jobs/upload-cancel", {
+    method: "POST",
+    body: {},
+    action: "Cancel checkpoint upload",
+  });
+}
+
 export interface SSHStatus {
   connected: boolean;
   configs: Record<string, { ok: boolean; at: number; name?: string; host?: string }>;

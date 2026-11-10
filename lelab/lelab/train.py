@@ -331,12 +331,19 @@ def build_training_command(
     # emitting any --policy.* sub-key without --policy.type makes draccus
     # abort, so the whole policy block is skipped for reward training.
     is_reward_model = request.policy_type == "reward_classifier"
+    # `--policy.path` makes draccus build the parser from the *loaded* config,
+    # which no longer accepts --policy.type/device/use_amp/push_to_hub — their
+    # values are then taken as positional args and lerobot dies with
+    # "unrecognized arguments: smolvla cuda false false". So a checkpoint start
+    # passes the path and nothing else in the policy namespace.
+    uses_checkpoint = bool(request.policy_pretrained_path) and not request.resume
     if is_reward_model:
         cmd.extend(["--reward_model.type", "reward_classifier"])
     else:
-        if request.policy_pretrained_path and not request.resume:
+        if uses_checkpoint:
             cmd.append(f"--policy.path={request.policy_pretrained_path}")
-        cmd.extend(["--policy.type", request.policy_type])
+        else:
+            cmd.extend(["--policy.type", request.policy_type])
 
     # Core training params
     cmd.extend(["--steps", str(request.steps)])
@@ -348,7 +355,7 @@ def build_training_command(
     # Policy device / AMP / hub — reward-model training has no --policy
     # section; any policy sub-key would make draccus abort.
     is_cloud = job_target is not None and job_target.runner == "hf_cloud"
-    if not is_reward_model:
+    if not is_reward_model and not uses_checkpoint:
         if request.policy_device:
             cmd.extend(["--policy.device", request.policy_device])
         # use_amp drives fp16 autocast, which a bf16-native policy can't use.

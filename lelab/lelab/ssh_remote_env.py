@@ -640,8 +640,12 @@ def run_remote_scoring(config_id: str, command: str, *, use_cn_mirror: bool = Tr
         command = _prepend_effective_python(client, cfg, command)
         script = (
             # Unbuffered: the terminal panel needs lines as they happen, not when
-            # an 8 KB stdout block fills up.
-            f"export HF_ENDPOINT={endpoint} HF_HUB_DISABLE_XET=1 PYTHONUNBUFFERED=1; "
+            # an 8 KB stdout block fills up. expandable_segments lets the CUDA
+            # allocator remap reserved blocks instead of demanding one contiguous
+            # 5-6 GB chunk — the 4B model leaves enough free memory but not in
+            # one piece, which OOM'd batch 8 on a 24 GB card.
+            f"export HF_ENDPOINT={endpoint} HF_HUB_DISABLE_XET=1 PYTHONUNBUFFERED=1 "
+            f"PYTORCH_ALLOC_CONF=expandable_segments:True; "
             f"{command}; echo ROLL_SCORE_DONE=$?"
         )
         cmd = f"nohup bash -c {shlex.quote(script)} > {_ROLL_SCORE_LOG} 2>&1 < /dev/null &"
@@ -676,6 +680,10 @@ def remote_scoring_status(config_id: str) -> dict:
         script = (
             "echo '==RUN'; pgrep -af '[c]ompute_rabc_weights' | head -3; "
             f"echo '==TAIL'; tail -c 4000 {log} 2>/dev/null; "
+            # The scorer prints a processor warning per batch, so a 4 KB tail is
+            # almost all warnings; the outer bar redraws once per episode and is
+            # far behind. Pull that one line out for the progress/ETA display.
+            f"echo '==PROG'; tr '\\r' '\\n' < {log} 2>/dev/null | grep -a '^Episodes' | tail -1; "
             f"echo '==STAT'; stat -c '%s %y' {log} 2>/dev/null || echo missing; "
             f"echo '==OK'; grep -c 'ROLL_SCORE_DONE=0' {log} 2>/dev/null; "
             f"echo '==DONE'; grep -c 'ROLL_SCORE_DONE=' {log} 2>/dev/null; "
@@ -693,13 +701,14 @@ def remote_scoring_status(config_id: str) -> dict:
             if marker not in out:
                 return ""
             body = out.split(marker, 1)[1]
-            for nxt in ("==RUN", "==TAIL", "==STAT", "==OK", "==DONE", "==PS", "==KERN", "==END"):
+            for nxt in ("==RUN", "==TAIL", "==PROG", "==STAT", "==OK", "==DONE", "==PS", "==KERN", "==END"):
                 if nxt != marker and nxt in body:
                     body = body.split(nxt, 1)[0]
             return body.strip(" \n")
 
         running = section("RUN")
         tail = section("TAIL")
+        prog = section("PROG")
         log_stat = section("STAT")
         done = section("OK")
         failed_out = section("DONE")
@@ -714,7 +723,7 @@ def remote_scoring_status(config_id: str) -> dict:
             "log_stat": log_stat.strip(),
             "proc_stats": proc_stats.strip(),
             "processes": running.strip()[-400:],
-            "log_chunk": tail[-4000:],
+            "log_chunk": (prog + "\n" + tail[-4000:]).strip(),
             "kernel_kill": kernel_hits.strip()[-300:],
             "log_tail": tail.replace("\r", "\n").strip().splitlines()[-1][-300:] if tail.strip() else "",
         }

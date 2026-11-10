@@ -29,9 +29,13 @@ tail -f.
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import json
 import logging
 import os
 import shlex
+import tarfile
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -53,6 +57,77 @@ from ..train import (
 )
 
 logger = logging.getLogger(__name__)
+
+# A finetune checkpoint is tarred and pushed over SFTP *before* the training job
+# exists, so nothing in the job registry can report it. The upload callback
+# writes here and the UI polls /jobs/upload-progress for the bar.
+_UPLOAD_STATE: dict = {"active": False}
+_UPLOAD_LOCK = threading.Lock()
+_UPLOAD_STATE_PATH = (
+    Path.home() / ".cache" / "huggingface" / "lerobot" / "upload_state.json"
+)
+_UPLOAD_LAST_WRITE = 0.0
+# Set by /jobs/upload-cancel; the put() callback raises so paramiko aborts the
+# transfer instead of finishing a 1.2 GB push nobody is waiting for.
+_UPLOAD_CANCEL = threading.Event()
+
+
+def cancel_upload() -> dict:
+    with _UPLOAD_LOCK:
+        active = bool(_UPLOAD_STATE.get("active"))
+    if not active:
+        return {"success": False, "message": "当前没有上传在进行"}
+    _UPLOAD_CANCEL.set()
+    return {"success": True, "message": "正在取消上传…"}
+
+
+def _persist_upload_state(force: bool = False) -> None:
+    """Mirror the transfer state to disk so a reloaded page can pick it up."""
+    global _UPLOAD_LAST_WRITE
+    now = time.time()
+    if not force and now - _UPLOAD_LAST_WRITE < 1.0:
+        return
+    _UPLOAD_LAST_WRITE = now
+    with _UPLOAD_LOCK:
+        data = dict(_UPLOAD_STATE)
+    try:
+        _UPLOAD_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _UPLOAD_STATE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False))
+        tmp.replace(_UPLOAD_STATE_PATH)
+    except OSError as exc:  # noqa: BLE001
+        logger.info("Upload state not persisted: %s", exc)
+
+
+def _load_upload_state() -> None:
+    """On start, any transfer left 'active' died with the previous process."""
+    try:
+        data = json.loads(_UPLOAD_STATE_PATH.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(data, dict):
+        return
+    if data.get("active"):
+        data.update({"active": False, "interrupted": True})
+    _UPLOAD_STATE.update(data)
+
+
+_load_upload_state()
+
+
+def upload_progress() -> dict:
+    """Current checkpoint transfer, with rate/ETA derived on read."""
+    with _UPLOAD_LOCK:
+        state = dict(_UPLOAD_STATE)
+    sent = int(state.get("sent") or 0)
+    total = int(state.get("total") or 0)
+    started = state.get("started_at")
+    if state.get("active") and started and sent > 0:
+        rate = sent / max(0.001, time.time() - float(started))
+        state["rate_bps"] = round(rate)
+        state["eta_s"] = round(max(0.0, (total - sent) / rate)) if rate > 0 else None
+        state["percent"] = round(100.0 * sent / total, 1) if total else None
+    return state
 
 # How often the consumed-line offset is flushed to the sidecar. The offset is
 # what lets a restart replay only the remote log lines written while LeLab was
@@ -130,6 +205,10 @@ class SSHJobRunner:
         # SFTP listing/export paths resolve `~` to $HOME and find nothing. Use an
         # absolute base instead.
         home = self._remote_home()
+        # A finetune checkpoint picked from a local/imported job lives only on
+        # this machine; the pod cannot read it. Ship it once to a content-
+        # addressed cache dir and point the command at that copy.
+        config = self._ensure_local_policy_on_remote(config, home)
         if resume_output_dir:
             self._remote_output_dir = resume_output_dir
         else:
@@ -985,6 +1064,147 @@ class SSHJobRunner:
                     client.close()
         self._remote_home_cache = home
         return home
+
+    def _ensure_local_policy_on_remote(self, config: TrainingRequest, home: str) -> TrainingRequest:
+        """Upload a local finetune checkpoint to the pod before training.
+
+        The finetune dropdown can point at a checkpoint that only exists on this
+        machine (an imported job). The remote command can only read pod paths,
+        so tar the directory, put it under ``<home>/lelab_models/<name>-<tag>``
+        and rewrite ``policy.path``. The tag hashes file names and sizes, so a
+        second run with the same weights reuses the upload instead of shipping
+        1+ GB again.
+        """
+        path = (config.policy_pretrained_path or "").strip()
+        if not path or config.resume:
+            return config
+        local = Path(path).expanduser()
+        if not local.is_absolute() or not local.is_dir():
+            # Hub repo id, or a path that already lives on the pod.
+            return config
+        files = sorted(p for p in local.rglob("*") if p.is_file())
+        if not files:
+            return config
+
+        # Prefer the Hub: ~12 MB/s up versus ~2 MB/s to the pod, and the pod
+        # pulls it through the mirror (cached for every later run). Falls back to
+        # the direct transfer if the push fails.
+        from ..model_push import ensure_hub_copy
+
+        published = ensure_hub_copy(local, local.name)
+        if published:
+            logger.info("Finetune checkpoint published to %s; pod will pull it", published)
+            return config.model_copy(update={"policy_pretrained_path": published})
+
+        digest = hashlib.sha256()
+        for f in files:
+            digest.update(f"{f.relative_to(local)}|{f.stat().st_size}".encode())
+        remote_dir = f"{home}/lelab_models/{local.name}-{digest.hexdigest()[:10]}"
+
+        client = None
+        try:
+            client = self._connect()
+            sftp = client.open_sftp()
+            try:
+                sftp.stat(f"{remote_dir}/config.json")
+                logger.info("Finetune checkpoint already on the pod: %s", remote_dir)
+                return config.model_copy(update={"policy_pretrained_path": remote_dir})
+            except FileNotFoundError:
+                pass
+            finally:
+                sftp.close()
+
+            tmp_path = Path(tempfile.mkstemp(suffix=".tar")[1])
+            try:
+                # Packing 1.2 GB of safetensors takes ~a minute; without this the
+                # page shows nothing at all until the network transfer starts.
+                _UPLOAD_CANCEL.clear()
+                with _UPLOAD_LOCK:
+                    _UPLOAD_STATE.clear()
+                    _UPLOAD_STATE.update(
+                        {
+                            "active": True,
+                            "phase": "packing",
+                            "sent": 0,
+                            "total": 0,
+                            "started_at": time.time(),
+                            "name": Path(remote_dir).name,
+                            "error": None,
+                        }
+                    )
+                _persist_upload_state(force=True)
+                with tarfile.open(tmp_path, "w") as tf:
+                    for f in files:
+                        tf.add(f, arcname=str(f.relative_to(local)))
+                size_mb = tmp_path.stat().st_size / 1e6
+                logger.info(
+                    "Uploading finetune checkpoint to %s (%.0f MB); training starts after the transfer",
+                    remote_dir,
+                    size_mb,
+                )
+                _stdin, stdout, _stderr = client.exec_command(
+                    f"mkdir -p {shlex.quote(remote_dir)}", timeout=60
+                )
+                stdout.channel.recv_exit_status()
+                remote_tar = f"{remote_dir}.tar"
+                sftp = client.open_sftp()
+                with _UPLOAD_LOCK:
+                    _UPLOAD_STATE.clear()
+                    _UPLOAD_STATE.update(
+                        {
+                            "active": True,
+                            "phase": "uploading",
+                            "sent": 0,
+                            "total": int(tmp_path.stat().st_size),
+                            "started_at": time.time(),
+                            "name": Path(remote_dir).name,
+                            "error": None,
+                        }
+                    )
+                _persist_upload_state(force=True)
+
+                def _on_progress(sent: int, _total: int) -> None:
+                    if _UPLOAD_CANCEL.is_set():
+                        raise RuntimeError("上传已取消")
+                    with _UPLOAD_LOCK:
+                        _UPLOAD_STATE["sent"] = int(sent)
+                    _persist_upload_state()
+
+                try:
+                    sftp.put(str(tmp_path), remote_tar, callback=_on_progress)
+                except Exception as exc:  # noqa: BLE001
+                    with _UPLOAD_LOCK:
+                        _UPLOAD_STATE.update({"active": False, "error": str(exc)})
+                    _persist_upload_state(force=True)
+                    raise
+                else:
+                    with _UPLOAD_LOCK:
+                        _UPLOAD_STATE.update(
+                            {"active": False, "sent": _UPLOAD_STATE.get("total", 0)}
+                        )
+                    _persist_upload_state(force=True)
+                finally:
+                    sftp.close()
+                _stdin, stdout, stderr = client.exec_command(
+                    f"tar -xf {shlex.quote(remote_tar)} -C {shlex.quote(remote_dir)} && "
+                    f"rm -f {shlex.quote(remote_tar)}",
+                    timeout=900,
+                )
+                if stdout.channel.recv_exit_status() != 0:
+                    raise RuntimeError(
+                        "解压上传的 checkpoint 失败: "
+                        + stderr.read().decode("utf-8", errors="replace")[-300:]
+                    )
+            finally:
+                with contextlib.suppress(OSError):
+                    tmp_path.unlink()
+        finally:
+            if client is not None:
+                with contextlib.suppress(Exception):
+                    client.close()
+
+        logger.info("Finetune checkpoint ready on the pod: %s", remote_dir)
+        return config.model_copy(update={"policy_pretrained_path": remote_dir})
 
     def _connect(self, import_paramiko=None, timeout: int = 30):
         """Create a new SSH connection using the stored config."""

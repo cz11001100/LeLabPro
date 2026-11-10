@@ -12,9 +12,11 @@ import {
   JobRecord,
   SSHStatus,
   deleteJob,
+  discoverRemoteJobs,
   getSSHStatus,
   listHubJobs,
   listJobs,
+  listSSHConfigs,
   stopJob,
 } from "@/lib/jobsApi";
 import JobCard from "./JobCard";
@@ -32,6 +34,7 @@ import {
 import {
   CalendarDays,
   ChevronRight,
+  CloudDownload,
   Download,
   ExternalLink,
   Gauge,
@@ -230,6 +233,7 @@ const JobsSection: React.FC = () => {
   const [hubAuthenticated, setHubAuthenticated] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [scanning, setScanning] = useState(false);
 
   const { selectedRecord } = useRobots();
   // Datasets for the DATASETS section: Hub-uploaded ones shown, local-only
@@ -375,6 +379,42 @@ const JobsSection: React.FC = () => {
   }, []);
 
   useJobsChangedSignal(refresh, applyProgress);
+
+  // A pod can hold runs launched from another computer; those have no local
+  // job.json, so scan every saved SSH target and register what it finds.
+  const handleScanRemote = async () => {
+    setScanning(true);
+    try {
+      const configs = await listSSHConfigs(baseUrl, fetchWithHeaders);
+      let discovered = 0;
+      const failures: string[] = [];
+      for (const cfg of configs) {
+        try {
+          const res = await discoverRemoteJobs(baseUrl, fetchWithHeaders, cfg.id);
+          discovered += res.discovered;
+        } catch (e) {
+          failures.push(`${cfg.name}: ${e instanceof Error ? e.message : String(e)}`);
+        }
+      }
+      if (discovered > 0) {
+        toast({ title: `发现 ${discovered} 个云端任务`, description: "已加入任务列表，可下载其 checkpoint" });
+        refresh();
+      } else {
+        toast({ title: "没有发现新的云端任务" });
+      }
+      if (failures.length > 0) {
+        toast({ title: "部分连接扫描失败", description: failures.join("；"), variant: "destructive" });
+      }
+    } catch (e) {
+      toast({
+        title: "扫描失败",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setScanning(false);
+    }
+  };
 
   const handleStop = async (id: string) => {
     try {
@@ -593,6 +633,21 @@ const JobsSection: React.FC = () => {
           >
             <Download className="w-3.5 h-3.5 mr-1.5" />
             Import Model
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleScanRemote}
+            disabled={scanning}
+            className="h-8 border-slate-700 bg-slate-800/50 text-slate-200 hover:text-white"
+            title="扫描已保存的 SSH 目标，把别的电脑发起的训练任务登记到本机"
+          >
+            {scanning ? (
+              <RefreshCw className="w-3.5 h-3.5 mr-1.5 animate-spin" />
+            ) : (
+              <CloudDownload className="w-3.5 h-3.5 mr-1.5" />
+            )}
+            扫描云端任务
           </Button>
           <Button
             variant="ghost"

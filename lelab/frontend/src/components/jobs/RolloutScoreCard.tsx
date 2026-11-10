@@ -32,16 +32,21 @@ import {
   getScoreJob,
   getScoreLogs,
   ScoreLogs,
-  getSarmTrainingStatus,
   listRolloutDatasets,
   preflightRolloutScore,
   promoteRolloutProgress,
   startRolloutScore,
   startRolloutScoreRemote,
-  startSarmTraining,
 } from "@/lib/rolloutEvalApi";
 
 const POLL_MS = 2000;
+
+const THRESHOLD_KEY = "lelab.rolloutScore.threshold";
+
+const initialThreshold = () => {
+  const saved = Number(window.localStorage.getItem(THRESHOLD_KEY));
+  return Number.isFinite(saved) && saved > 0 ? saved : 0.7;
+};
 
 const BACKENDS = [
   { value: "robometer", label: "Robometer（零样本通用）" },
@@ -74,6 +79,19 @@ const mmss = (s: number | null | undefined) => {
   if (s == null) return "—";
   const total = Math.max(0, Math.round(s));
   return `${Math.floor(total / 60)}:${String(total % 60).padStart(2, "0")}`;
+};
+
+/** 05:58, or "11-05 05:58" once the estimate crosses midnight. */
+const clockTime = (d: Date) => {
+  const now = new Date();
+  const hm = `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  const sameDay =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+  return sameDay
+    ? hm
+    : `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")} ${hm}`;
 };
 
 /** "0-9,12" -> [0..9,12]; empty or unparseable -> null (score everything). */
@@ -122,7 +140,7 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
   const [numSubsampled, setNumSubsampled] = useState(8);
   const [batchSize, setBatchSize] = useState(8);
   const [headMode, setHeadMode] = useState("sparse");
-  const [threshold, setThreshold] = useState(0.9);
+  const [threshold, setThreshold] = useState(initialThreshold);
   const [episodeFilter, setEpisodeFilter] = useState("");
   const [curveEp, setCurveEp] = useState<number | null>(null);
   const [takeStats, setTakeStats] = useState<RolloutTakeStats | null>(null);
@@ -134,6 +152,7 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
     total: number;
     percent: number;
     eta_s: number | null;
+    elapsed_s: number | null;
   } | null>(null);
   const [runner, setRunner] = useState<"local" | "ssh">("local");
   const [testing, setTesting] = useState(false);
@@ -148,12 +167,6 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
   const [comparison, setComparison] = useState<RolloutComparison | null>(null);
   const [sshConfigs, setSshConfigs] = useState<SSHConfig[]>([]);
   const [sshConfigId, setSshConfigId] = useState("");
-  const [sarmBusy, setSarmBusy] = useState(false);
-  const [sarmStatus, setSarmStatus] = useState<{
-    training: boolean;
-    finished_ok: boolean;
-    log_tail: string;
-  } | null>(null);
   const [promoting, setPromoting] = useState("");
   const wasRunningRef = useRef(false);
 
@@ -199,6 +212,7 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
             total: res.status?.episodes_total ?? job.episodes_total ?? 0,
             percent: res.status?.percent ?? 0,
             eta_s: res.status?.eta_s ?? null,
+            elapsed_s: res.status?.elapsed_s ?? null,
           });
           setRemoteTail("已接回上次的打分任务…");
         } else if (res.status) {
@@ -254,31 +268,6 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
     },
     [baseUrl, fetchWithHeaders],
   );
-
-  // Follow the pod-side SARM run once it has been started from here.
-  useEffect(() => {
-    if (!sarmStatus?.training || !sshConfigId) return;
-    let cancelled = false;
-    const tick = async () => {
-      try {
-        const st = await getSarmTrainingStatus(baseUrl, fetchWithHeaders, sshConfigId);
-        if (cancelled) return;
-        setSarmStatus({
-          training: st.training,
-          finished_ok: st.finished_ok,
-          log_tail: st.log_tail,
-        });
-        if (!st.training) refreshDatasets();
-      } catch {
-        // Pod unreachable mid-run; keep polling.
-      }
-    };
-    const id = setInterval(tick, 5000);
-    return () => {
-      cancelled = true;
-      clearInterval(id);
-    };
-  }, [sarmStatus?.training, sshConfigId, baseUrl, fetchWithHeaders, refreshDatasets]);
 
   const loadComparison = useCallback(
     async (id: string) => {
@@ -431,7 +420,7 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
           push_to_hub: true,
         });
         setRemoteTail(`已提交：${res.log_path}`);
-        setRemoteProgress({ done: 0, total: selected?.episodes ?? 0, percent: 0, eta_s: null });
+        setRemoteProgress({ done: 0, total: selected?.episodes ?? 0, percent: 0, eta_s: null, elapsed_s: null });
         toast({ title: "已提交到 pod" });
       } else {
         const res = await startRolloutScore(baseUrl, fetchWithHeaders, scoreBody());
@@ -469,6 +458,7 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
               total,
               percent: st.percent ?? 0,
               eta_s: st.eta_s ?? null,
+              elapsed_s: st.elapsed_s ?? null,
             };
           });
           setRemoteTail(`pod 上跑着… ${st.log_tail ?? ""}`);
@@ -530,28 +520,6 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
       });
     } finally {
       setPromoting("");
-    }
-  };
-
-  const handleTrainSarm = async () => {
-    if (!repoId || !sshConfigId) return;
-    setSarmBusy(true);
-    try {
-      const res = await startSarmTraining(baseUrl, fetchWithHeaders, {
-        config_id: sshConfigId,
-        dataset_repo_id: repoId,
-        image_key: imageKey,
-      });
-      toast({ title: res.message, description: `日志 ${res.log_path}` });
-      setSarmStatus({ training: true, finished_ok: false, log_tail: "" });
-    } catch (e) {
-      toast({
-        title: "SARM 训练没起来",
-        description: e instanceof Error ? e.message : String(e),
-        variant: "destructive",
-      });
-    } finally {
-      setSarmBusy(false);
     }
   };
 
@@ -665,7 +633,10 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
                 max={1}
                 value={threshold}
                 onChange={(v) => {
-                  if (v !== undefined) setThreshold(v);
+                  if (v !== undefined) {
+                    setThreshold(v);
+                    window.localStorage.setItem(THRESHOLD_KEY, String(v));
+                  }
                 }}
                 className="bg-slate-900 border-slate-700 text-white text-xs h-9"
               />
@@ -790,19 +761,23 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
 
           {preflight && (
             <div className="space-y-1 rounded border border-slate-700 bg-slate-900/40 p-3">
-              {preflight.checks.map((c) => (
-                <div key={c.name} className="flex items-start gap-2 text-xs">
-                  <span className={c.ok ? "text-green-400" : "text-red-400"}>
-                    {c.ok ? "✓" : "✗"}
-                  </span>
-                  <span className="text-slate-200">{c.name}</span>
-                  {c.detail && <span className="text-slate-500 break-all">— {c.detail}</span>}
-                </div>
-              ))}
               {preflight.ok ? (
-                <p className="text-xs text-green-400 pt-1">环境满足，可以开始打分</p>
+                <p className="text-xs text-green-400">校验成功</p>
               ) : (
-                <p className="text-xs text-amber-400 pt-1">上面有未通过项，先解决再打分</p>
+                <>
+                  {preflight.checks
+                    .filter((c) => !c.ok)
+                    .map((c) => (
+                      <div key={c.name} className="flex items-start gap-2 text-xs">
+                        <span className="text-red-400">✗</span>
+                        <span className="text-slate-200">{c.name}</span>
+                        {c.detail && (
+                          <span className="text-slate-500 break-all">— {c.detail}</span>
+                        )}
+                      </div>
+                    ))}
+                  <p className="text-xs text-amber-400 pt-1">上面有未通过项，先解决再打分</p>
+                </>
               )}
             </div>
           )}
@@ -817,9 +792,11 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
                       total: scoreState?.episodes_total ?? 0,
                       percent: scoreState?.percent ?? 0,
                       eta_s: scoreState?.eta_s ?? null,
+                      elapsed_s: scoreState?.elapsed_s ?? null,
                     };
               if (!p) return null;
               const pct = p.percent || (p.total ? Math.round((p.done / p.total) * 100) : 0);
+              const finishAt = p.eta_s != null ? new Date(Date.now() + p.eta_s * 1000) : null;
               return (
                 <div className="space-y-1">
                   <div className="h-1.5 w-full overflow-hidden rounded bg-slate-700">
@@ -830,8 +807,9 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
                   </div>
                   <div className="flex flex-wrap gap-3 text-xs text-slate-400">
                     <span>{p.total ? `第 ${p.done} / ${p.total} 集` : "准备中…"}</span>
-                    <span>已用 {mmss(scoreState?.elapsed_s)}</span>
+                    <span>已用 {mmss(p.elapsed_s)}</span>
                     {p.eta_s != null && <span>预计还剩 {mmss(p.eta_s)}</span>}
+                    {finishAt && <span>预计 {clockTime(finishAt)} 完成</span>}
                   </div>
                 </div>
               );
@@ -862,10 +840,6 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
                 {logs.text}
               </pre>
             </div>
-          )}
-
-          {summary?.no_progress && (
-            <p className="text-xs text-slate-400">{summary.hint}</p>
           )}
 
           {summary?.misaligned && (
@@ -1025,44 +999,25 @@ const RolloutScoreCard: React.FC<{ initialRepoId?: string }> = ({
               )}
             </div>
           ) : backendsPresent.length > 0 ? (
-            <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
-              <span>目前只有 {backendsPresent.join(" / ")} 打过这个集。</span>
-              {sshConfigs.length > 0 && (
-                <>
-                  <Select value={sshConfigId} onValueChange={setSshConfigId}>
-                    <SelectTrigger className="w-40 bg-slate-900 border-slate-700 text-white text-xs h-8">
-                      <SelectValue placeholder="选 pod" />
-                    </SelectTrigger>
-                    <SelectContent className="bg-slate-900 border-slate-700 text-white text-xs">
-                      {sshConfigs.map((c) => (
-                        <SelectItem key={c.id} value={c.id}>
-                          {c.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={handleTrainSarm}
-                    disabled={sarmBusy || !sshConfigId}
-                    className="border-slate-600 text-black hover:bg-slate-200 hover:text-black text-xs h-8"
-                  >
-                    {sarmBusy && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
-                    Train SARM on Pod
-                  </Button>
-                </>
-              )}
-              {sarmStatus && (
-                <span className="text-slate-400">
-                  {sarmStatus.training
-                    ? "SARM 训练中…"
-                    : sarmStatus.finished_ok
-                      ? "SARM 训练完成，可选它作打分后端"
-                      : "SARM 训练结束（未确认成功）"}
-                  {sarmStatus.log_tail ? ` · ${sarmStatus.log_tail.split("\n").pop()}` : ""}
-                </span>
-              )}
+            <div className="space-y-2">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="text-slate-400">以谁为准</span>
+                {backendsPresent
+                  .filter((b): b is "robometer" | "sarm" => b === "robometer" || b === "sarm")
+                  .map((b) => (
+                    <Button
+                      key={b}
+                      size="sm"
+                      variant="outline"
+                      onClick={() => handlePromote(b)}
+                      disabled={!!promoting}
+                      className="border-slate-600 text-black hover:bg-slate-200 hover:text-black text-xs h-8"
+                    >
+                      {promoting === b && <Loader2 className="w-3 h-3 mr-1 animate-spin" />}
+                      Use {b === "robometer" ? "Robometer" : "SARM"}
+                    </Button>
+                  ))}
+              </div>
             </div>
           ) : null}
         </>

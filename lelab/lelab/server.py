@@ -33,6 +33,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.concurrency import run_in_threadpool
 from starlette.responses import Response
 from starlette.types import Scope
 
@@ -100,6 +101,7 @@ from .rollout_eval import (
     read_take_stats,
 )
 from .dataset_merge import MergeRequest, handle_merge, handle_merge_status, inspect_merge_sources
+from .model_push import PushModelRequest, handle_push_model, push_status
 from .ssh_remote_env import sarm_training_status as _sarm_training_status
 from .ssh_remote_env import ssh_connection_status as _ssh_connection_status
 from .ssh_remote_env import start_sarm_training_remote as _start_sarm_training
@@ -1037,17 +1039,53 @@ async def create_training_job(req: Request):
     if getattr(body.config, "sample_weighting_enable", False):
         from .rollout_eval import preflight_rabc_training
 
-        problem = preflight_rabc_training(body.config.dataset_repo_id)
+        problem = await run_in_threadpool(preflight_rabc_training, body.config.dataset_repo_id)
         if problem:
             raise HTTPException(status_code=400, detail=problem)
     try:
-        record = job_registry.start(body.config, body.target)
+        # `start` talks to the pod (SSH, env probes) and can take minutes; running
+        # it on the event loop froze every other request — including the page that
+        # clicked the button, which then spun on "Starting…" forever.
+        record = await run_in_threadpool(job_registry.start, body.config, body.target)
     except JobAlreadyRunningError as exc:
         raise HTTPException(status_code=409, detail=f"Job already running: {exc}") from exc
     except ValueError as exc:
         # e.g. "flavor is required when runner is hf_cloud"
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return record
+
+
+@app.get("/jobs/upload-progress")
+def jobs_upload_progress():
+    """Checkpoint transfer that happens before a remote job exists."""
+    from .runners.ssh_remote import upload_progress
+
+    return upload_progress()
+
+
+@app.post("/jobs/upload-cancel")
+def jobs_upload_cancel():
+    """Abort the in-flight checkpoint upload (no job has started yet)."""
+    from .runners.ssh_remote import cancel_upload
+
+    return cancel_upload()
+
+
+@app.post("/models/push-to-hub")
+def models_push_to_hub(request: PushModelRequest):
+    """Push a local checkpoint to the Hub so pods can pull it instead of SFTP."""
+    result = handle_push_model(request)
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=result.get("status_code", 500),
+            detail=result.get("message", "Push failed"),
+        )
+    return result
+
+
+@app.get("/models/push-status")
+def models_push_status():
+    return push_status()
 
 
 class ImportModelRequest(BaseModel):
@@ -1558,6 +1596,23 @@ def ssh_configs_test(body: SSHTestBody):
 def ssh_check_env(body: SSHRemoteEnvBody):
     """Check remote environment: lerobot, CUDA, Python version, disk space."""
     return _check_remote_env(body.config_id)
+
+
+@app.post("/ssh-configs/discover-jobs")
+def ssh_discover_jobs(body: SSHRemoteEnvBody):
+    """Scan the target's output dirs and register runs started elsewhere.
+
+    A pod can hold trainings launched from another computer; those runs have
+    no local job.json, so without this scan their checkpoints are invisible
+    (and un-downloadable) on this machine.
+    """
+    try:
+        jobs = job_registry.discover_remote_jobs(body.config_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"discovered": len(jobs), "jobs": [j.model_dump() for j in jobs]}
 
 
 class SSHRewardModelBody(BaseModel):

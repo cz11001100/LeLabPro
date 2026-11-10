@@ -2,7 +2,16 @@ import React, { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { JobRecord, startJobValidation, stopJobValidation, ValidationState } from "@/lib/jobsApi";
+import { Input } from "@/components/ui/input";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { JobRecord, startJobValidation, stopJobValidation, ValidationState, pushModelToHub, getPushStatus } from "@/lib/jobsApi";
 import { modelStepOf, modelBaseName } from "@/lib/modelGroups";
 import {
   Square,
@@ -18,8 +27,10 @@ import {
   ShieldCheck,
   ShieldAlert,
   FlaskConical,
+  CloudUpload,
 } from "lucide-react";
 import { useApi } from "@/contexts/ApiContext";
+import { useHfAuth } from "@/contexts/HfAuthContext";
 import { useToast } from "@/hooks/use-toast";
 import {
   JobCheckpoint,
@@ -29,6 +40,20 @@ import {
   cancelJobExport,
 } from "@/lib/checkpointsApi";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
+
+// The registry lists an imported model twice once it is also on the Hub: the
+// local file and the Hub repo, both at the same step. The dropdown must show
+// one row per step, preferring the local copy.
+const dedupeCheckpoints = (cks: JobCheckpoint[]): JobCheckpoint[] => {
+  const byStep = new Map<number, JobCheckpoint>();
+  for (const c of cks) {
+    const prev = byStep.get(c.step);
+    if (!prev || (prev.source !== "local" && c.source === "local")) {
+      byStep.set(c.step, c);
+    }
+  }
+  return Array.from(byStep.values()).sort((a, b) => a.step - b.step);
+};
 
 interface Props {
   job: JobRecord;
@@ -70,6 +95,7 @@ const statePresentation: Record<
 const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPlay, onExport, onResume }) => {
   const navigate = useNavigate();
   const { baseUrl, fetchWithHeaders } = useApi();
+  const { auth } = useHfAuth();
   const { toast } = useToast();
   // When grouped, the card represents one training run and `job` is the member
   // whose checkpoint is currently selected; otherwise it is the single job.
@@ -100,8 +126,9 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
     }
     let cancelled = false;
     listJobCheckpoints(baseUrl, fetchWithHeaders, job.id)
-      .then((cks) => {
+      .then((raw) => {
         if (cancelled) return;
+        const cks = dedupeCheckpoints(raw);
         setCheckpoints(cks);
         if (cks.length > 0) {
           const latest = cks[cks.length - 1].step;
@@ -149,6 +176,138 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
     }
   };
 
+  const [pushing, setPushing] = useState(false);
+  const [pushElapsed, setPushElapsed] = useState(0);
+  const [pushInterrupted, setPushInterrupted] = useState(false);
+  const [tokenDialogOpen, setTokenDialogOpen] = useState(false);
+  const [hfToken, setHfToken] = useState("");
+  const [pushedRepo, setPushedRepo] = useState<string | null>(null);
+  const [pushError, setPushError] = useState<string | null>(null);
+
+  // The push runs in a server thread, so a reloaded page re-attaches to it
+  // instead of showing an idle button. Only the card that owns the job reacts.
+  useEffect(() => {
+    let cancelled = false;
+    getPushStatus(baseUrl, fetchWithHeaders)
+      .then((st) => {
+        if (cancelled || st.job_id !== job.id) return;
+        if (st.running) {
+          setPushing(true);
+          const startedAt = st.elapsed_s ? Date.now() - st.elapsed_s * 1000 : Date.now();
+          pollPush(startedAt, false);
+        } else if (st.interrupted) {
+          setPushInterrupted(true);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.id]);
+
+  const pollPush = (startedAt: number, notify: boolean) => {
+    const timer = window.setInterval(async () => {
+      setPushElapsed(Math.round((Date.now() - startedAt) / 1000));
+      try {
+        const st = await getPushStatus(baseUrl, fetchWithHeaders);
+        if (st.running) return;
+        window.clearInterval(timer);
+        setPushing(false);
+        if (st.done) {
+          setPushedRepo(st.repo_id ?? null);
+          setPushError(null);
+        } else {
+          setPushError(st.error || "服务端没有给出原因，看 ~/lelab-server.log");
+        }
+        if (notify) {
+          if (st.done) toast({ title: `已上传到 ${st.repo_id}` });
+          else
+            toast({
+              title: "上传失败",
+              description: st.error || "服务端没有给出原因，看 ~/lelab-server.log",
+              variant: "destructive",
+            });
+        }
+      } catch {
+        // keep polling
+      }
+    }, 3000);
+  };
+
+  // Show an upload that finished before this card mounted (reload, other tab),
+  // or re-attach when the upload still belongs to this job.
+  useEffect(() => {
+    let cancelled = false;
+    getPushStatus(baseUrl, fetchWithHeaders)
+      .then((st) => {
+        if (cancelled) return;
+        const repo = st.by_job?.[job.id];
+        if (repo) setPushedRepo(repo);
+        if (st.running && st.job_id === job.id) {
+          setPushing(true);
+          pollPush(Date.now() - (st.elapsed_s ?? 0) * 1000, true);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+    // pollPush is stable in behaviour; re-running on id change is wrong.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job.id, baseUrl, fetchWithHeaders]);
+
+  // Pushing to the Hub is what lets a pod *pull* the checkpoint through the
+  // mirror instead of receiving a 1.2 GB upload before every remote run.
+  // SSH jobs upload straight from the pod — no local download needed.
+  const doPush = async (token?: string) => {
+    if (pushing || selectedStep == null) return;
+    setPushing(true);
+    setPushElapsed(0);
+    setPushInterrupted(false);
+    setPushError(null);
+    const startedAt = Date.now();
+    const slug = job.name
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .toLowerCase();
+    const repoId =
+      auth.status === "authenticated" && slug ? `${auth.username}/${slug}` : "";
+    try {
+      const res = await pushModelToHub(baseUrl, fetchWithHeaders, {
+        job_id: job.id,
+        step: selectedStep,
+        repo_id: repoId,
+        token,
+      });
+      toast({ title: res.message, description: res.repo_id });
+      setTokenDialogOpen(false);
+      setHfToken("");
+      pollPush(startedAt, true);
+    } catch (err) {
+      setPushing(false);
+      const message = err instanceof Error ? err.message : String(err);
+      // No HF session on this machine: ask for a write token instead of
+      // failing with a raw 401.
+      if (/401|令牌|token/i.test(message) && !token) {
+        setTokenDialogOpen(true);
+        return;
+      }
+      toast({ title: "上传没起来", description: message, variant: "destructive" });
+    }
+  };
+
+  const handlePushHub = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (pushing || selectedStep == null) return;
+    doPush();
+  };
+
+  const handleTokenSubmit = () => {
+    if (!hfToken.trim()) return;
+    doPush(hfToken.trim());
+  };
+
   const handlePlay = (e: React.MouseEvent) => {
     e.stopPropagation();
     if (selectedStep == null) return;
@@ -157,6 +316,25 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
 
   const [exporting, setExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState<ExportProgress | null>(null);
+
+  // Re-attach to an export that is already running server-side (page reload,
+  // second tab, or the other tab's POST still in flight). Without this the
+  // card looks idle and a second click is rejected as a duplicate.
+  useEffect(() => {
+    if (isRunning || selectedStep == null) return;
+    let cancelled = false;
+    getExportProgress(baseUrl, fetchWithHeaders, job.id, selectedStep)
+      .then((p) => {
+        if (!cancelled && (p.state === "preparing" || p.state === "downloading")) {
+          setExporting(true);
+          setExportProgress(p);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [job.id, selectedStep, baseUrl, fetchWithHeaders, isRunning]);
 
   // The export POST blocks until the SFTP transfer completes, so bytes
   // downloaded have to come from a side channel while that request is live.
@@ -186,6 +364,13 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
     const step = selectedStep;
     setExporting(true);
     setExportProgress({ state: "preparing", transferred_bytes: 0, total_bytes: 0, current_file: "" });
+    // Another tab may already own this export; the server rejects duplicates,
+    // so attach to the running transfer instead of surfacing an error.
+    const running = await getExportProgress(baseUrl, fetchWithHeaders, job.id, step).catch(() => null);
+    if (running && (running.state === "preparing" || running.state === "downloading")) {
+      setExportProgress(running);
+      return;
+    }
     try {
       const ok = await onExport(job, step);
       // The server flips to "done" just before the POST returns, so one final
@@ -495,6 +680,34 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                 )}
               </Button>
             ) : null}
+            {(isImported || isSSH) && showInferenceRow ? (
+              <Button
+                size="icon"
+                onClick={handlePushHub}
+                disabled={pushing || selectedStep == null}
+                className={`h-8 w-8 text-white ${
+                  pushInterrupted && !pushing
+                    ? "bg-amber-600 hover:bg-amber-700"
+                    : "bg-sky-600 hover:bg-sky-700"
+                }`}
+                aria-label="Upload this checkpoint to the Hub"
+                title={
+                  pushing
+                    ? `上传中 ${pushElapsed}s`
+                    : isSSH
+                      ? "从云端直接上传到 Hub（不经过本地）"
+                      : pushInterrupted
+                        ? "上次上传被中断（服务重启），可重试"
+                        : "Upload to Hub"
+                }
+              >
+                {pushing ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <CloudUpload className="w-4 h-4" />
+                )}
+              </Button>
+            ) : null}
           </div>
         ) : null}
 
@@ -541,7 +754,69 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
             </div>
           </div>
         ) : null}
+
+        {pushedRepo ? (
+          <div className="flex items-center gap-1.5 text-xs text-green-400 min-w-0">
+            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+            <span className="truncate" title={pushedRepo}>
+              已上传 Hub：{pushedRepo}
+            </span>
+          </div>
+        ) : pushError ? (
+          <div className="text-xs text-red-400 break-all">上传失败：{pushError}</div>
+        ) : null}
       </CardContent>
+
+      <Dialog
+        open={tokenDialogOpen}
+        onOpenChange={(open) => {
+          if (!pushing) setTokenDialogOpen(open);
+        }}
+      >
+        <DialogContent
+          className="bg-slate-900 border-slate-700 text-slate-100"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <DialogHeader>
+            <DialogTitle>需要 Hugging Face 写入令牌</DialogTitle>
+            <DialogDescription className="text-slate-400">
+              本机还没有登录 Hugging Face。粘贴一个带 write 权限的令牌，只用于本次上传。
+            </DialogDescription>
+          </DialogHeader>
+          <Input
+            type="password"
+            value={hfToken}
+            onChange={(e) => setHfToken(e.target.value)}
+            placeholder="hf_..."
+            autoFocus
+            className="bg-slate-800 border-slate-600 text-white"
+            onKeyDown={(e) => {
+              if (e.key === "Enter") handleTokenSubmit();
+            }}
+          />
+          <p className="text-xs text-slate-500">
+            获取地址 huggingface.co/settings/tokens（Write 权限）
+          </p>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => setTokenDialogOpen(false)}
+              disabled={pushing}
+              className="border-slate-600 bg-transparent text-slate-200 hover:bg-slate-800"
+            >
+              取消
+            </Button>
+            <Button
+              onClick={handleTokenSubmit}
+              disabled={pushing || !hfToken.trim()}
+              className="bg-sky-600 hover:bg-sky-700 text-white"
+            >
+              {pushing ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : null}
+              上传到 Hub
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </Card>
   );
 };

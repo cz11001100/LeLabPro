@@ -71,6 +71,31 @@ class LogLine(BaseModel):
     message: str
 
 
+def _default_repo_id_for_name(name: str) -> str:
+    """`<hf_user>/<slug(name)>` — the repo a model push would create.
+
+    `whoami` is a network call that has hung for tens of seconds on this link,
+    so it is bounded; without a user the caller falls back to a direct upload.
+    """
+    import re
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
+
+    from .utils.hf_auth import cached_whoami
+
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
+        info = pool.submit(cached_whoami).result(timeout=5) or {}
+    except (FutureTimeout, Exception):  # noqa: BLE001
+        return ""
+    finally:
+        pool.shutdown(wait=False)
+    user = info.get("name")
+    if not user:
+        return ""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-").lower()
+    return f"{user}/{slug or 'model'}"
+
+
 class JobRecord(BaseModel):
     id: str
     name: str
@@ -1242,6 +1267,192 @@ class JobRegistry:
         self._notify_change()
         return record
 
+    def discover_remote_jobs(self, config_id: str) -> builtins.list[JobRecord]:
+        """Register training runs that live on an SSH target but not locally.
+
+        The registry only knows jobs launched from this machine. A pod reused
+        from another computer still holds the lerobot run tree, its
+        train_config.json and /tmp exit-code files, which is enough to rebuild
+        a record whose checkpoints can be exported through the normal flow.
+        """
+        from .ssh_config import get_ssh_config
+
+        cfg = get_ssh_config(config_id)
+        if cfg is None:
+            raise ValueError(f"SSH config {config_id!r} not found")
+        try:
+            import paramiko
+        except ImportError as exc:
+            raise RuntimeError("paramiko is not installed. Run: pip install paramiko") from exc
+
+        probe = r"""
+import glob, json, os
+out, seen = [], set()
+for root in (os.path.expanduser('~/lelab_outputs'), '/root/lelab_outputs'):
+    for d in sorted(glob.glob(os.path.join(root, '*'))):
+        if not os.path.isdir(d) or os.path.basename(d) in seen:
+            continue
+        name = os.path.basename(d)
+        seen.add(name)
+        cfgs = sorted(glob.glob(os.path.join(d, 'checkpoints', '*', 'pretrained_model', 'train_config.json')))
+        if not cfgs:
+            root_cfg = os.path.join(d, 'pretrained_model', 'train_config.json')
+            cfgs = [root_cfg] if os.path.isfile(root_cfg) else []
+        info = {'job_id': name, 'dir': d, 'policy': None, 'dataset': None,
+                'steps': None, 'job_name': None, 'ckpts': 0, 'exit': None, 'running': False}
+        if cfgs:
+            try:
+                t = json.load(open(cfgs[-1]))
+                info['policy'] = (t.get('policy') or {}).get('type')
+                info['dataset'] = (t.get('dataset') or {}).get('repo_id')
+                info['steps'] = t.get('steps')
+                info['job_name'] = t.get('job_name')
+            except Exception:
+                pass
+        info['ckpts'] = len(glob.glob(os.path.join(d, 'checkpoints', '*', 'pretrained_model', 'config.json')))
+        ef = '/tmp/lelab_exit_' + name + '.code'
+        if os.path.isfile(ef):
+            try:
+                info['exit'] = int(open(ef).read().strip())
+            except Exception:
+                pass
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                cmd = open('/proc/' + pid + '/cmdline', 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace')
+            except Exception:
+                continue
+            if 'lerobot_train' in cmd and d in cmd:
+                info['running'] = True
+                break
+        out.append(info)
+print(json.dumps(out))
+"""
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            kwargs: dict = {
+                "hostname": cfg.host,
+                "port": cfg.port,
+                "username": cfg.username,
+                "timeout": 20,
+            }
+            if cfg.key_path:
+                kwargs["key_filename"] = os.path.expanduser(cfg.key_path)
+            elif cfg.password:
+                kwargs["password"] = cfg.password
+            client.connect(**kwargs)
+            _stdin, stdout, stderr = client.exec_command(
+                f"{cfg.remote_python or 'python3'} - <<'PY'\n{probe}PY", timeout=60
+            )
+            raw = stdout.read().decode(errors="replace").strip()
+            if not raw:
+                raise RuntimeError(
+                    stderr.read().decode(errors="replace").strip() or "remote scan produced no output"
+                )
+            entries = json.loads(raw.splitlines()[-1])
+        finally:
+            client.close()
+
+        with self._lock:
+            known = set(self._records)
+        created: builtins.list[JobRecord] = []
+        for e in entries:
+            job_id = str(e.get("job_id") or "")
+            if not job_id or job_id in known:
+                continue
+            exit_code = e.get("exit")
+            if e.get("running"):
+                state: JobState = "running"
+            elif exit_code == 0:
+                state = "done"
+            elif exit_code is not None:
+                state = "failed"
+            else:
+                state = "interrupted"
+            steps = int(e.get("steps") or 0)
+            ckpt_count = int(e.get("ckpts") or 0)
+            record = JobRecord(
+                id=job_id,
+                name=str(e.get("job_name") or job_id),
+                state=state,
+                config=TrainingRequest(
+                    dataset_repo_id=str(e.get("dataset") or "(unknown)"),
+                    policy_type=str(e.get("policy") or "unknown"),
+                    steps=steps,
+                ),
+                output_dir="",
+                started_at=time.time(),
+                ended_at=time.time() if state != "running" else None,
+                exit_code=exit_code,
+                runner="ssh",
+                ssh_config_id=config_id,
+                remote_output_dir=str(e.get("dir") or ""),
+                metrics=TrainingMetrics(
+                    current_step=max(0, ckpt_count * 2500) if steps else 0, total_steps=steps
+                ),
+            )
+            record.checkpoint_count = ckpt_count
+            with self._lock:
+                self._records[job_id] = record
+                self._persist(record, force=True)
+            created.append(record)
+        if created:
+            self._notify_change()
+        return created
+
+    def local_checkpoint_dir(self, job_id: str, step: int | None) -> Path | None:
+        """Local directory holding this job's checkpoint, or None.
+
+        SSH checkpoints physically live on the pod. The export step keeps a
+        local copy under a deterministic folder (older exports registered an
+        imported job instead), so both are checked before giving up.
+        """
+        with self._lock:
+            record = self._records.get(job_id)
+            imported = [r for r in self._records.values() if r.runner == "imported"]
+        if record is None:
+            return None
+        if record.runner in ("local", "imported"):
+            checkpoints = self._checkpoints_for(record)
+            if not checkpoints:
+                return None
+            chosen = checkpoints[-1] if step is None else next(
+                (c for c in checkpoints if c.step == step), None
+            )
+            if chosen is None:
+                return None
+            path = Path(str(chosen.ref))
+            try:
+                return path if path.is_dir() else None
+            except OSError:
+                return None
+        if step is None:
+            return None
+        candidate = self._output_root / f"imported_{job_id.replace('/', '_')}_s{step}" / "model"
+        try:
+            if (candidate / "config.json").is_file():
+                return candidate
+        except OSError:
+            pass
+        # Legacy exports used a timestamped directory, registered as an
+        # imported job named "<source name> (step N)".
+        suffix = f"(step {step})"
+        for r in imported:
+            if not r.output_dir or not r.name.endswith(suffix):
+                continue
+            if not r.name.startswith(record.name):
+                continue
+            legacy = Path(r.output_dir)
+            try:
+                if (legacy / "config.json").is_file():
+                    return legacy
+            except OSError:
+                continue
+        return None
+
     def stop(self, job_id: str) -> JobRecord:
         with self._lock:
             record = self._records.get(job_id)
@@ -1342,6 +1553,20 @@ class JobRegistry:
         return points
 
     def _checkpoints_for(self, record: JobRecord) -> builtins.list[JobCheckpoint]:
+        checkpoints = list(self._base_checkpoints_for(record))
+        # A checkpoint that was pushed to the Hub is usable as a starting point
+        # too: the pod pulls it through the mirror instead of receiving a 1.2 GB
+        # SFTP upload from this machine.
+        from .model_push import pushed_repo
+
+        repo = pushed_repo(record.id)
+        if repo and not any(c.source == "hub" and c.ref == repo for c in checkpoints):
+            checkpoints.append(
+                JobCheckpoint(step=checkpoints[-1].step if checkpoints else 0, source="hub", ref=repo)
+            )
+        return checkpoints
+
+    def _base_checkpoints_for(self, record: JobRecord) -> builtins.list[JobCheckpoint]:
         if record.runner == "imported":
             if record.hf_repo_id:
                 return self._list_cloud_cached(record.hf_repo_id)
@@ -1569,6 +1794,14 @@ class JobRegistry:
             raise ValueError(f"Job {job_id!r} has no SSH config")
 
         key = self._export_key(job_id, step)
+        # Concurrent exports of the same checkpoint each open their own SFTP
+        # session, split the pod's upstream bandwidth and clobber each other's
+        # progress (all three write the same key). Refuse the duplicate.
+        with self._lock:
+            if key in self._cancel_events:
+                raise ValueError(
+                    "该 checkpoint 正在导出中，请等待完成或先取消后再试"
+                )
         self._set_export_progress(
             key, state="preparing", transferred_bytes=0, total_bytes=0, current_file="", error=None
         )
@@ -1592,14 +1825,20 @@ class JobRegistry:
             raise RuntimeError("paramiko is not installed. Run: pip install paramiko")
 
         remote_ckpt_dir = match.ref  # e.g. /path/to/checkpoints/000100/pretrained_model
-        # Local destination: <output_root>/imported/<job_id>_step<step>/
-        import_id = _generate_job_id(record.config.policy_type, record.config.dataset_repo_id)
-        import_id = f"{import_id}_s{step}"
+        # Stable destination per (job, step) so an interrupted transfer resumes
+        # onto the same partial files instead of starting a fresh directory.
+        import_id = f"imported_{job_id.replace('/', '_')}_s{step}"
         local_dir = _job_dir(self._output_root, import_id) / "model"
         local_dir.mkdir(parents=True, exist_ok=True)
 
         cancel_event = threading.Event()
         with self._lock:
+            # Re-check under the lock: close the race between the fast-fail
+            # check above and this registration.
+            if key in self._cancel_events:
+                raise ValueError(
+                    "该 checkpoint 正在导出中，请等待完成或先取消后再试"
+                )
             self._cancel_events[key] = cancel_event
 
         client = paramiko.SSHClient()
@@ -1656,34 +1895,71 @@ class JobRegistry:
     ) -> None:
         """Recursively download a directory via SFTP, publishing byte progress.
 
-        Checks ``cancel_event`` between files (a single in-flight ``sftp.get``
-        is not interruptible) and raises ``_ExportCancelled`` when set.
+        Resumable: files already present at full size are skipped and partial
+        files continue from the local byte offset, so a server restart or a
+        dropped connection never re-transfers what already landed on disk.
+        Checks ``cancel_event`` between chunks/files and raises
+        ``_ExportCancelled`` when set.
         """
         files = self._sftp_collect_files(sftp, remote_dir)
+        total = sum(size for _, _, size in files)
+        Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+        # Seed the byte counter with what a previous attempt already wrote.
+        done = 0
+        for _, rel, size in files:
+            local_path = Path(local_dir) / rel
+            have = local_path.stat().st_size if local_path.exists() else 0
+            if have > size:
+                local_path.unlink()  # stale oversized copy — refetch cleanly
+                have = 0
+            done += have
+
         self._set_export_progress(
-            key, state="downloading", total_bytes=sum(size for _, _, size in files)
+            key, state="downloading", total_bytes=total, transferred_bytes=done
         )
         # Throttle the updates: paramiko calls back once per ~32KB packet, which
         # would otherwise take the registry lock thousands of times per second.
         last_tick = 0.0
-        done = 0
-        Path(local_dir).mkdir(parents=True, exist_ok=True)
+
+        def publish(transferred: int) -> None:
+            nonlocal last_tick
+            now = time.monotonic()
+            if transferred < total and now - last_tick < 0.2:
+                return
+            last_tick = now
+            self._set_export_progress(key, transferred_bytes=transferred)
+
         for remote_path, rel, size in files:
             if cancel_event.is_set():
                 raise _ExportCancelled()
             local_path = Path(local_dir) / rel
             local_path.parent.mkdir(parents=True, exist_ok=True)
+            have = local_path.stat().st_size if local_path.exists() else 0
+            if size > 0 and have >= size:
+                continue  # fully present; already counted in `done`
+            file_base = done - have  # bytes belonging to the other files
+            if have > 0:
+                # Resume from the local offset: sftp.get() truncates and
+                # restarts from byte 0, so stream the remainder by hand.
+                with sftp.open(remote_path, "rb") as remote_fh, open(local_path, "ab") as local_fh:
+                    remote_fh.seek(have)
+                    cur = have
+                    while True:
+                        if cancel_event.is_set():
+                            raise _ExportCancelled()
+                        chunk = remote_fh.read(1 << 20)
+                        if not chunk:
+                            break
+                        local_fh.write(chunk)
+                        cur += len(chunk)
+                        publish(file_base + cur)
+            else:
+                def on_bytes(sent: int, file_total: int, base: int = file_base) -> None:
+                    publish(base + sent)
 
-            def on_bytes(sent: int, file_total: int, rel: str = rel, base: int = done) -> None:
-                nonlocal last_tick
-                now = time.monotonic()
-                if sent < file_total and now - last_tick < 0.2:
-                    return
-                last_tick = now
-                self._set_export_progress(key, transferred_bytes=base + sent, current_file=rel)
-
-            sftp.get(remote_path, str(local_path), callback=on_bytes)
-            done += size
+                sftp.get(remote_path, str(local_path), callback=on_bytes)
+            done = file_base + size
             self._set_export_progress(key, transferred_bytes=done, current_file=rel)
 
     def cancel_export(self, job_id: str, step: int) -> dict:

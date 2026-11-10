@@ -24,6 +24,7 @@ import {
 import type { DatasetHealth, RepairProgress } from "@/lib/replayApi";
 import DatasetHealthWarning from "@/components/DatasetHealthWarning";
 import DatasetSummaryCard from "@/components/DatasetSummaryCard";
+import { compareRolloutProgress } from "@/lib/rolloutEvalApi";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -48,6 +49,7 @@ interface DatasetInfo {
 
 import MergeSection from "@/components/dataset/MergeSection";
 import RolloutScoreCard from "@/components/jobs/RolloutScoreCard";
+import SarmTrainCard from "@/components/jobs/SarmTrainCard";
 
 const Upload = () => {
   const location = useLocation();
@@ -98,12 +100,14 @@ const Upload = () => {
   const [isDeletingEpisode, setIsDeletingEpisode] = useState(false);
 
   // Dataset health check state
-  const [health, setHealth] = useState<DatasetHealth | null>(null);
-  const [checkingHealth, setCheckingHealth] = useState(false);
+  const [health, setHealth] = useState<DatasetHealth | null>(null);  const [checkingHealth, setCheckingHealth] = useState(false);
   const [isRepairing, setIsRepairing] = useState(false);
   const [repairProgress, setRepairProgress] = useState<RepairProgress | null>(
     null,
   );
+
+  // Which scorers already have a progress file for this dataset.
+  const [scoredBackends, setScoredBackends] = useState<string[]>([]);
 
   const loadDatasetInfo = React.useCallback(async () => {
     if (!initialDatasetInfo?.dataset_repo_id) {
@@ -140,6 +144,28 @@ const Upload = () => {
   React.useEffect(() => {
     loadDatasetInfo();
   }, [loadDatasetInfo]);
+
+  React.useEffect(() => {
+    const repoId = datasetInfo?.dataset_repo_id;
+    if (!repoId) {
+      setScoredBackends([]);
+      return;
+    }
+    let cancelled = false;
+    compareRolloutProgress(baseUrl, fetchWithHeaders, repoId)
+      .then((c) => {
+        if (cancelled) return;
+        // `available` means both parquets exist; otherwise the payload lists
+        // whichever single backend has scored.
+        setScoredBackends(c.available ? ["robometer", "sarm"] : c.backends ?? []);
+      })
+      .catch(() => {
+        if (!cancelled) setScoredBackends([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [datasetInfo?.dataset_repo_id, baseUrl, fetchWithHeaders]);
 
   const followUploadProgress = React.useCallback(() => {
     if (progressStream.current) return;
@@ -589,6 +615,9 @@ const Upload = () => {
           <div id="dataset-scoring" className="mt-8">
             <RolloutScoreCard initialRepoId={scoreRepoId} />
           </div>
+          <div className="mt-8">
+            <SarmTrainCard initialRepoId={scoreRepoId} />
+          </div>
         </div>
       </div>
     );
@@ -659,11 +688,23 @@ const Upload = () => {
         <div className="bg-gray-900 rounded-lg p-6 border border-gray-700 mb-8">
           <div className="flex items-center justify-between gap-4 mb-5">
             <h2 className="text-xl font-semibold text-white">数据集概览 Overview</h2>
-            <span
-              className={`rounded-full border px-3 py-1 text-xs ${uploadStatus.cls}`}
-            >
-              {uploadStatus.text}
-            </span>
+            <div className="flex items-center gap-2">
+              <span
+                className={`rounded-full border px-3 py-1 text-xs ${uploadStatus.cls}`}
+              >
+                {uploadStatus.text}
+              </span>
+              {scoredBackends.includes("robometer") ? (
+                <span className="rounded-full border border-purple-600/50 bg-purple-900/20 px-3 py-1 text-xs text-purple-400">
+                  Robometer 已评分
+                </span>
+              ) : null}
+              {scoredBackends.includes("sarm") ? (
+                <span className="rounded-full border border-cyan-600/50 bg-cyan-900/20 px-3 py-1 text-xs text-cyan-400">
+                  SARM 已评分
+                </span>
+              ) : null}
+            </div>
           </div>
 
           {isUploading && (
@@ -945,6 +986,10 @@ const Upload = () => {
 
         <div id="dataset-scoring" className="mt-8">
           <RolloutScoreCard initialRepoId={scoreRepoId} />
+        </div>
+
+        <div className="mt-8">
+          <SarmTrainCard initialRepoId={scoreRepoId} />
         </div>
       </div>
 

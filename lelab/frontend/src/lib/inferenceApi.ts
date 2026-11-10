@@ -2,6 +2,16 @@ import { Fetcher, apiRequest } from "./apiClient";
 
 export type CaptureMode = "base" | "dagger" | "highlight" | "sentry";
 
+export interface GrpcConfig {
+  enabled: boolean;
+  port: number;
+  policy_device: string;
+  actions_per_chunk: number;
+  chunk_size_threshold: number;
+  aggregate_fn: string;
+  ssh_command?: string;
+}
+
 export interface StartInferenceRequest {
   follower_port: string;
   follower_config: string;
@@ -27,6 +37,7 @@ export interface StartInferenceRequest {
   record_autonomous?: boolean;
   leader_port?: string;
   leader_config?: string;
+  grpc?: GrpcConfig;
 }
 
 export interface TakeStats {

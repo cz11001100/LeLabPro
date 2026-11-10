@@ -36,6 +36,9 @@ import {
   RunnerFlavor,
   SSHConfig,
   listSSHConfigs,
+  getUploadProgress,
+  cancelUpload,
+  UploadProgress,
 } from "@/lib/jobsApi";
 import { JobCheckpoint, ModelInfo, getCheckpointModelInfo, listJobCheckpoints } from "@/lib/checkpointsApi";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
@@ -217,6 +220,47 @@ const ConfigurationMode: React.FC = () => {
   const [trainingExtraInstallHint, setTrainingExtraInstallHint] = useState<string>("pip install accelerate");
   const [localJobRunning, setLocalJobRunning] = useState<boolean>(false);
   const [isStarting, setIsStarting] = useState(false);
+  const [upload, setUpload] = useState<UploadProgress | null>(null);
+  // Set when the operator cancels the transfer, so the aborted POST doesn't
+  // surface as a scary "Error".
+  const cancelledUploadRef = useRef(false);
+
+  const handleCancelUpload = async () => {
+    cancelledUploadRef.current = true;
+    try {
+      const res = await cancelUpload(baseUrl, fetchWithHeaders);
+      toast({ title: res.message });
+    } catch {
+      // the abort still happens server-side; nothing else to do here
+    }
+    setIsStarting(false);
+    setUpload(null);
+  };
+
+  // Starting an SSH job first pushes the checkpoint (often >1 GB) and only then
+  // creates the job record — poll the transfer so the button isn't a dead spin.
+  // The first tick also runs on mount, so reloading the page re-attaches to a
+  // transfer that is already in flight.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = () =>
+      getUploadProgress(baseUrl, fetchWithHeaders)
+        .then((u) => {
+          if (!cancelled) setUpload(u);
+        })
+        .catch(() => {});
+    tick();
+    if (!isStarting && !upload?.active) {
+      return () => {
+        cancelled = true;
+      };
+    }
+    const id = window.setInterval(tick, 1500);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [isStarting, upload?.active, baseUrl, fetchWithHeaders]);
   const [policyExtra, setPolicyExtra] = useState<{
     policyType: string;
     packageName: string;
@@ -320,6 +364,7 @@ const ConfigurationMode: React.FC = () => {
       }
     }
 
+    cancelledUploadRef.current = false;
     setIsStarting(true);
     try {
       const job = await startTrainingJob(baseUrl, fetchWithHeaders, configToRequest(trainingConfig));
@@ -327,7 +372,9 @@ const ConfigurationMode: React.FC = () => {
       navigate(`/training/${job.id}`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      toast({ title: "Error", description: msg, variant: "destructive" });
+      if (!cancelledUploadRef.current) {
+        toast({ title: "Error", description: msg, variant: "destructive" });
+      }
       // If the failure was the 409 case, refresh our running-job knowledge.
       listJobs(baseUrl, fetchWithHeaders, 200)
         .then((j) =>
@@ -406,7 +453,51 @@ const ConfigurationMode: React.FC = () => {
           sshConfigs={sshConfigs}
           sshConfigsLoading={sshConfigsLoading}
         />
-        <div className="max-w-3xl mx-auto mt-6 flex justify-end">
+        <div className="max-w-3xl mx-auto mt-6">
+          {upload?.interrupted && !upload?.active && (
+            <p className="mb-2 text-xs text-amber-400">
+              上次 checkpoint 上传被中断（服务重启），需要重新点 Start Training。
+            </p>
+          )}
+          {upload?.active && (
+            <div className="mb-3 space-y-1 rounded-lg border border-slate-700 bg-slate-800/60 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-300">
+                <span>
+                  {upload.phase === "packing"
+                    ? `正在打包 checkpoint（${upload.name}）…`
+                    : `正在上传 checkpoint 到远端（${upload.name}）`}
+                </span>
+                <span className="text-slate-400">
+                  {upload.phase === "packing"
+                    ? "准备中"
+                    : `${Math.round((upload.sent ?? 0) / 1e6)} / ${Math.round(
+                        (upload.total ?? 0) / 1e6,
+                      )} MB` +
+                      (upload.eta_s != null ? ` · 约 ${Math.ceil(upload.eta_s / 60)} 分钟` : "")}
+                </span>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleCancelUpload}
+                  className="h-6 border-slate-600 px-2 text-[11px] text-black hover:bg-slate-200 hover:text-black"
+                >
+                  取消上传
+                </Button>
+              </div>
+              <div className="h-1.5 w-full overflow-hidden rounded bg-slate-700">
+                <div
+                  className={`h-full bg-blue-500 transition-all ${
+                    upload.phase === "packing" ? "animate-pulse" : ""
+                  }`}
+                  style={{ width: `${upload.phase === "packing" ? 100 : upload.percent ?? 0}%` }}
+                />
+              </div>
+              <p className="text-[11px] text-slate-500">
+                传完会自动开始训练，期间不要关闭这个页面
+              </p>
+            </div>
+          )}
+          <div className="flex justify-end">
           {(() => {
             const startButton = (
               <Button
@@ -440,6 +531,7 @@ const ConfigurationMode: React.FC = () => {
               </Tooltip>
             );
           })()}
+          </div>
         </div>
       </div>
 

@@ -52,18 +52,30 @@ const AdvancedCard: React.FC<ConfigComponentProps> = ({ config, updateConfig }) 
     setCkptLoading(true);
     listJobs(baseUrl, fetchWithHeaders, 100, controller.signal)
       .then((jobs) => {
-        const relevant = jobs.filter(
-          (j) => j.checkpoint_count > 0 && (isSSH ? j.runner === "ssh" : j.runner !== "ssh"),
-        );
+        // SSH runs can start from pod checkpoints and from local ones (the
+        // runner uploads those to the pod before training). Local runs can
+        // only use host paths, so other pods' checkpoints stay hidden there.
+        const relevant = jobs.filter((j) => {
+          if (j.checkpoint_count <= 0) return false;
+          if (j.runner === "hf_cloud") return false;
+          if (!isSSH && j.runner === "ssh") return false;
+          return true;
+        });
         return Promise.all(
           relevant.map((job) =>
             listJobCheckpoints(baseUrl, fetchWithHeaders, job.id, controller.signal)
               .then((cks) =>
                 cks
-                  .filter((c) => c.source === "local")
+                  // SSH runs can also start from a checkpoint that lives on the
+                  // Hub — the pod pulls it, so no local upload is needed.
+                  .filter((c) => c.source === "local" || (isSSH && c.source === "hub"))
                   .map((c) => ({
                     value: c.ref,
-                    label: `${job.name} · step ${c.step}`,
+                    // Imported single models list as step 0; their name already
+                    // carries the real step, so a "step 0" suffix is just noise.
+                    label: `${job.name}${c.step > 0 ? ` · step ${c.step}` : ""}${
+                      c.source === "hub" ? " · Hub" : ""
+                    }`,
                   })),
               )
               .catch(() => [] as { value: string; label: string }[]),

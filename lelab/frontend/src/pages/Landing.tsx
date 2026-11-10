@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, useMemo } from "react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { useNavigate, useLocation } from "react-router-dom";
 import { ChevronsUpDown, RotateCw, Rocket, Database, Brain, Loader2, FlaskConical } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -17,6 +17,7 @@ import UsageInstructionsModal from "@/components/landing/UsageInstructionsModal"
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import { useRobots } from "@/hooks/useRobots";
 import { useDatasets } from "@/hooks/useDatasets";
+import { useJobsChangedSignal } from "@/hooks/useJobsChangedSignal";
 import { DatasetItem } from "@/lib/replayApi";
 import { CameraConfig } from "@/components/recording/CameraConfiguration";
 import {
@@ -93,13 +94,24 @@ const Landing = () => {
   // Deploy/Eval pickers mirror the model cards' checkpoint grouping.
   const modelGroups = useMemo(() => groupImportedByRun(importedModels), [importedModels]);
 
-  useEffect(() => {
-    listJobs(baseUrl, fetchWithHeaders, 100).then((jobs) => {
+  const refreshImportedModels = useCallback(async () => {
+    try {
+      const jobs = await listJobs(baseUrl, fetchWithHeaders, 100);
       const imported = jobs.filter((j) => j.runner === "imported");
       importedModelsCache.set(baseUrl, imported);
       setImportedModels(imported);
-    }).catch(() => {});
+    } catch {
+      // keep the cached list on transient failures
+    }
   }, [baseUrl, fetchWithHeaders]);
+
+  // Fetch on mount, and keep in sync afterwards: a checkpoint exported from
+  // the jobs section registers a new imported record without remounting this
+  // page, so the Deploy/Eval pickers would otherwise stay stale until reload.
+  useEffect(() => {
+    refreshImportedModels();
+  }, [refreshImportedModels]);
+  useJobsChangedSignal(refreshImportedModels);
 
   const releaseStreamsRef = useRef<(() => void) | null>(null);
 
@@ -425,7 +437,13 @@ const Landing = () => {
               <Rocket className="h-5 w-5 text-gray-400" />
               部署 Deploy
             </h3>
-            <Popover open={deployPopoverOpen} onOpenChange={setDeployPopoverOpen}>
+            <Popover
+              open={deployPopoverOpen}
+              onOpenChange={(open) => {
+                setDeployPopoverOpen(open);
+                if (open) refreshImportedModels();
+              }}
+            >
               <PopoverTrigger asChild>
                 <Button
                   variant="outline"
@@ -478,7 +496,13 @@ const Landing = () => {
               <FlaskConical className="h-5 w-5 text-purple-400" />
               评估 Evaluation
             </h3>
-            <Popover open={evalPopoverOpen} onOpenChange={setEvalPopoverOpen}>
+            <Popover
+              open={evalPopoverOpen}
+              onOpenChange={(open) => {
+                setEvalPopoverOpen(open);
+                if (open) refreshImportedModels();
+              }}
+            >
               <PopoverTrigger asChild>
                 <Button
                   variant="outline"

@@ -89,6 +89,26 @@ def clear_score_job() -> None:
         _score_job_path().unlink()
 
 
+def mark_score_job_pulled() -> None:
+    """Remember that the pod's parquet is already here.
+
+    Without this marker every card mount re-enters the finish branch and pulls
+    the remote file again, silently overwriting a reconciled or promoted copy.
+    """
+    import json
+
+    record = load_score_job()
+    if not record:
+        return
+    record["pulled_at"] = time.time()
+    try:
+        tmp = _score_job_path().with_suffix(".tmp")
+        tmp.write_text(json.dumps(record, ensure_ascii=False, indent=1))
+        tmp.replace(_score_job_path())
+    except OSError:
+        pass
+
+
 def finish_score_job(*, failed: bool) -> None:
     """Mark the job done but keep its record — the log is what explains a crash."""
     import json
@@ -1237,7 +1257,8 @@ def handle_rollout_score_remote_status(
     if status.get("running"):
         status.update(_parse_scoring_progress(str(status.get("log_chunk") or "")))
     status.pop("log_chunk", None)
-    if status.get("finished_ok") and dataset_repo_id and backend:
+    already_pulled = bool(load_score_job().get("pulled_at"))
+    if status.get("finished_ok") and dataset_repo_id and backend and not already_pulled:
         from .ssh_remote_env import download_remote_file
 
         filename = PROGRESS_BY_BACKEND[backend]
@@ -1247,6 +1268,7 @@ def handle_rollout_score_remote_status(
         if got.get("success"):
             with contextlib.suppress(OSError):
                 tmp.replace(root / filename)
+            mark_score_job_pulled()
             status["pulled"] = got
         else:
             status["pulled"] = got
