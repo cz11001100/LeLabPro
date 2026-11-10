@@ -21,6 +21,7 @@ lives in app/jobs.py.
 import importlib
 import json
 import logging
+import os
 import platform
 import re
 from typing import TYPE_CHECKING
@@ -59,20 +60,46 @@ def accelerate_mixed_precision(policy_type: str) -> str:
 
 
 def resolve_hub_revision(repo_id: str, repo_type: str = "dataset") -> str | None:
-    """Current commit SHA of a Hub repo, read from huggingface.co directly.
+    """Current commit SHA of a Hub repo, read from Hugging Face (mirror-aware).
 
     A pod that resolves `main` through a mirror can be handed a cached, stale
     file tree — after remote files were deleted it still downloads them, which
     reintroduces the index-out-of-bounds crash. Pinning the SHA skips that
     resolution entirely. Returns None when the Hub can't be reached.
+
+    The endpoint honours ``HF_ENDPOINT``: on networks where huggingface.co is
+    unreachable (mainland China), a hardcoded direct call hung the caller
+    forever — and since this runs inside the FastAPI event loop it froze the
+    whole UI. An 8s timeout keeps a dead Hub from blocking a training start;
+    LeRobot falls back to resolving the ref itself, which the pod does through
+    the mirror.
     """
+    endpoint = os.environ.get("HF_ENDPOINT") or "https://huggingface.co"
     try:
         from huggingface_hub import HfApi
 
-        return HfApi(endpoint="https://huggingface.co").repo_info(repo_id, repo_type=repo_type).sha
+        return HfApi(endpoint=endpoint).repo_info(repo_id, repo_type=repo_type, timeout=8).sha
     except Exception as exc:
-        logger.warning("Could not resolve Hub revision for %s (%s)", repo_id, str(exc)[:160])
+        logger.warning("Could not resolve Hub revision for %s via %s (%s)", repo_id, endpoint, str(exc)[:160])
         return None
+
+
+def _preset_optimizer_defaults(policy_type: str) -> tuple[float, float, float]:
+    """The policy's own optimizer preset (lr, weight_decay, grad_clip).
+
+    Needed when a scheduler override forces ``use_policy_training_preset=false``:
+    lerobot then requires a complete optimizer, and silently falling back to a
+    generic lr would train a different model than the one the user picked.
+    """
+    try:
+        import lerobot.policies  # noqa: F401 - registers policy choices
+        from lerobot.configs.policies import PreTrainedConfig
+
+        preset = PreTrainedConfig.get_choice_class(policy_type)().get_optimizer_preset()
+        return float(preset.lr), float(preset.weight_decay), float(getattr(preset, "grad_clip_norm", 10.0))
+    except Exception:
+        logger.warning("Falling back to ACT optimizer defaults for %s", policy_type)
+        return 1e-5, 1e-4, 10.0
 
 
 def _resolve_video_backend(requested: str | None) -> str:
@@ -176,17 +203,6 @@ class TrainingRequest(BaseModel):
     augmentation_sharpness: bool = True
     augmentation_affine: bool = True
 
-    # RA-BC sample weighting: per-frame loss weights derived from task progress
-    # (delta = progress[t+chunk] - progress[t]), so frames where the recorded
-    # action moved the task backwards contribute nothing. Needs a progress
-    # parquet next to the dataset (see lelab.rollout_eval); lerobot auto-finds
-    # `<dataset root>/sarm_progress.parquet` when no path is given.
-    sample_weighting_enable: bool = False
-    sample_weighting_type: str = "rabc"
-    sample_weighting_progress_path: str | None = None
-    sample_weighting_kappa: float | None = None
-    sample_weighting_head_mode: str | None = None
-
     # Optimizer — None = defer to the policy's training preset (e.g. SmolVLA
     # uses AdamW lr=1e-4/betas=(0.9,0.95)). lerobot applies the preset only on
     # fresh runs; on a *resume* an explicit flag here would win, so always
@@ -200,6 +216,10 @@ class TrainingRequest(BaseModel):
     scheduler_warmup_steps: int | None = None
     scheduler_decay_steps: int | None = None
     scheduler_decay_lr: float | None = None
+    # Cosine schedule peak LR; defaults to the optimizer LR, then to ACT's
+    # 1e-5 preset. The form has no field for it because it almost always
+    # equals the learning rate the user already picked.
+    scheduler_peak_lr: float | None = None
 
     # Advanced
     use_policy_training_preset: bool = True
@@ -380,38 +400,66 @@ def build_training_command(
     cmd.extend(["--eval.batch_size", str(request.eval_batch_size)])
     cmd.extend(["--eval.use_async_envs", "true" if request.eval_use_async_envs else "false"])
 
-    # Optimizer
-    if request.optimizer_type:
-        cmd.extend(["--optimizer.type", request.optimizer_type])
-    if request.optimizer_lr is not None:
-        cmd.extend(["--optimizer.lr", str(request.optimizer_lr)])
-    if request.optimizer_weight_decay is not None:
-        cmd.extend(["--optimizer.weight_decay", str(request.optimizer_weight_decay)])
-    if request.optimizer_grad_clip_norm is not None:
-        cmd.extend(["--optimizer.grad_clip_norm", str(request.optimizer_grad_clip_norm)])
+    # Optimizer / scheduler / preset.
+    # lerobot's TrainPipelineConfig.validate() throws away optimizer and
+    # scheduler overrides whenever use_policy_training_preset is true (it
+    # re-applies the policy preset). A scheduler override therefore silently
+    # became "constant lr" unless the preset is switched off in the same
+    # command — and with the preset off lerobot demands a full optimizer.
+    optimizer_overrides = (
+        request.optimizer_type is not None
+        or request.optimizer_lr is not None
+        or request.optimizer_weight_decay is not None
+        or request.optimizer_grad_clip_norm is not None
+    )
+    scheduler_overrides = (
+        request.scheduler_warmup_steps is not None
+        or request.scheduler_decay_steps is not None
+        or request.scheduler_decay_lr is not None
+    )
+    disable_preset = (not request.use_policy_training_preset) or scheduler_overrides
 
-    # Scheduler (overrides; unset = policy preset defaults)
-    if request.scheduler_warmup_steps is not None:
-        cmd.extend(["--scheduler.num_warmup_steps", str(request.scheduler_warmup_steps)])
-    if request.scheduler_decay_steps is not None:
-        cmd.extend(["--scheduler.num_decay_steps", str(request.scheduler_decay_steps)])
-    if request.scheduler_decay_lr is not None:
-        cmd.extend(["--scheduler.decay_lr", str(request.scheduler_decay_lr)])
+    if disable_preset:
+        default_lr, default_wd, default_clip = _preset_optimizer_defaults(request.policy_type)
+        lr = request.optimizer_lr if request.optimizer_lr is not None else default_lr
+        cmd.extend([
+            "--use_policy_training_preset", "false",
+            "--optimizer.type", request.optimizer_type or "adamw",
+            "--optimizer.lr", str(lr),
+            "--optimizer.weight_decay", str(
+                request.optimizer_weight_decay if request.optimizer_weight_decay is not None else default_wd
+            ),
+            "--optimizer.grad_clip_norm", str(
+                request.optimizer_grad_clip_norm
+                if request.optimizer_grad_clip_norm is not None
+                else default_clip
+            ),
+        ])
+        if optimizer_overrides and not scheduler_overrides:
+            logger.warning("Optimizer overrides without a scheduler will fail: lerobot requires both")
+    else:
+        if optimizer_overrides:
+            logger.warning("Optimizer overrides ignored while use_policy_training_preset is on")
+        cmd.extend(["--use_policy_training_preset", "true"])
 
-    # RA-BC weighting (off unless asked for: it silently changes the objective).
-    # `sample_weighting` is Optional on lerobot's side and has no `enable`
-    # field — the config object exists exactly when we pass one of its fields.
-    if request.sample_weighting_enable:
-        cmd.extend(["--training.sample_weighting.type", request.sample_weighting_type])
-        if request.sample_weighting_progress_path:
-            cmd.extend(["--training.sample_weighting.progress_path", request.sample_weighting_progress_path])
-        if request.sample_weighting_kappa is not None:
-            cmd.extend(["--training.sample_weighting.kappa", str(request.sample_weighting_kappa)])
-        if request.sample_weighting_head_mode:
-            cmd.extend(["--training.sample_weighting.head_mode", request.sample_weighting_head_mode])
+    # Scheduler: draccus resolves LRSchedulerConfig through a choice registry,
+    # so a bare --scheduler.num_warmup_steps fails with "Expected a dict with a
+    # 'type' key". The form only exposes the three numeric knobs; infer the
+    # cosine schedule and fill the fields the form doesn't ask for.
+    if scheduler_overrides:
+        warmup_steps = request.scheduler_warmup_steps or 0
+        decay_steps = request.scheduler_decay_steps or request.steps
+        peak_lr = request.scheduler_peak_lr or lr
+        decay_lr = request.scheduler_decay_lr if request.scheduler_decay_lr is not None else 0.0
+        cmd.extend([
+            "--scheduler.type", "cosine_decay_with_warmup",
+            "--scheduler.num_warmup_steps", str(warmup_steps),
+            "--scheduler.num_decay_steps", str(decay_steps),
+            "--scheduler.peak_lr", str(peak_lr),
+            "--scheduler.decay_lr", str(decay_lr),
+        ])
 
     # Advanced
-    cmd.extend(["--use_policy_training_preset", "true" if request.use_policy_training_preset else "false"])
     if request.config_path:
         cmd.append(f"--config_path={request.config_path}")
 

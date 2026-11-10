@@ -22,6 +22,7 @@ import builtins
 import contextlib
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -189,6 +190,18 @@ def _parse_duration(s: str) -> float | None:
     return None
 
 
+def _finite(value: float | None) -> float | None:
+    """JSON cannot carry inf/nan, and FastAPI then fails the whole response.
+
+    The first logged step of a fresh run often has grad_norm=inf (unscaled
+    warmup), which is exactly what made /metrics-history and /training-health
+    return 500 and left the charts with a single dot.
+    """
+    if value is None:
+        return None
+    return value if math.isfinite(value) else None
+
+
 def parse_metrics_into(line: str, metrics: TrainingMetrics) -> None:
     """Update `metrics` in-place from one stdout line.
 
@@ -213,15 +226,19 @@ def parse_metrics_into(line: str, metrics: TrainingMetrics) -> None:
 
         if "step:" in line and "loss:" in line:
             with contextlib.suppress(ValueError):
+                # Plain digits only: past step 1000 lerobot prints "18K", and
+                # int() fails so the exact tqdm step parsed above is kept.
+                # That is what gives the chart ~180 points instead of one per
+                # thousand-step bucket.
                 metrics.current_step = int(line.split("step:")[1].split()[0].replace(",", ""))
             with contextlib.suppress(ValueError):
-                metrics.current_loss = float(line.split("loss:")[1].split()[0])
+                metrics.current_loss = _finite(float(line.split("loss:")[1].split()[0]))
             if "lr:" in line:
                 with contextlib.suppress(ValueError):
-                    metrics.current_lr = float(line.split("lr:")[1].split()[0])
+                    metrics.current_lr = _finite(float(line.split("lr:")[1].split()[0]))
             if "grdn:" in line:
                 with contextlib.suppress(ValueError):
-                    metrics.grad_norm = float(line.split("grdn:")[1].split()[0])
+                    metrics.grad_norm = _finite(float(line.split("grdn:")[1].split()[0]))
 
     except Exception as exc:
         logger.debug("Error parsing log line %r: %s", line, exc)
@@ -1319,9 +1336,9 @@ class JobRegistry:
                     continue
                 point = MetricsHistoryPoint(
                     step=fresh.current_step,
-                    loss=fresh.current_loss,
-                    lr=fresh.current_lr,
-                    grad_norm=fresh.grad_norm,
+                    loss=_finite(fresh.current_loss),
+                    lr=_finite(fresh.current_lr),
+                    grad_norm=_finite(fresh.grad_norm),
                 )
                 # Dedupe by step: overwrite on consecutive same-step lines.
                 if points and points[-1].step == point.step:
@@ -1760,18 +1777,27 @@ class JobRegistry:
             if record.validation_state == "running":
                 return {"validation_state": "running", "message": "Validation already in progress"}
 
-            ckpts = self._list_checkpoints_unlocked(job_id)
-            if not ckpts:
-                raise ValueError(f"No checkpoints found for job {job_id}")
+        # SSH checkpoints live on the pod, so listing them opens an SFTP
+        # session. _list_checkpoints_unlocked only ever scanned a local
+        # checkpoints/ directory, so every cloud job reported "No checkpoints
+        # found" and remote validation was unreachable.
+        if record.runner == "ssh":
+            ckpts = _list_ssh_checkpoints(record)
+        else:
+            with self._lock:
+                ckpts = self._list_checkpoints_unlocked(job_id)
+        if not ckpts:
+            raise ValueError(f"No checkpoints found for job {job_id}")
 
-            step = opts.get("step")
-            if step is None:
-                latest = ckpts[-1]
-            else:
-                latest = next((c for c in ckpts if c.step == int(step)), None)
-                if latest is None:
-                    raise ValueError(f"No checkpoint at step {step} for job {job_id}")
+        step = opts.get("step")
+        if step is None:
+            latest = ckpts[-1]
+        else:
+            latest = next((c for c in ckpts if c.step == int(step)), None)
+            if latest is None:
+                raise ValueError(f"No checkpoint at step {step} for job {job_id}")
 
+        with self._lock:
             # Charts land under the job dir so the server can serve them by
             # relative path without exposing the whole filesystem.
             chart_dir = _job_dir(self._output_root, job_id) / "evaluation" / datetime.now().strftime(
@@ -1910,6 +1936,7 @@ class JobRegistry:
         seed: int = 0,
         holdout_episodes: int = 0,
         episodes: list[int] | None = None,
+        frames_per_episode: int = 0,
         probe: bool = True,
         device: str = "cuda",
         saliency_frames: int = 0,
@@ -1987,6 +2014,8 @@ class JobRegistry:
             )
             if holdout_episodes:
                 cmd += f" --holdout-episodes {int(holdout_episodes)}"
+            if frames_per_episode:
+                cmd += f" --frames-per-episode {int(frames_per_episode)}"
             if episodes:
                 cmd += " --episodes " + ",".join(str(int(e)) for e in episodes)
             if not probe:
@@ -1994,6 +2023,12 @@ class JobRegistry:
             nohup_cmd = (
                 f"nohup bash -c '{cmd}; echo $? > {remote_exit}' > {remote_log} 2>&1 & echo $!"
             )
+            # The exit/log files are named per job, not per (job, step), so a
+            # second validation on the same job would read the previous run's
+            # stale EXIT=0 the moment its log got truncated and report
+            # "exited with code 0" with nothing to show. Clear them first.
+            with contextlib.suppress(Exception):
+                client.exec_command(f"rm -f {remote_exit} {remote_log}", timeout=15)[1].channel.recv_exit_status()
             _stdin, stdout, _stderr = client.exec_command(nohup_cmd, timeout=30)
             pid_out = stdout.read().decode().strip()
             logger.info("SSH validation started (pid=%s) for job %s", pid_out, job_id)
@@ -2023,7 +2058,9 @@ class JobRegistry:
                             client.close()
                         client = _connect()
                     _stdin, stdout, _stderr = client.exec_command(
-                        f"grep -m1 '^RESULT_JSON ' {remote_log} 2>/dev/null; "
+                        # tqdm writes with \r and no trailing newline, so the
+                        # marker can end up mid-"line"; normalize before grep.
+                        f"tr '\\r' '\\n' < {remote_log} 2>/dev/null | grep -aom1 'RESULT_JSON .*'; "
                         f"test -f {remote_exit} && echo EXIT=$(cat {remote_exit})",
                         timeout=15,
                     )
@@ -2034,9 +2071,10 @@ class JobRegistry:
 
                 exit_code: int | None = None
                 for line in out.splitlines():
-                    if line.startswith("RESULT_JSON "):
+                    marker = line.find("RESULT_JSON ")
+                    if marker >= 0:
                         try:
-                            result_json = json.loads(line[len("RESULT_JSON "):])
+                            result_json = json.loads(line[marker + len("RESULT_JSON "):])
                         except json.JSONDecodeError:
                             pass
                     elif line.startswith("EXIT="):

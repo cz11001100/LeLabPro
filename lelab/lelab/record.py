@@ -293,6 +293,25 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
             return {"success": False, "message": "Teleoperation is currently active. Stop it first."}
         if _rollout.inference_active:
             return {"success": False, "message": "Inference is currently active. Stop it first."}
+        # Fail fast on a camera set that cannot actually stream together. The check is
+        # measured (opens them at once for a moment), because whether one controller
+        # accepts a second UVC reservation is host-firmware dependent: this AMD laptop
+        # takes one per controller, an Intel box may take three. Network (RTSP/URL)
+        # cameras have no USB reservation, so they are excluded from the probe.
+        from .camera_service import preflight as camera_preflight
+        from .network_camera import camera_source
+
+        usb_cameras = {}
+        for name, cam in (request.cameras or {}).items():
+            try:
+                kind, _source = camera_source(cam)
+            except Exception:
+                kind = "device"
+            if kind != "network":
+                usb_cameras[name] = cam
+        problem = camera_preflight(usb_cameras)
+        if problem:
+            return {"success": False, "message": problem}
         recording_active = True
         recording_thread = None
         recording_events = None

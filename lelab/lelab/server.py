@@ -28,16 +28,18 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from starlette.datastructures import Headers
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 from starlette.types import Scope
 
 # Import our custom recording functionality
-from . import datasets as dataset_browser, record as _record
+from . import camera_service, datasets as dataset_browser, record as _record
+from .camera_console import HTML as CAMERA_CONSOLE_HTML
 from .datasets import analyze_dataset
 
 # Import our custom calibration functionality
@@ -669,18 +671,49 @@ def recording_status():
 
 @app.get("/camera-feed/{cam_key}")
 def camera_feed(cam_key: str):
-    """Live MJPEG preview of one configured camera during an active recording.
+    """Live MJPEG preview of one camera.
 
-    Browsers render `multipart/x-mixed-replace` directly in an <img>, so the
-    frontend just points an <img> at this URL. Only valid while a session is
-    active; the generator ends itself when recording stops.
+    While a recording owns the devices the frames are peeked from the record
+    loop (zero device contention); outside a session `camera_service` opens the
+    node itself, shares it between viewers, releases it when the last viewer
+    leaves, and paints the failure reason into the frame so a broken camera
+    explains itself instead of going black. Network cameras have their own
+    /network-camera-feed route.
     """
-    if not _record.recording_active:
-        raise HTTPException(status_code=409, detail="No active recording session")
+    if _record.recording_active:
+        return StreamingResponse(
+            _record.camera_feed_frames(cam_key),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
     return StreamingResponse(
-        _record.camera_feed_frames(cam_key),
+        camera_service.preview_frames(cam_key),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
+
+
+@app.get("/camera-health")
+def camera_health(refresh: bool = False, concurrency: bool = False):
+    """Per-camera verdict: fps / failure reason, and which nodes share one xHCI.
+
+    Cameras are probed one at a time (that is what makes a solo measurement
+    meaningful); pass `concurrency=true` to open them all at once and see which one
+    loses the isochronous-bandwidth fight. Refuses to run while a recording,
+    inference or teleoperation session owns the devices.
+    """
+    return camera_service.health(refresh=refresh, concurrency=concurrency)
+
+
+@app.get("/cameras", response_class=HTMLResponse)
+def cameras_page():
+    """Standalone camera console: watch any camera at any time, plus the health table.
+
+    Deliberately served by FastAPI instead of the React bundle so it works with no
+    frontend rebuild. One large preview at a time on purpose: on a host whose
+    controller accepts only a single UVC stream (measured here on AMD), several tiles
+    at once would fight for isochronous bandwidth and misreport what the cameras can
+    really do — the page's "并发验证" button runs that fight on purpose, as a test.
+    """
+    return CAMERA_CONSOLE_HTML
 
 
 # A stream URL carries `user:password@`. Registering it once and addressing the
@@ -739,16 +772,14 @@ def network_camera_feed(key: str):
     Independent of any session: RTSP takes several client sessions, so the picker
     can watch a camera while a recording or inference run holds its own copy.
     """
-    from .network_camera import preview_frames
+    from .network_camera import open_preview
 
     source = _network_preview_sources.get(key)
     if source is None:
         raise HTTPException(status_code=404, detail="Unknown preview key — re-register the camera URL")
     _network_preview_sources[key] = (source[0], time.time())
-    return StreamingResponse(
-        preview_frames(source[0]),
-        media_type="multipart/x-mixed-replace; boundary=frame",
-    )
+    media_type, chunks = open_preview(source[0])
+    return StreamingResponse(chunks, media_type=media_type)
 
 
 @app.post("/recording-exit-early")
@@ -909,7 +940,10 @@ async def create_training_job(req: Request):
     raw = await req.json()
     body = StartTrainingBody.from_legacy(raw)
     try:
-        record = job_registry.start(body.config, body.target)
+        # start() connects over SSH and may resolve the dataset SHA; running it
+        # inline would block the event loop and freeze every other request
+        # (page polling included) for the duration.
+        record = await run_in_threadpool(job_registry.start, body.config, body.target)
     except JobAlreadyRunningError as exc:
         raise HTTPException(status_code=409, detail=f"Job already running: {exc}") from exc
     except ValueError as exc:

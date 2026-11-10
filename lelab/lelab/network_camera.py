@@ -15,6 +15,7 @@ inference subprocess through lerobot's CLI parser.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import math
 import os
@@ -79,6 +80,54 @@ def redact(url: Any) -> str:
     return re.sub(r"^([a-zA-Z]+://)[^/@:]+:[^/@]+@", r"\1***@", str(url))
 
 
+def split_url_rotation(url: str) -> tuple[str, int]:
+    """Strip a `#rotate=90` or `?rotate=90` marker and return (clean URL, degrees).
+
+    The camera form has no rotation control, so a phone mounted sideways can be
+    fixed by appending the marker to its URL. A fragment is never sent over the
+    network; a query parameter is removed here. Both forms are accepted because
+    some UIs percent-encode the `#`.
+    """
+    angle = 0
+
+    def _parse(parts: list[str]) -> int:
+        found = 0
+        for part in parts:
+            if part.startswith("rotate="):
+                with contextlib.suppress(ValueError):
+                    found = int(float(part.split("=", 1)[1]))
+        return found
+
+    base = url
+    if "#" in base:
+        base, fragment = base.split("#", 1)
+        angle = _parse(re.split(r"[&;]", fragment))
+    if "?" in base:
+        head, query = base.split("?", 1)
+        parts = re.split(r"[&;]", query)
+        stripped = [p for p in parts if not p.startswith("rotate=")]
+        if len(stripped) != len(parts):
+            angle = _parse(parts) or angle
+            base = head + ("?" + "&".join(stripped) if stripped else "")
+    angle %= 360
+    return base, angle if angle in (90, 180, 270) else 0
+
+
+def rotate_frame(frame: Any, angle: int) -> Any:
+    """Rotate a BGR frame clockwise by 0/90/180/270 degrees."""
+    if not angle or frame is None:
+        return frame
+    import cv2
+
+    if angle == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if angle == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    if angle == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return frame
+
+
 def ensure_stream_env() -> None:
     """Pin OpenCV's FFmpeg backend to TCP with a bounded connect timeout.
 
@@ -89,8 +138,12 @@ def ensure_stream_env() -> None:
     """
     os.environ.setdefault(
         "OPENCV_FFMPEG_CAPTURE_OPTIONS",
-        # stimeout and max_delay are microseconds.
-        "rtsp_transport;tcp|stimeout;8000000|fflags;nobuffer|max_delay;500000|flags;low_delay",
+        # stimeout and max_delay are microseconds. max_delay=0 tells the demuxer
+        # not to hold packets for reordering (it defaulted to 0.5 s here, which
+        # is most of the visible lag); a small probe budget starts playback
+        # sooner instead of buffering a second of stream first.
+        "rtsp_transport;tcp|stimeout;8000000|fflags;nobuffer|max_delay;0|flags;low_delay"
+        "|probesize;32768|analyzeduration;0",
     )
 
 
@@ -228,6 +281,11 @@ class NetworkCameraConfig(OpenCVCameraConfig):
 
     def __post_init__(self) -> None:
         self.index_or_path = normalize_url(self.index_or_path)
+        self.index_or_path, angle = split_url_rotation(self.index_or_path)
+        if angle:
+            from lerobot.cameras.configs import Cv2Rotation
+
+            self.rotation = Cv2Rotation({90: 90, 180: 180, 270: -90}[angle])
         super().__post_init__()
         self.backend = Cv2Backends.ANY
 
@@ -467,12 +525,16 @@ def preview_stream(url: str):
     RTSP allows several concurrent client sessions, so LeLab can open its own copy
     for a live preview while a recording or inference run holds the primary one —
     unlike a UVC device, which takes a single opener. `read()`/`release()` match
-    cv2's so callers don't need to know which kind of source they got.
+    cv2's so callers don't need to know what kind of source they got.
+
+    A trailing ``#rotate=90`` (or 180/270) is honoured and stripped before the URL
+    reaches OpenCV — a phone held sideways streams its sensor orientation, and the
+    camera picker has no rotation control to fix it.
     """
 
     class _Stream:
         def __init__(self, target: str) -> None:
-            self.url = normalize_url(target)
+            self.url, self.angle = split_url_rotation(normalize_url(target))
             self.cap = None
             self._next_open = 0.0
 
@@ -489,9 +551,12 @@ def preview_stream(url: str):
                     self.cap = None
                     self._next_open = time.monotonic() + 2.0
                     return False, None
+                with contextlib.suppress(Exception):
+                    # Decoder-side queue: 1 keeps ~one frame of lag on MJPEG.
+                    self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             ok, frame = self.cap.read()
             if ok and frame is not None:
-                return True, frame
+                return True, rotate_frame(frame, self.angle)
             # A failed read means the session is gone for good; reopen on the next call.
             self.cap.release()
             self.cap = None
@@ -506,7 +571,93 @@ def preview_stream(url: str):
     return _Stream(url)
 
 
-def preview_frames(url: str, fps: float = 10.0, max_misses: int | None = None):
+_PREVIEW_HUBS: dict[tuple[str, int], "_PreviewHub"] = {}
+_PREVIEW_HUBS_LOCK = threading.Lock()
+
+
+class _PreviewHub:
+    """One upstream connection per URL, fanned out to every preview viewer.
+
+    A phone camera server splits its frame rate across clients: three open
+    preview tabs turned a 25 fps stream into 7.5 fps each, which reads as
+    "high latency". A single reader thread keeps the newest encoded frame and
+    every viewer sees that same frame.
+    """
+
+    def __init__(self, url: str, angle: int) -> None:
+        self.url = url
+        self.angle = angle
+        self._cond = threading.Condition()
+        self._latest: bytes | None = None
+        self._seq = 0
+        self._started = False
+        self._start_lock = threading.Lock()
+
+    def _ensure_started(self) -> None:
+        with self._start_lock:
+            if self._started:
+                return
+            self._started = True
+            threading.Thread(target=self._run, name="preview-hub", daemon=True).start()
+
+    def _run(self) -> None:
+        import cv2
+
+        while True:
+            ensure_stream_env()
+            cap = cv2.VideoCapture(self.url, cv2.CAP_ANY)
+            if not cap.isOpened():
+                cap.release()
+                time.sleep(2.0)
+                continue
+            with contextlib.suppress(Exception):
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            try:
+                while True:
+                    ok, frame = cap.read()
+                    if not ok or frame is None:
+                        break
+                    frame = rotate_frame(frame, self.angle)
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                    if not ok:
+                        continue
+                    with self._cond:
+                        self._latest = buf.tobytes()
+                        self._seq += 1
+                        self._cond.notify_all()
+            finally:
+                cap.release()
+            time.sleep(1.0)
+
+    def frames(self):
+        self._ensure_started()
+        last = 0
+        while True:
+            with self._cond:
+                self._cond.wait(timeout=1.0)
+                if self._latest is None or self._seq == last:
+                    continue
+                jpg = self._latest
+                last = self._seq
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+
+
+def open_preview(url: str):
+    """Return (media_type, chunk_iterator) for a live MJPEG preview.
+
+    All viewers of one URL share a single upstream connection; without that,
+    each open preview tab costs the phone a client and divides its frame rate.
+    """
+    base, angle = split_url_rotation(normalize_url(url))
+    with _PREVIEW_HUBS_LOCK:
+        hub = _PREVIEW_HUBS.get((base, angle))
+        if hub is None:
+            hub = _PreviewHub(base, angle)
+            _PREVIEW_HUBS[(base, angle)] = hub
+    return "multipart/x-mixed-replace; boundary=frame", hub.frames()
+
+
+def preview_frames(url: str, fps: float = 30.0, max_misses: int | None = None):
     """Yield multipart-MJPEG chunks from a stream URL until the client leaves.
 
     Browsers render `multipart/x-mixed-replace` straight in an <img>. A failed
@@ -523,16 +674,23 @@ def preview_frames(url: str, fps: float = 10.0, max_misses: int | None = None):
     interval = 1.0 / fps
     misses_allowed = MAX_PREVIEW_MISSES if max_misses is None else max_misses
     misses = 0
+    last_emit = 0.0
     try:
         while misses < misses_allowed:
             ok, frame = stream.read()
-            if ok and frame is not None:
-                misses = 0
-                encoded, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-                if encoded:
-                    yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
-            else:
+            if not ok or frame is None:
                 misses += 1
-            time.sleep(interval)
+                time.sleep(0.05)
+                continue
+            misses = 0
+            now = time.monotonic()
+            if now - last_emit < interval:
+                # Drain without encoding: a 30 fps source fed at 10 fps would
+                # otherwise queue seconds of stale frames inside FFmpeg.
+                continue
+            last_emit = now
+            encoded, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            if encoded:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + buf.tobytes() + b"\r\n"
     finally:
         stream.release()
