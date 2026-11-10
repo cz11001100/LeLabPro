@@ -43,6 +43,9 @@ lelab
 - 修复 24GB 卡上 4B 模型 batch 8 OOM（`PYTORCH_ALLOC_CONF=expandable_segments:True`）
 - 修复 打分进度滞后：日志尾部被每个 batch 的告警占满，进度与 ETA 取不到真实行
 - 修复 一键升级国内超时后悄悄用旧版、换目录重跑又克隆一份 —— 升级改为重跑安装命令，自动找回已有目录并走镜像拉取
+- 修复 批量视频编码跨 meta 分片时 episode 索引与时间戳错位 —— 按真实分片与 `episode_index` 逐集更新，并校验索引连续性、分片归属和返回序号
+- 修复 episode 元数据与数据行数不一致时漏检 —— 分析、健康检查与续录前逐集核对，修复后二次验证；纯数值数据集缺失 `info.json` 时可从 parquet 重建
+- 修复 SSH 远端 Ubuntu 软件源替换命令中正则分组与 `sed` 分隔符冲突
 
 **2026-10-28**
 - 变更 首页「任务」与「模型」整合、评估改三维度评分、部署按 checkpoint 选择、dagger 计时与 RTC 延迟修正
