@@ -52,6 +52,7 @@ import { groupImportedByRun } from "@/lib/modelGroups";
 import { randomGreeting } from "@/lib/greetings";
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import ScoringModal from "./ScoringModal";
+import EvaluationModal from "./EvaluationModal";
 
 // The registry holds every job ever run; the untracked section collapses
 // finished ones, so a small cap hid whole months of history (26 records were
@@ -251,6 +252,9 @@ const JobsSection: React.FC = () => {
   const [importModalOpen, setImportModalOpen] = useState(false);
   const [scoringModalOpen, setScoringModalOpen] = useState(false);
   const [scoringRepoId, setScoringRepoId] = useState("");
+  const [evaluationModalOpen, setEvaluationModalOpen] = useState(false);
+  const [evaluationJob, setEvaluationJob] = useState<JobRecord | null>(null);
+  const [evaluationGroup, setEvaluationGroup] = useState<JobRecord[] | null>(null);
   const [inferenceJob, setInferenceJob] = useState<JobRecord | null>(null);
   const [inferenceStep, setInferenceStep] = useState<number | null>(null);
   const [sshStatus, setSshStatus] = useState<SSHStatus | null>(null);
@@ -525,6 +529,21 @@ const JobsSection: React.FC = () => {
   // Collapse per-step imported jobs into one card per training run (shared with
   // the Landing Deploy/Eval pickers via modelGroups).
   const importedGroups = useMemo(() => groupImportedByRun(importedJobs), [importedJobs]);
+
+  // The flask on a model card opens the evaluation dialog; the run itself is
+  // started and stopped inside it. Siblings of the same training run come
+  // along so the dialog can switch checkpoint.
+  const handleEvaluate = useCallback(
+    (job: JobRecord) => {
+      const group = importedGroups.find((g) =>
+        g.members.some((m) => m.id === job.id),
+      );
+      setEvaluationJob(job);
+      setEvaluationGroup(group ? group.members : null);
+      setEvaluationModalOpen(true);
+    },
+    [importedGroups],
+  );
   // Hub jobs already mirrored by a local JobRecord get their richer card via
   // trackedCloudJobs; everything else from the hub gets a plain HubJobCard.
   const trackedHfJobIds = useMemo(
@@ -694,6 +713,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -705,6 +725,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -716,6 +737,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -749,6 +771,7 @@ const JobsSection: React.FC = () => {
                     onStop={handleStop}
                     onDelete={handleDelete}
                     onPlay={handlePlay}
+                    onEvaluate={handleEvaluate}
                     onExport={handleExport}
                     onResume={handleResume}
                   />
@@ -828,6 +851,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -839,6 +863,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -850,6 +875,7 @@ const JobsSection: React.FC = () => {
                   onStop={handleStop}
                   onDelete={handleDelete}
                   onPlay={handlePlay}
+                  onEvaluate={handleEvaluate}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -876,6 +902,13 @@ const JobsSection: React.FC = () => {
         open={importModalOpen}
         onOpenChange={setImportModalOpen}
         onImported={refresh}
+      />
+
+      <EvaluationModal
+        open={evaluationModalOpen}
+        onOpenChange={setEvaluationModalOpen}
+        job={evaluationJob}
+        group={evaluationGroup ?? undefined}
       />
 
       <ScoringModal
