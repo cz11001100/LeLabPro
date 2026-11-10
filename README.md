@@ -17,7 +17,7 @@ curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh
 **升级**
 
 ```bash
-cd LeLabPro && git pull && bash install.sh        # 轻量档加 --lite
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash        # 轻量档加 -s -- --lite
 ```
 
 **启动**
@@ -37,8 +37,11 @@ lelab
 - 新增 SARM 进度头训练：任务卡里选数据集与 SSH 主机，直接在 pod 上训
 - 新增 远端任务发现：绑定 SSH 主机后列出该机已有任务并接回本地
 - 新增 检查点上传进度：速率与剩余时间、状态落盘可接回、可中途取消
+- 新增 模型导入反馈：进度条与已耗时、完成绿色确认、回车提交、导入中锁定弹窗
+- 变更 模型卡评测按钮改为打开评测弹窗，启停在弹窗内、可切同 run 的 checkpoint
 - 修复 24GB 卡上 4B 模型 batch 8 OOM（`PYTORCH_ALLOC_CONF=expandable_segments:True`）
 - 修复 打分进度滞后：日志尾部被每个 batch 的告警占满，进度与 ETA 取不到真实行
+- 修复 一键升级国内超时后悄悄用旧版、换目录重跑又克隆一份 —— 升级改为重跑安装命令，自动找回已有目录并走镜像拉取
 
 **2026-10-28**
 - 变更 首页「任务」与「模型」整合、评估改三维度评分、部署按 checkpoint 选择、dagger 计时与 RTC 延迟修正

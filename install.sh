@@ -219,28 +219,65 @@ if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then
 fi
 command -v conda &>/dev/null && { eval "$(conda shell.bash hook 2>/dev/null)" 2>/dev/null || true; conda deactivate 2>/dev/null || true; }
 
-# ---------- 定位仓库：curl 执行时先自举 clone ----------
-SCRIPT_PATH="${BASH_SOURCE[0]:-}"
-if [[ -f "$SCRIPT_PATH" && -d "$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/lelab" \
-      && -d "$(cd "$(dirname "$SCRIPT_PATH")" && pwd)/lerobot" ]]; then
-    ROOT="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
-    info "使用已有仓库目录: $ROOT"
-else
-    ROOT="$PWD/LeLabPro"
-    if [[ -d "$ROOT/.git" ]]; then
-        info "更新已有克隆 $ROOT"
-        git -C "$ROOT" pull --ff-only -q || warn "pull 失败，沿用当前版本"
+# ---------- 定位仓库：升级 = 重跑本命令，任意目录都能找回已有克隆 ----------
+# 查找顺序（找到就复用并拉最新，找不到才新克隆）：
+# 1) 直接在仓库里跑 bash install.sh —— 脚本旁有 lelab/ 与 lerobot/
+# 2) 上次安装写进 ~/.local/bin/lelab 启动器里的路径（在哪个目录重跑都找得回）
+# 3) 常见位置 $HOME/LeLabPro、$PWD/LeLabPro
+# 新克隆统一放 $HOME/LeLabPro，避免在不同目录重跑时克隆出多份。
+is_repo() { [[ -d "$1/lelab" && -d "$1/lerobot" ]]; }
+
+pull_repo() {   # pull_repo <目录>：ff-only 拉最新；直连不通换 gh-proxy，都失败沿用当前版本
+    local dir="$1" branch
+    if [[ ! -d "$dir/.git" ]]; then
+        note "  $dir 不是 git 克隆，跳过更新（直接用当前代码）"
+        return 0
+    fi
+    branch=$(git -C "$dir" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)
+    # 用显式 URL 拉取，不改用户的 origin 配置；--ff-only 保证工作区脏时干净地拒绝而非乱合并
+    if git -C "$dir" pull --ff-only -q origin "$branch" 2>/dev/null; then
+        info "已更新到最新版本: $dir"
+        return 0
+    fi
+    note "  直连 GitHub 拉取失败，改用镜像加速重试"
+    if git -C "$dir" pull --ff-only -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$branch" 2>/dev/null; then
+        info "已更新到最新版本（镜像加速）: $dir"
     else
-        FAILED_STEP="克隆仓库"
-        command -v git &>/dev/null || die "需要 git，请先安装：sudo apt install git"
-        info "克隆 $REPO_URL 到 $ROOT"
-        # GitHub 直连在国内常被限速到几十 KB/s 或直接重置；直连失败就换 gh-proxy 前缀重试
-        if ! git clone --depth 1 -q "$REPO_URL" "$ROOT" 2>/dev/null; then
-            rm -rf "$ROOT"
-            info "  直连 GitHub 失败，改用镜像加速重试"
-            git clone --depth 1 -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$ROOT" \
-                || die "克隆失败：直连与 $GH_PROXY 都不通。换个网络，或手动 git clone 后在该目录里跑 bash install.sh"
-        fi
+        warn "pull 失败，沿用当前版本（不影响启动）"
+    fi
+}
+
+SCRIPT_PATH="${BASH_SOURCE[0]:-}"
+ROOT=""
+if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
+    CAND="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+    is_repo "$CAND" && ROOT="$CAND"
+fi
+if [[ -z "$ROOT" && -f "$HOME/.local/bin/lelab" ]]; then
+    CAND=$(sed -n 's#^exec "\(.*\)/lelab-run\.sh".*#\1#p' "$HOME/.local/bin/lelab" 2>/dev/null | head -1)
+    [[ -n "$CAND" ]] && is_repo "$CAND" && ROOT="$CAND"
+fi
+if [[ -z "$ROOT" ]]; then
+    for CAND in "$HOME/LeLabPro" "$PWD/LeLabPro"; do
+        if is_repo "$CAND"; then ROOT="$CAND"; break; fi
+    done
+fi
+
+if [[ -n "$ROOT" ]]; then
+    info "使用已有仓库目录: $ROOT"
+    FAILED_STEP="更新仓库"
+    pull_repo "$ROOT"
+else
+    ROOT="$HOME/LeLabPro"
+    FAILED_STEP="克隆仓库"
+    command -v git &>/dev/null || die "需要 git，请先安装：sudo apt install git"
+    info "克隆 $REPO_URL 到 $ROOT"
+    # GitHub 直连在国内常被限速到几十 KB/s 或直接重置；直连失败就换 gh-proxy 前缀重试
+    if ! git clone --depth 1 -q "$REPO_URL" "$ROOT" 2>/dev/null; then
+        rm -rf "$ROOT"
+        info "  直连 GitHub 失败，改用镜像加速重试"
+        git clone --depth 1 -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$ROOT" \
+            || die "克隆失败：直连与 $GH_PROXY 都不通。换个网络，或手动 git clone 后在该目录里跑 bash install.sh"
     fi
 fi
 VENV="$ROOT/lerobot-env"

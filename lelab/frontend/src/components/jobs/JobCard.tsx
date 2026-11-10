@@ -11,7 +11,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { JobRecord, startJobValidation, stopJobValidation, ValidationState, pushModelToHub, getPushStatus } from "@/lib/jobsApi";
+import { JobRecord, ValidationState, pushModelToHub, getPushStatus } from "@/lib/jobsApi";
 import { modelStepOf, modelBaseName } from "@/lib/modelGroups";
 import {
   Square,
@@ -64,6 +64,9 @@ interface Props {
   onStop: (id: string) => void;
   onDelete: (id: string) => void;
   onPlay: (job: JobRecord, step: number) => void;
+  // The flask opens the evaluation dialog; starting and stopping a run lives
+  // there, so the card stays a pure entry point.
+  onEvaluate: (job: JobRecord) => void;
   onExport?: (job: JobRecord, step: number) => void | Promise<boolean>;
   onResume?: (job: JobRecord) => void;
 }
@@ -92,7 +95,7 @@ const statePresentation: Record<
   interrupted: { label: "已中断", color: "text-amber-400", Icon: AlertTriangle },
 };
 
-const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPlay, onExport, onResume }) => {
+const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPlay, onEvaluate, onExport, onResume }) => {
   const navigate = useNavigate();
   const { baseUrl, fetchWithHeaders } = useApi();
   const { auth } = useHfAuth();
@@ -399,46 +402,11 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
     }
   };
 
-  const [validating, setValidating] = useState(false);
   // Validation is only offered on imported models, not on training jobs
   // (local/ssh/cloud) — per user request, jobs don't get a validate button.
   const canValidate = !isRunning && job.checkpoint_count > 0 && job.runner === "imported";
   const vState: ValidationState = job.validation_state ?? "none";
   const vResults = job.validation_results;
-
-  const handleValidate = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setValidating(true);
-    try {
-      await startJobValidation(baseUrl, fetchWithHeaders, job.id);
-      toast({ title: "验证已启动" });
-    } catch (err) {
-      toast({
-        title: "验证失败",
-        description: err instanceof Error ? err.message : String(err),
-        variant: "destructive",
-      });
-    } finally {
-      setValidating(false);
-    }
-  };
-
-  const handleStopValidate = async (e: React.MouseEvent) => {
-    e.stopPropagation();
-    setValidating(true);
-    try {
-      await stopJobValidation(baseUrl, fetchWithHeaders, job.id);
-      toast({ title: "正在停止评测…" });
-    } catch (err) {
-      toast({
-        title: "停止失败",
-        description: err instanceof Error ? err.message : String(err),
-        variant: "destructive",
-      });
-    } finally {
-      setValidating(false);
-    }
-  };
 
   const handleCancelExport = async (e: React.MouseEvent) => {
     e.stopPropagation();
@@ -663,17 +631,25 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
             {canValidate ? (
               <Button
                 size="icon"
-                onClick={vState === "running" ? handleStopValidate : handleValidate}
-                disabled={validating}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onEvaluate(job);
+                }}
                 className={`h-8 w-8 text-white ${
                   vState === "running"
                     ? "bg-red-500 hover:bg-red-600"
                     : "bg-purple-500 hover:bg-purple-600"
                 }`}
-                aria-label={vState === "running" ? "Stop evaluation" : "Evaluate model"}
-                title={vState === "running" ? "Evaluating — click to stop" : "Evaluate model"}
+                aria-label="Open evaluation"
+                title={
+                  vState === "running"
+                    ? "评测进行中 — 点击查看"
+                    : vState === "done"
+                      ? "View evaluation results"
+                      : "Evaluate model"
+                }
               >
-                {validating || vState === "running" ? (
+                {vState === "running" ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   <FlaskConical className="w-4 h-4" />
