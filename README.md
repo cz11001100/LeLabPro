@@ -32,7 +32,16 @@ lelab
 
 最近更新，完整历史见 [CHANGELOG.md](CHANGELOG.md)。
 
+**2026-11-10**
+- 新增 模型推送 Hub：checkpoint 推到 Hub 后云端按 repo id 走镜像拉取，不再每次开训前上传 1.2GB
+- 新增 SARM 进度头训练：任务卡里选数据集与 SSH 主机，直接在 pod 上训
+- 新增 远端任务发现：绑定 SSH 主机后列出该机已有任务并接回本地
+- 新增 检查点上传进度：速率与剩余时间、状态落盘可接回、可中途取消
+- 修复 24GB 卡上 4B 模型 batch 8 OOM（`PYTORCH_ALLOC_CONF=expandable_segments:True`）
+- 修复 打分进度滞后：日志尾部被每个 batch 的告警占满，进度与 ETA 取不到真实行
+
 **2026-10-28**
+- 变更 首页「任务」与「模型」整合、评估改三维度评分、部署按 checkpoint 选择、dagger 计时与 RTC 延迟修正
 - 新增 本地安装与运行接入 HuggingFace 镜像 —— 实测官方站与 hf-mirror 吞吐选端点，走镜像时自动关掉无视 `HF_ENDPOINT` 的 Xet 传输、放宽跨境读超时
 - 修复 包索引选择改用实测下载吞吐（原先按索引页延迟选，方向经常是反的）
 - 修复 没有独显的机器也在下 2.7GB CUDA 库导致安装普遍超时 —— 档位改为按 GPU 自动选择，无 GPU 自动走 CPU 版 torch
