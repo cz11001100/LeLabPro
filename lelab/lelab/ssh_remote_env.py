@@ -395,8 +395,8 @@ def _ensure_apt_cn_mirror(client, use_cn_mirror: bool, priv: str = "") -> str | 
         return None  # deb86 layout or non-Ubuntu: no legacy file to rewrite
     exit_code, out, err = _run_cmd(
         client,
-        f"{priv}sed -i -E 's|https?://(archive|security)\\.ubuntu\\.com/ubuntu"
-        "|https://mirrors.aliyun.com/ubuntu|g' /etc/apt/sources.list",
+        f"{priv}sed -i -E 's#https?://(archive|security)\\.ubuntu\\.com/ubuntu"
+        "#https://mirrors.aliyun.com/ubuntu#g' /etc/apt/sources.list",
         timeout=30,
     )
     if exit_code != 0:
