@@ -43,6 +43,7 @@ lelab
 - 新增 仿真评测：模型卡内启动/停止 EnvHub 闭环评测，看成功率、日志与产物
 - 变更 模型卡评测按钮改为打开评测弹窗，启停在弹窗内、可切同 run 的 checkpoint
 - 变更 lerobot 升级到 0.7.0：评测可加载官方 EnvHub 仿真环境跑闭环成功率，训练跟踪由 W&B 换成 Trackio
+- 变更 训练页可选策略随 0.7 扩充：Cosmos3、DM05、EO1/EVO1、FLUX.3、LingBot、LongWAM 等，按策略自动带出依赖
 - 修复 24GB 卡上 4B 模型 batch 8 OOM（`PYTORCH_ALLOC_CONF=expandable_segments:True`）
 - 修复 打分进度滞后：日志尾部被每个 batch 的告警占满，进度与 ETA 取不到真实行
 - 修复 一键升级国内超时后悄悄用旧版、换目录重跑又克隆一份 —— 升级改为重跑安装命令，自动找回已有目录并走镜像拉取

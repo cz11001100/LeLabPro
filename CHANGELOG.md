@@ -34,6 +34,7 @@
 - **模型评测入口**：模型卡的评测按钮改为打开评测弹窗，启动 / 停止移进弹窗内，并可切换同一训练 run 的其他 checkpoint
 - **lerobot 升级到 0.7.0**：评测可加载官方 EnvHub 仿真环境跑闭环成功率，训练跟踪由 W&B 换成 Trackio；转角防抖、连接时写入校准、DAgger 只按自主时长计时三项本地改动已随新版移植
 - **训练页的 W&B 面板换成 Trackio**：项目名、Space（远端训练必填）、私有与产物开关；任务卡的运行链接改指 Trackio Space；SSH 主机里的 wandb API key 换成 HF token，留空则自动用 LeLab 已登录的 HF 账号，旧配置里失效的 wandb key 会被清理
+- **训练可选策略大幅扩充**：随 lerobot 0.7 接入 Cosmos3（Nano / Edge）、DM05、EO1 / EVO1、FastWAM、FLUX.3、LingBot-VA / VLA v2、LongWAM、LaWAM、FineART、G05、MolmoAct2、VLA-JEPA、Wall-OSS、XVLA 等新策略；训练页按所选策略自动带出所需依赖，SSH 远端装环境时一并安装
 
 ### 修复
 
