@@ -137,16 +137,6 @@ const InferenceModal: React.FC<Props> = ({
   const [chunkSmooth, setChunkSmooth] = useState(false);
   const [smoothStrength, setSmoothStrength] = useState(50);
   const [rtc, setRtc] = useState(false);
-  // gRPC deployment runs lerobot's policy_server + robot_client instead of the
-  // local rollout process. The server owns action chunking, so RTC/smoothing
-  // and the capture strategies don't apply in this mode.
-  const [grpcEnabled, setGrpcEnabled] = useState(false);
-  const [grpcPort, setGrpcPort] = useState(8080);
-  const [grpcDevice, setGrpcDevice] = useState("cuda");
-  const [grpcActionsPerChunk, setGrpcActionsPerChunk] = useState(50);
-  const [grpcChunkThreshold, setGrpcChunkThreshold] = useState(0.5);
-  const [grpcAggregateFn, setGrpcAggregateFn] = useState("weighted_average");
-  const [grpcSsh, setGrpcSsh] = useState("");
   // Data collection during rollout. 'base' just runs the policy; the other
   // modes are lerobot rollout strategies that write episodes as it drives.
   const [captureMode, setCaptureMode] = useState<CaptureMode>("base");
@@ -338,14 +328,6 @@ const InferenceModal: React.FC<Props> = ({
     (name) => cameraBindings[name] != null,
   );
 
-  const grpcConfigValid =
-    !grpcEnabled ||
-    (grpcPort >= 1 &&
-      grpcPort <= 65535 &&
-      grpcActionsPerChunk >= 1 &&
-      grpcChunkThreshold >= 0 &&
-      grpcChunkThreshold <= 1);
-
   const canStart =
     !!robot &&
     robot.is_clean &&
@@ -353,7 +335,6 @@ const InferenceModal: React.FC<Props> = ({
     !!policyConfig &&
     allCamerasBound &&
     (!policyConfig.requires_task || task.trim().length > 0) &&
-    grpcConfigValid &&
     !submitting;
 
   const handleStart = async () => {
@@ -410,17 +391,6 @@ const InferenceModal: React.FC<Props> = ({
         num_episodes: nRuns,
         max_correction_s: maxCorrection,
         record_autonomous: recordAutonomous,
-        grpc: grpcEnabled
-          ? {
-              enabled: true,
-              port: grpcPort,
-              policy_device: grpcDevice,
-              actions_per_chunk: grpcActionsPerChunk,
-              chunk_size_threshold: grpcChunkThreshold,
-              aggregate_fn: grpcAggregateFn,
-              ssh_command: grpcSsh.trim(),
-            }
-          : undefined,
       });
       onOpenChange(false);
       navigate("/inference");
@@ -548,7 +518,6 @@ const InferenceModal: React.FC<Props> = ({
               <Label className="text-sm font-medium text-gray-300">模式</Label>
               <Select
                 value={presetOf(captureMode, recordAutonomous)}
-                disabled={grpcEnabled}
                 onValueChange={(v) => {
                   const preset = CAPTURE_PRESETS.find((p) => p.value === v);
                   if (!preset) return;
@@ -634,132 +603,6 @@ const InferenceModal: React.FC<Props> = ({
                 )}
               </>
             )}
-          </div>
-
-          <div className="space-y-4">
-            <h3 className="text-lg font-semibold text-white border-b border-gray-700 pb-2">
-              gRPC
-            </h3>
-            <div className="space-y-3 rounded-lg border border-gray-700 bg-gray-800/40 p-4">
-              <div className="flex items-center justify-between gap-4">
-                <Label htmlFor="grpc" className="text-sm font-medium text-gray-200">
-                  开启 gRPC（policy server + robot client）
-                </Label>
-                <Switch
-                  id="grpc"
-                  checked={grpcEnabled}
-                  onCheckedChange={(v) => {
-                    setGrpcEnabled(v);
-                    if (v) {
-                      setCaptureMode("base");
-                      setRecordAutonomous(false);
-                      setRtc(false);
-                      setChunkSmooth(false);
-                    }
-                  }}
-                />
-              </div>
-              {grpcEnabled && (
-                <>
-                  <div className="grid grid-cols-2 gap-4 border-t border-gray-700 pt-4">
-                    <div className="space-y-2">
-                      <Label htmlFor="grpc-port" className="text-sm font-medium text-gray-300">
-                        服务端口 Port
-                      </Label>
-                      <NumberInput
-                        id="grpc-port"
-                        min={1}
-                        max={65535}
-                        value={grpcPort}
-                        onChange={(v) => {
-                          if (v !== undefined) setGrpcPort(v);
-                        }}
-                        className="bg-gray-800 border-gray-700 text-white"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label className="text-sm font-medium text-gray-300">
-                        推理设备 Device
-                      </Label>
-                      <Select value={grpcDevice} onValueChange={setGrpcDevice}>
-                        <SelectTrigger className="bg-gray-800 border-gray-700 text-white">
-                          <SelectValue />
-                        </SelectTrigger>
-                        <SelectContent className="bg-gray-900 border-gray-700 text-white">
-                          <SelectItem value="cuda">CUDA</SelectItem>
-                          <SelectItem value="cpu">CPU</SelectItem>
-                        </SelectContent>
-                      </Select>
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="grpc-chunk" className="text-sm font-medium text-gray-300">
-                        每块动作数 Actions per chunk
-                      </Label>
-                      <NumberInput
-                        id="grpc-chunk"
-                        min={1}
-                        value={grpcActionsPerChunk}
-                        onChange={(v) => {
-                          if (v !== undefined) setGrpcActionsPerChunk(v);
-                        }}
-                        className="bg-gray-800 border-gray-700 text-white"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="grpc-threshold" className="text-sm font-medium text-gray-300">
-                        块切换阈值 Chunk threshold
-                      </Label>
-                      <NumberInput
-                        id="grpc-threshold"
-                        min={0}
-                        max={1}
-                        step={0.05}
-                        integer={false}
-                        value={grpcChunkThreshold}
-                        onChange={(v) => {
-                          if (v !== undefined) setGrpcChunkThreshold(v);
-                        }}
-                        className="bg-gray-800 border-gray-700 text-white"
-                      />
-                    </div>
-                  </div>
-                  <div className="space-y-2">
-                    <Label className="text-sm font-medium text-gray-300">
-                      聚合方式 Aggregation
-                    </Label>
-                    <Select value={grpcAggregateFn} onValueChange={setGrpcAggregateFn}>
-                      <SelectTrigger className="bg-gray-800 border-gray-700 text-white">
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent className="bg-gray-900 border-gray-700 text-white">
-                        <SelectItem value="weighted_average">
-                          加权平均 Weighted average（旧 0.3 / 新 0.7）
-                        </SelectItem>
-                        <SelectItem value="latest_only">仅取最新块 Latest only</SelectItem>
-                        <SelectItem value="average">
-                          算术平均 Average（旧 0.5 / 新 0.5）
-                        </SelectItem>
-                        <SelectItem value="conservative">
-                          保守加权 Conservative（旧 0.7 / 新 0.3）
-                        </SelectItem>
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="space-y-2">
-                    <Label htmlFor="grpc-ssh" className="text-sm font-medium text-gray-300">
-                      SSH 连接
-                    </Label>
-                    <Input
-                      id="grpc-ssh"
-                      value={grpcSsh}
-                      onChange={(e) => setGrpcSsh(e.target.value)}
-                      placeholder="ssh -p 22 user@host"
-                      className="bg-gray-800 border-gray-700 text-white font-mono"
-                    />
-                  </div>
-                </>
-              )}
-            </div>
           </div>
 
           <div className="space-y-4">
@@ -866,11 +709,7 @@ const InferenceModal: React.FC<Props> = ({
                 </p>
               )}
             </div>
-            <div
-              className={`space-y-3 rounded-lg border border-gray-700 bg-gray-800/40 p-4 ${
-                grpcEnabled ? "opacity-50" : ""
-              }`}
-            >
+            <div className="space-y-3 rounded-lg border border-gray-700 bg-gray-800/40 p-4">
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <Label htmlFor="rtc" className="text-sm font-medium text-gray-200">
@@ -885,7 +724,6 @@ const InferenceModal: React.FC<Props> = ({
                 <Switch
                   id="rtc"
                   checked={rtc}
-                  disabled={grpcEnabled}
                   onCheckedChange={(v) => {
                     setRtc(v);
                     if (v) setChunkSmooth(false);
@@ -906,7 +744,6 @@ const InferenceModal: React.FC<Props> = ({
                 <Switch
                   id="chunk-smooth"
                   checked={chunkSmooth}
-                  disabled={grpcEnabled}
                   onCheckedChange={(v) => {
                     setChunkSmooth(v);
                     if (v) setRtc(false);
@@ -1032,11 +869,9 @@ const InferenceModal: React.FC<Props> = ({
               <Play className="w-5 h-5 mr-2" />
               {submitting
                 ? "Starting…"
-                : grpcEnabled
-                  ? "Start gRPC"
-                  : captureMode === "base"
-                    ? "Start Inference"
-                    : "Start Collecting"}
+                : captureMode === "base"
+                  ? "Start Inference"
+                  : "Start Collecting"}
             </Button>
             <Button
               onClick={() => onOpenChange(false)}

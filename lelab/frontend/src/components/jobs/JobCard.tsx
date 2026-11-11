@@ -111,7 +111,6 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
   const Icon = present.Icon;
   const isRunning = job.state === "running";
   const isImported = job.runner === "imported";
-  const stateLabel = isImported ? "已导入" : present.label;
   const isStarting = isRunning && job.metrics.total_steps === 0;
   const progressPct =
     job.metrics.total_steps > 0
@@ -186,6 +185,8 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
   const [hfToken, setHfToken] = useState("");
   const [pushedRepo, setPushedRepo] = useState<string | null>(null);
   const [pushError, setPushError] = useState<string | null>(null);
+  // 上传成功后直接把状态标签显示为“已上传”，与导入后的“已导入”用同一套样式
+  const stateLabel = isImported ? "已导入" : pushedRepo ? "已上传" : present.label;
 
   // The push runs in a server thread, so a reloaded page re-attaches to it
   // instead of showing an idle button. Only the card that owns the job reacts.
@@ -731,14 +732,7 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
           </div>
         ) : null}
 
-        {pushedRepo ? (
-          <div className="flex items-center gap-1.5 text-xs text-green-400 min-w-0">
-            <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
-            <span className="truncate" title={pushedRepo}>
-              已上传 Hub：{pushedRepo}
-            </span>
-          </div>
-        ) : pushError ? (
+        {pushError ? (
           <div className="text-xs text-red-400 break-all">上传失败：{pushError}</div>
         ) : null}
       </CardContent>

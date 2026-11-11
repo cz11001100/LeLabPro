@@ -7,6 +7,7 @@ import {
 } from "@/components/ui/dialog";
 import { JobRecord } from "@/lib/jobsApi";
 import EvaluationCard from "@/components/jobs/EvaluationCard";
+import SimEvalCard from "@/components/jobs/SimEvalCard";
 import { modelStepOf, modelBaseName, ModelVariant } from "@/lib/modelGroups";
 
 interface Props {
@@ -48,6 +49,12 @@ const EvaluationModal: React.FC<Props> = ({ open, onOpenChange, job, group }) =>
           <div className="space-y-4">
             <EvaluationCard
               key={activeJob.id}
+              job={activeJob}
+              variants={variants}
+              onSelectJob={setActiveId}
+            />
+            <SimEvalCard
+              key={`sim-${activeJob.id}`}
               job={activeJob}
               variants={variants}
               onSelectJob={setActiveId}

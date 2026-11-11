@@ -199,6 +199,9 @@ export interface JobRecord {
   checkpoint_count: number;
   validation_state: ValidationState;
   validation_results: ValidationResults | null;
+  sim_eval_state: SimEvalState;
+  sim_eval_results: SimEvalResults | null;
+  sim_eval_run_dir: string | null;
   // SSH/cloud only: steps already downloaded to local via export.
   exported_steps: number[];
 }
@@ -862,6 +865,121 @@ export async function getJobValidation(
     signal,
     action: "Get validation",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Closed-loop simulation evaluation (lerobot-eval + EnvHub MuJoCo)
+// ---------------------------------------------------------------------------
+
+export type SimEvalState = "none" | "running" | "done" | "failed";
+
+export interface SimEvalOverall {
+  avg_sum_reward: number;
+  avg_max_reward: number;
+  pc_success: number;
+  n_episodes: number;
+  n_success: number;
+  pc_success_ci95: [number, number];
+  eval_s: number;
+  video_paths: string[];
+}
+
+export interface SimEvalResults {
+  success?: boolean;
+  cancelled?: boolean;
+  error?: string;
+  traceback?: string;
+  log_tail?: string;
+  exit_code?: number | null;
+  step?: number;
+  env?: string;
+  ts?: number;
+  eval_s?: number;
+  overall?: SimEvalOverall;
+  per_group?: Record<string, unknown>;
+  videos?: string[];
+  run_dir?: string;
+}
+
+export interface SimEvalHistoryEntry {
+  ts: number;
+  step: number;
+  env: string;
+  n_episodes: number | null;
+  n_success: number | null;
+  pc_success: number | null;
+  avg_max_reward: number | null;
+  run_dir: string;
+}
+
+export interface SimEvalOptions {
+  step?: number | null;
+  n_episodes?: number;
+  batch_size?: number;
+  seed?: number;
+  env_hub_path?: string;
+  max_episode_steps?: number | null;
+}
+
+export interface SimEvalStatus {
+  sim_eval_state: SimEvalState;
+  sim_eval_results: SimEvalResults | null;
+  sim_eval_run_dir: string | null;
+  history: SimEvalHistoryEntry[];
+  progress: { batches_done: number; batches_total: number } | null;
+}
+
+export async function startJobSimEval(
+  baseUrl: string,
+  fetcher: Fetcher,
+  id: string,
+  options?: SimEvalOptions,
+): Promise<{ sim_eval_state: SimEvalState; message: string }> {
+  return apiRequest(baseUrl, fetcher, `/jobs/${id}/sim-eval`, {
+    method: "POST",
+    body: options,
+    action: "Start sim eval",
+  });
+}
+
+export async function stopJobSimEval(
+  baseUrl: string,
+  fetcher: Fetcher,
+  id: string,
+): Promise<{ sim_eval_state: SimEvalState; message: string }> {
+  return apiRequest(baseUrl, fetcher, `/jobs/${id}/sim-eval/stop`, {
+    method: "POST",
+    action: "Stop sim eval",
+  });
+}
+
+export async function getJobSimEval(
+  baseUrl: string,
+  fetcher: Fetcher,
+  id: string,
+  signal?: AbortSignal,
+): Promise<SimEvalStatus> {
+  return apiRequest(baseUrl, fetcher, `/jobs/${id}/sim-eval`, {
+    signal,
+    action: "Get sim eval",
+  });
+}
+
+export async function getJobSimEvalLogs(
+  baseUrl: string,
+  fetcher: Fetcher,
+  id: string,
+  tail = 200,
+  signal?: AbortSignal,
+): Promise<{ log: string; run_dir: string | null }> {
+  return apiRequest(baseUrl, fetcher, `/jobs/${id}/sim-eval/logs?tail=${tail}`, {
+    signal,
+    action: "Get sim eval logs",
+  });
+}
+
+export function simEvalArtifactUrl(baseUrl: string, jobId: string, relPath: string): string {
+  return `${baseUrl}/jobs/${jobId}/sim-eval/artifact?path=${encodeURIComponent(relPath)}`;
 }
 
 // ---------------------------------------------------------------------------

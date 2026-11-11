@@ -98,11 +98,31 @@ const INSTALLABLE_POLICIES: { v: string; label: string }[] = [
   { v: "diffusion", label: "Diffusion" },
   { v: "pi0", label: "Pi0" },
   { v: "pi0_fast", label: "Pi0-Fast" },
+  { v: "pi05", label: "Pi0.5" },
   { v: "smolvla", label: "SmolVLA" },
   { v: "groot", label: "GR00T" },
   { v: "tdmpc", label: "TDMPC" },
   { v: "vqbet", label: "VQBet" },
   { v: "reward_classifier", label: "Reward" },
+  { v: "cosmos3_nano", label: "Cosmos3 Nano" },
+  { v: "cosmos3_edge", label: "Cosmos3 Edge" },
+  { v: "dm05", label: "DM05" },
+  { v: "eo1", label: "EO1" },
+  { v: "evo1", label: "EVO1" },
+  { v: "fastwam", label: "FastWAM" },
+  { v: "fineart_vla", label: "FineART" },
+  { v: "flux3", label: "FLUX.3" },
+  { v: "g05", label: "G05" },
+  { v: "lawam", label: "LaWAM" },
+  { v: "lingbot_va", label: "LingBot-VA" },
+  { v: "lingbot_vla_v2", label: "LingBot-VLA v2" },
+  { v: "longwam", label: "LongWAM" },
+  { v: "molmoact2", label: "MolmoAct2" },
+  { v: "multi_task_dit", label: "Multi-task DiT" },
+  { v: "vla_jepa", label: "VLA-JEPA" },
+  { v: "wall_oss_05", label: "WALL-OSS 0.5" },
+  { v: "wall_x", label: "WALL-X" },
+  { v: "xvla", label: "XVLA" },
 ];
 
 const TargetCard: React.FC<TargetCardProps> = ({
@@ -461,6 +481,11 @@ const TargetCard: React.FC<TargetCardProps> = ({
               <SelectValue placeholder={loading ? "加载中…" : "选择目标"} />
             </SelectTrigger>
             <SelectContent className="bg-slate-800 border-slate-600 text-white">
+              <SelectItem value="ssh">
+                <span className="flex items-center gap-1">
+                  <Wifi className="w-3 h-3" /> SSH — 远程服务器
+                </span>
+              </SelectItem>
               <SelectItem value="local">本地 — 本机（免费）</SelectItem>
               {flavors.map((f) => (
                 <SelectItem
@@ -476,11 +501,6 @@ const TargetCard: React.FC<TargetCardProps> = ({
                   )}
                 </SelectItem>
               ))}
-              <SelectItem value="ssh">
-                <span className="flex items-center gap-1">
-                  <Wifi className="w-3 h-3" /> SSH — 远程服务器
-                </span>
-              </SelectItem>
             </SelectContent>
           </Select>
           <p className="text-xs text-slate-500 mt-1">

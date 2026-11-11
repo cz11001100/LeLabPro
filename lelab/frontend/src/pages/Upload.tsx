@@ -50,6 +50,7 @@ interface DatasetInfo {
 import MergeSection from "@/components/dataset/MergeSection";
 import RolloutScoreCard from "@/components/jobs/RolloutScoreCard";
 import SarmTrainCard from "@/components/jobs/SarmTrainCard";
+import DatasetViewer from "@/components/datasets/DatasetViewer";
 
 const Upload = () => {
   const location = useLocation();
@@ -108,6 +109,7 @@ const Upload = () => {
 
   // Which scorers already have a progress file for this dataset.
   const [scoredBackends, setScoredBackends] = useState<string[]>([]);
+  const [viewerOpen, setViewerOpen] = useState(false);
 
   const loadDatasetInfo = React.useCallback(async () => {
     if (!initialDatasetInfo?.dataset_repo_id) {
@@ -783,6 +785,14 @@ const Upload = () => {
           {/* 操作 */}
           <div className="mt-6 border-t border-gray-700 pt-5 flex flex-wrap gap-3">
             <Button
+              onClick={() => setViewerOpen(true)}
+              variant="outline"
+              className="border-cyan-600/60 text-cyan-300 hover:bg-cyan-900/20 hover:text-cyan-200"
+            >
+              <ListVideo className="w-4 h-4 mr-2" />
+              本地可视化
+            </Button>
+            <Button
               onClick={handleUploadToHub}
               disabled={isUploading}
               className="bg-blue-500 hover:bg-blue-600 text-white"
@@ -820,6 +830,14 @@ const Upload = () => {
               </Button>
             )}
           </div>
+
+          {datasetInfo.dataset_repo_id && (
+            <DatasetViewer
+              open={viewerOpen}
+              onOpenChange={setViewerOpen}
+              repoId={datasetInfo.dataset_repo_id}
+            />
+          )}
         </div>
 
         {/* Dataset Health / Corruption Warning */}

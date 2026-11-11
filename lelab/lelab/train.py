@@ -34,18 +34,27 @@ if TYPE_CHECKING:
 
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9._-]+")
 
-# Policies whose weights sit in bfloat16 and that expose no `dtype` config field
-# (pi0/pi05/pi0_fast/xvla do, so lerobot picks the mode for them):
-#   smolvla — SmolVLMWithExpert is built with torch_dtype="bfloat16"
-#   wall_x  — `self.to(dtype=torch.bfloat16)`
-#   groot   — use_bf16=True by default
+# Policies whose weights sit in bfloat16 and that expose no usable `dtype`
+# default to steer accelerate (pi0/pi05/pi0_fast/xvla default to fp32 and let
+# lerobot pick the mode for them):
+#   smolvla — SmolVLMWithExpert is built with torch_dtype="bfloat16" when loading
+#             VLM weights; bf16 autocast is also safe for the fp32 scratch path
+#   wall_x  — `to_bfloat16_for_selected_params`
+#   lawam   — vlm_dtype=bf16 + internal bf16 autocast
+#   groot   — use_bf16=True backbone
+#   the rest declare dtype=bfloat16 as their config default
 # Accelerate's fp16 path builds a GradScaler, and its CUDA kernel
 # `_amp_foreach_non_finite_check_and_unscale_` has no bf16 support, so the very
 # first `clip_grad_norm_` aborts the run. Mixed precision has to follow the
 # policy's native weight dtype, and we must not leave it to the environment:
 # lerobot passes `mixed_precision=None` whenever the config has no dtype field,
 # which lets a pod image's ACCELERATE_MIXED_PRECISION default pick the mode.
-_BF16_NATIVE_POLICIES = {"smolvla", "groot", "wall_x"}
+_BF16_NATIVE_POLICIES = {
+    "smolvla", "groot", "wall_x", "lawam",
+    "dm05", "eo1", "evo1", "fastwam", "flux3", "g05",
+    "lingbot_va", "lingbot_vla_v2", "longwam", "molmoact2",
+    "vla_jepa", "wall_oss_05",
+}
 
 
 def policy_weights_are_bf16(policy_type: str) -> bool:
@@ -265,6 +274,28 @@ def preflight_rabc(config: "TrainingRequest") -> str | None:
         return None
 
 
+def augmentation_tfs(request) -> dict:
+    """The six image augmentations LeLab exposes, as lerobot transform configs.
+
+    Shared by the training command builder and the augmentation preview so the
+    preview shows exactly what training will apply.
+    """
+    tfs: dict = {}
+    if request.augmentation_brightness:
+        tfs["brightness"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"brightness": [0.8, 1.2]}}
+    if request.augmentation_contrast:
+        tfs["contrast"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"contrast": [0.8, 1.2]}}
+    if request.augmentation_saturation:
+        tfs["saturation"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"saturation": [0.5, 1.5]}}
+    if request.augmentation_hue:
+        tfs["hue"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"hue": [-0.05, 0.05]}}
+    if request.augmentation_sharpness:
+        tfs["sharpness"] = {"weight": 1.0, "type": "SharpnessJitter", "kwargs": {"sharpness": [0.5, 1.5]}}
+    if request.augmentation_affine:
+        tfs["affine"] = {"weight": 1.0, "type": "RandomAffine", "kwargs": {"degrees": [-5.0, 5.0], "translate": [0.05, 0.05]}}
+    return tfs
+
+
 def build_training_command(
     request: TrainingRequest,
     output_dir: str,
@@ -303,19 +334,7 @@ def build_training_command(
         cmd.extend(["--dataset.image_transforms.max_num_transforms", str(request.augmentation_max_num_transforms)])
         cmd.extend(["--dataset.image_transforms.random_order", "true" if request.augmentation_random_order else "false"])
 
-        tfs = {}
-        if request.augmentation_brightness:
-            tfs["brightness"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"brightness": [0.8, 1.2]}}
-        if request.augmentation_contrast:
-            tfs["contrast"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"contrast": [0.8, 1.2]}}
-        if request.augmentation_saturation:
-            tfs["saturation"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"saturation": [0.5, 1.5]}}
-        if request.augmentation_hue:
-            tfs["hue"] = {"weight": 1.0, "type": "ColorJitter", "kwargs": {"hue": [-0.05, 0.05]}}
-        if request.augmentation_sharpness:
-            tfs["sharpness"] = {"weight": 1.0, "type": "SharpnessJitter", "kwargs": {"sharpness": [0.5, 1.5]}}
-        if request.augmentation_affine:
-            tfs["affine"] = {"weight": 1.0, "type": "RandomAffine", "kwargs": {"degrees": [-5.0, 5.0], "translate": [0.05, 0.05]}}
+        tfs = augmentation_tfs(request)
 
         if tfs:
             cmd.extend(["--dataset.image_transforms.tfs", json.dumps(tfs)])

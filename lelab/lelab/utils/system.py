@@ -199,10 +199,32 @@ POLICY_EXTRAS: dict[str, tuple[str, str]] = {
     "smolvla": ("transformers", "lerobot[smolvla]"),
     "pi0": ("transformers", "lerobot[pi]"),
     "pi0_fast": ("transformers", "lerobot[pi]"),
+    "pi05": ("transformers", "lerobot[pi]"),
     "diffusion": ("diffusers", "lerobot[diffusion]"),
     # groot pulls in peft (LoRA), diffusers, timm, dm-tree and decord; peft is a
     # reliable, cross-platform stand-in for "the lerobot[groot] extra is present".
     "groot": ("peft", "lerobot[groot]"),
+    "cosmos3_nano": ("transformers", "lerobot[cosmos3]"),
+    "cosmos3_edge": ("transformers", "lerobot[cosmos3]"),
+    "dm05": ("transformers", "lerobot[dm05]"),
+    "eo1": ("transformers", "lerobot[eo1]"),
+    "evo1": ("transformers", "lerobot[evo1]"),
+    "fastwam": ("diffusers", "lerobot[fastwam]"),
+    "fineart_vla": ("transformers", "lerobot[fineart_vla]"),
+    # flux3 also needs natten at construction, which its extra does not pull;
+    # the training log surfaces that ImportError with the install hint.
+    "flux3": ("transformers", "lerobot[flux3]"),
+    "g05": ("transformers", "lerobot[g05]"),
+    "lawam": ("diffusers", "lerobot[lawam]"),
+    "lingbot_va": ("diffusers", "lerobot[lingbot_va]"),
+    "lingbot_vla_v2": ("transformers", "lerobot[lingbot_vla_v2]"),
+    "longwam": ("diffusers", "lerobot[longwam]"),
+    "molmoact2": ("transformers", "lerobot[molmoact2]"),
+    "multi_task_dit": ("transformers", "lerobot[multi_task_dit]"),
+    "vla_jepa": ("transformers", "lerobot[vla_jepa]"),
+    "wall_oss_05": ("transformers", "lerobot[wall_oss_05]"),
+    "wall_x": ("transformers", "lerobot[wallx]"),
+    "xvla": ("transformers", "lerobot[xvla]"),
 }
 
 # One install manager per install target (lerobot[smolvla] / lerobot[pi] / …),

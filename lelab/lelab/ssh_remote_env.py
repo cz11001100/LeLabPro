@@ -41,7 +41,12 @@ CN_PYTORCH_WHEELS = "https://mirror.sjtu.edu.cn/pytorch-wheels"
 #   diffusion -> "diffusion"; pi0 / pi0_fast -> "pi"; smolvla -> "smolvla";
 #   groot -> "groot"; reward_classifier deps -> "robometer"
 # ("sac" is an RL-pipeline policy and does not go through lerobot-train.)
-POLICY_UNION_EXTRAS = ("diffusion", "pi", "smolvla", "groot", "robometer")
+POLICY_UNION_EXTRAS = (
+    "diffusion", "pi", "smolvla", "groot", "robometer",
+    "cosmos3", "dm05", "eo1", "evo1", "fastwam", "fineart_vla", "flux3",
+    "g05", "lawam", "lingbot_va", "lingbot_vla_v2", "longwam", "molmoact2",
+    "multi_task_dit", "vla_jepa", "wall_oss_05", "wallx", "xvla",
+)
 
 # Extras each UI-facing policy needs beyond core + "training" deps.
 # act / tdmpc / vqbet live in core lerobot and need no extra.
@@ -52,9 +57,29 @@ POLICY_INSTALL_EXTRAS: dict[str, tuple[str, ...]] = {
     "diffusion": ("diffusion",),
     "pi0": ("pi",),
     "pi0_fast": ("pi",),
+    "pi05": ("pi",),
     "smolvla": ("smolvla",),
     "groot": ("groot",),
     "reward_classifier": ("robometer",),
+    "cosmos3_nano": ("cosmos3",),
+    "cosmos3_edge": ("cosmos3",),
+    "dm05": ("dm05",),
+    "eo1": ("eo1",),
+    "evo1": ("evo1",),
+    "fastwam": ("fastwam",),
+    "fineart_vla": ("fineart_vla",),
+    "flux3": ("flux3",),
+    "g05": ("g05",),
+    "lawam": ("lawam",),
+    "lingbot_va": ("lingbot_va",),
+    "lingbot_vla_v2": ("lingbot_vla_v2",),
+    "longwam": ("longwam",),
+    "molmoact2": ("molmoact2",),
+    "multi_task_dit": ("multi_task_dit",),
+    "vla_jepa": ("vla_jepa",),
+    "wall_oss_05": ("wall_oss_05",),
+    "wall_x": ("wallx",),
+    "xvla": ("xvla",),
 }
 
 # Policies probed by both the env check and installer verification step.
@@ -63,11 +88,31 @@ PROBED_POLICIES = (
     "diffusion",
     "pi0",
     "pi0_fast",
+    "pi05",
     "smolvla",
     "groot",
     "tdmpc",
     "vqbet",
     "reward_classifier",
+    "cosmos3_nano",
+    "cosmos3_edge",
+    "dm05",
+    "eo1",
+    "evo1",
+    "fastwam",
+    "fineart_vla",
+    "flux3",
+    "g05",
+    "lawam",
+    "lingbot_va",
+    "lingbot_vla_v2",
+    "longwam",
+    "molmoact2",
+    "multi_task_dit",
+    "vla_jepa",
+    "wall_oss_05",
+    "wall_x",
+    "xvla",
 )
 
 
@@ -462,7 +507,7 @@ def _env_probe_script() -> str:
         "        r['training_deps_missing'].append(m)\n"
         "r['policies_ready'] = []; r['policies_missing'] = []; r['policy_errors'] = {}\n"
         "if r['lerobot_installed']:\n"
-        "    for t in ('act','diffusion','pi0','pi0_fast','smolvla','groot','tdmpc','vqbet','reward_classifier'):\n"
+        "    for t in ('act','diffusion','pi0','pi0_fast','pi05','smolvla','groot','tdmpc','vqbet','reward_classifier','cosmos3_nano','cosmos3_edge','dm05','eo1','evo1','fastwam','fineart_vla','flux3','g05','lawam','lingbot_va','lingbot_vla_v2','longwam','molmoact2','multi_task_dit','vla_jepa','wall_oss_05','wall_x','xvla'):\n"
         "        try:\n"
         "            if t == 'reward_classifier':\n"
         "                from lerobot.rewards.factory import get_reward_model_class\n"
@@ -1531,7 +1576,7 @@ def install_lerobot_remote_streaming(
             "except: r['training_extras'] = False\n"
             "ready, missing = [], []\n"
             "from lerobot.policies.factory import get_policy_class\n"
-            "for t in ('act','diffusion','pi0','pi0_fast','smolvla','groot','tdmpc','vqbet'):\n"
+            "for t in ('act','diffusion','pi0','pi0_fast','pi05','smolvla','groot','tdmpc','vqbet','cosmos3_nano','cosmos3_edge','dm05','eo1','evo1','fastwam','fineart_vla','flux3','g05','lawam','lingbot_va','lingbot_vla_v2','longwam','molmoact2','multi_task_dit','vla_jepa','wall_oss_05','wall_x','xvla'):\n"
             "    try:\n"
             "        get_policy_class(t); ready.append(t)\n"
             "    except Exception:\n"

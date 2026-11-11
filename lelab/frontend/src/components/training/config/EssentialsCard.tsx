@@ -7,7 +7,9 @@ import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
@@ -100,17 +102,49 @@ const EssentialsCard: React.FC<EssentialsCardProps> = ({ config, updateConfig, d
               <SelectTrigger id="policy_type" className="bg-slate-900 border-slate-600 text-white rounded-lg">
                 <SelectValue />
               </SelectTrigger>
-              <SelectContent className="bg-slate-800 border-slate-600 text-white">
-                <SelectItem value="act">ACT (Action Chunking Transformer)</SelectItem>
-                <SelectItem value="diffusion">Diffusion Policy</SelectItem>
-                <SelectItem value="pi0">PI0</SelectItem>
-                <SelectItem value="smolvla">SmolVLA</SelectItem>
-                <SelectItem value="groot">GR00T N1.7</SelectItem>
-                <SelectItem value="tdmpc">TD-MPC</SelectItem>
-                <SelectItem value="vqbet">VQ-BeT</SelectItem>
-                <SelectItem value="pi0_fast">PI0 Fast</SelectItem>
-                <SelectItem value="sac" disabled>SAC（在线 RL，暂不支持）</SelectItem>
-                <SelectItem value="reward_classifier">Reward Classifier</SelectItem>
+              <SelectContent className="bg-slate-800 border-slate-600 text-white max-h-80">
+                <SelectGroup>
+                  <SelectLabel className="text-slate-500">常用</SelectLabel>
+                  <SelectItem value="act">ACT (Action Chunking Transformer)</SelectItem>
+                  <SelectItem value="diffusion">Diffusion Policy</SelectItem>
+                  <SelectItem value="pi0">PI0</SelectItem>
+                  <SelectItem value="pi05">PI0.5</SelectItem>
+                  <SelectItem value="pi0_fast">PI0 Fast</SelectItem>
+                  <SelectItem value="smolvla">SmolVLA</SelectItem>
+                  <SelectItem value="groot">GR00T N1.7</SelectItem>
+                  <SelectItem value="tdmpc">TD-MPC</SelectItem>
+                  <SelectItem value="vqbet">VQ-BeT</SelectItem>
+                </SelectGroup>
+                <SelectGroup>
+                  <SelectLabel className="text-slate-500">VLA</SelectLabel>
+                  <SelectItem value="dm05">DM05</SelectItem>
+                  <SelectItem value="eo1">EO1</SelectItem>
+                  <SelectItem value="evo1">EVO1</SelectItem>
+                  <SelectItem value="fineart_vla">FineART VLA</SelectItem>
+                  <SelectItem value="g05">G05</SelectItem>
+                  <SelectItem value="lingbot_vla_v2">LingBot-VLA v2</SelectItem>
+                  <SelectItem value="molmoact2">MolmoAct2</SelectItem>
+                  <SelectItem value="wall_oss_05">WALL-OSS 0.5</SelectItem>
+                  <SelectItem value="wall_x">WALL-X</SelectItem>
+                  <SelectItem value="xvla">XVLA</SelectItem>
+                </SelectGroup>
+                <SelectGroup>
+                  <SelectLabel className="text-slate-500">世界模型</SelectLabel>
+                  <SelectItem value="cosmos3_nano">Cosmos3 Nano</SelectItem>
+                  <SelectItem value="cosmos3_edge">Cosmos3 Edge</SelectItem>
+                  <SelectItem value="fastwam">FastWAM</SelectItem>
+                  <SelectItem value="flux3">FLUX.3</SelectItem>
+                  <SelectItem value="lawam">LaWAM</SelectItem>
+                  <SelectItem value="lingbot_va">LingBot-VA</SelectItem>
+                  <SelectItem value="longwam">LongWAM</SelectItem>
+                  <SelectItem value="vla_jepa">VLA-JEPA</SelectItem>
+                </SelectGroup>
+                <SelectGroup>
+                  <SelectLabel className="text-slate-500">其他</SelectLabel>
+                  <SelectItem value="multi_task_dit">Multi-task DiT</SelectItem>
+                  <SelectItem value="reward_classifier">Reward Classifier</SelectItem>
+                  <SelectItem value="sac" disabled>SAC（在线 RL，暂不支持）</SelectItem>
+                </SelectGroup>
               </SelectContent>
             </Select>
           </div>

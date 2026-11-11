@@ -20,6 +20,7 @@ import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/component
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import { Loader2, Play, Square, Trash2, ArrowLeft, Cpu, ChevronDown } from "lucide-react";
 import EvaluationCard from "@/components/jobs/EvaluationCard";
+import SimEvalCard from "@/components/jobs/SimEvalCard";
 
 import { DatasetItem, listDatasets } from "@/lib/replayApi";
 import {
@@ -887,6 +888,8 @@ const MonitoringMode: React.FC<{ jobId: string }> = ({ jobId }) => {
         )}
 
         {canValidate && <EvaluationCard job={job} />}
+
+        {canValidate && <SimEvalCard job={job} />}
 
         <div className="bg-slate-800/40 border border-slate-700 rounded-lg p-4 flex items-center gap-3">
           <span className="text-sm font-semibold text-slate-300">Run inference</span>

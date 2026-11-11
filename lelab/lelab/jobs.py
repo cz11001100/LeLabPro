@@ -127,6 +127,11 @@ class JobRecord(BaseModel):
     # Validation state and results
     validation_state: Literal["none", "pending", "running", "done", "failed"] = "none"
     validation_results: dict | None = None
+    # Closed-loop sim evaluation (local subprocess): state, latest results and
+    # the run directory (relative to the job dir) that holds log.txt/videos.
+    sim_eval_state: Literal["none", "running", "done", "failed"] = "none"
+    sim_eval_results: dict | None = None
+    sim_eval_run_dir: str | None = None
     # SSH only: the last attempt ended in "could not reach the pod", which is not
     # evidence the training stopped, so the watchdog keeps re-attaching the job.
     remote_unconfirmed: bool = False
@@ -762,7 +767,13 @@ def _list_imported_hub(api, repo_id: str) -> list[JobCheckpoint]:
     return []
 
 
-_LANGUAGE_CONDITIONED_POLICY_TYPES = {"smolvla", "pi0", "pi0_fast", "pi05"}
+_LANGUAGE_CONDITIONED_POLICY_TYPES = {
+    "smolvla", "pi0", "pi0_fast", "pi05",
+    "cosmos3_nano", "cosmos3_edge", "dm05", "eo1", "evo1", "fastwam",
+    "fineart_vla", "flux3", "g05", "lawam", "lingbot_va", "lingbot_vla_v2",
+    "longwam", "molmoact2", "multi_task_dit", "vla_jepa", "wall_oss_05",
+    "wall_x", "xvla", "groot",
+}
 
 
 _HUB_CKPT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@checkpoints/(?P<step_dir>\d+)$")
@@ -2367,6 +2378,197 @@ print(json.dumps(out))
                 "validation_results": record.validation_results,
             }
 
+    def start_sim_eval(self, job_id: str, options: dict | None = None) -> dict:
+        """Closed-loop simulation evaluation of a local checkpoint.
+
+        Options: ``step``, ``n_episodes``, ``batch_size``, ``seed``,
+        ``env_hub_path``, ``max_episode_steps``. Runs lerobot-eval in a
+        subprocess (MuJoCo renders on the local X display); only local and
+        imported jobs qualify — SSH/cloud checkpoints must be exported first.
+        """
+        from .sim_eval import DEFAULT_ENV_HUB
+
+        opts = options or {}
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            if record.runner not in ("local", "imported"):
+                raise ValueError("仿真评测需要本地 checkpoint：SSH/云端任务请先导出到本地")
+            if record.sim_eval_state == "running":
+                return {"sim_eval_state": "running", "message": "仿真评测已在进行中"}
+
+            ckpts = self._list_checkpoints_unlocked(job_id)
+            if not ckpts:
+                raise ValueError(f"No checkpoints found for job {job_id}")
+            step = opts.get("step")
+            if step is None:
+                chosen = ckpts[-1]
+            else:
+                chosen = next((c for c in ckpts if c.step == int(step)), None)
+                if chosen is None:
+                    raise ValueError(f"No checkpoint at step {step} for job {job_id}")
+            if not Path(chosen.ref).is_dir():
+                raise ValueError(f"Checkpoint 不在本地: {chosen.ref}")
+
+            run_dir = _job_dir(self._output_root, job_id) / "sim_eval" / datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+            record.sim_eval_state = "running"
+            record.sim_eval_results = None
+            record.sim_eval_run_dir = str(run_dir.relative_to(_job_dir(self._output_root, job_id)))
+            self._persist(record, force=True)
+            cancel_event = threading.Event()
+            self._cancel_events[f"sim_eval:{job_id}"] = cancel_event
+
+        self._notify_change()
+        env_hub_path = str(opts.get("env_hub_path") or DEFAULT_ENV_HUB).strip()
+        eval_kwargs = {
+            "env_hub_path": env_hub_path,
+            "n_episodes": max(1, int(opts.get("n_episodes", 10))),
+            "batch_size": max(1, int(opts.get("batch_size", 1))),
+            "seed": int(opts.get("seed", 1000)),
+            "max_episode_steps": opts.get("max_episode_steps") or None,
+        }
+        started_at = time.time()
+
+        def _finalize(results: dict) -> None:
+            results["step"] = chosen.step
+            results["env"] = env_hub_path
+            results["ts"] = started_at
+            results["eval_s"] = round(time.time() - started_at, 1)
+            cancelled = bool(results.get("cancelled"))
+            if results.get("success"):
+                self._append_sim_eval_history(job_id, results)
+            with self._lock:
+                rec = self._records.get(job_id)
+                if rec is not None:
+                    if cancelled:
+                        rec.sim_eval_state = "none"
+                        rec.sim_eval_results = None
+                    else:
+                        rec.sim_eval_state = "done" if results.get("success") else "failed"
+                        rec.sim_eval_results = results
+                    self._persist(rec, force=True)
+            self._notify_change()
+
+        def _run():
+            try:
+                from .sim_eval import run_sim_eval
+
+                results = run_sim_eval(
+                    checkpoint_path=chosen.ref,
+                    run_dir=str(run_dir),
+                    cancel_event=cancel_event,
+                    **eval_kwargs,
+                )
+                _finalize(results)
+            except Exception as e:
+                import traceback
+
+                logger.error("Sim eval failed for job %s: %s", job_id, traceback.format_exc())
+                _finalize({"error": str(e), "traceback": traceback.format_exc()})
+            finally:
+                with self._lock:
+                    self._cancel_events.pop(f"sim_eval:{job_id}", None)
+
+        threading.Thread(target=_run, daemon=True, name=f"sim-eval-{job_id}").start()
+        return {"sim_eval_state": "running", "message": "仿真评测已启动"}
+
+    def _append_sim_eval_history(self, job_id: str, results: dict) -> None:
+        """One line per successful run, so checkpoints can be ranked side by side."""
+        overall = results.get("overall") or {}
+        entry = {
+            "ts": results.get("ts"),
+            "step": results.get("step"),
+            "env": results.get("env"),
+            "n_episodes": overall.get("n_episodes"),
+            "n_success": overall.get("n_success"),
+            "pc_success": overall.get("pc_success"),
+            "avg_max_reward": overall.get("avg_max_reward"),
+            "run_dir": results.get("run_dir"),
+        }
+        path = _job_dir(self._output_root, job_id) / "sim_eval" / "history.json"
+        try:
+            history = json.loads(path.read_text()) if path.is_file() else []
+            if not isinstance(history, list):
+                history = []
+            history.append(entry)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(history, indent=2))
+        except OSError as exc:
+            logger.warning("Could not write sim eval history for %s: %s", job_id, exc)
+
+    def stop_sim_eval(self, job_id: str) -> dict:
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            if record.sim_eval_state != "running":
+                return {"sim_eval_state": record.sim_eval_state, "message": "没有正在进行的仿真评测"}
+            evt = self._cancel_events.get(f"sim_eval:{job_id}")
+            if evt is not None:
+                evt.set()
+        return {"sim_eval_state": "running", "message": "正在停止仿真评测…"}
+
+    def get_sim_eval(self, job_id: str) -> dict:
+        from .sim_eval import parse_progress
+
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            state = record.sim_eval_state
+            results = record.sim_eval_results
+            run_dir_rel = record.sim_eval_run_dir
+        history: list = []
+        progress = None
+        job_dir = _job_dir(self._output_root, job_id)
+        history_path = job_dir / "sim_eval" / "history.json"
+        if history_path.is_file():
+            with contextlib.suppress(OSError, json.JSONDecodeError):
+                history = json.loads(history_path.read_text())
+        if state == "running" and run_dir_rel:
+            progress = parse_progress(job_dir / run_dir_rel / "log.txt")
+        return {
+            "sim_eval_state": state,
+            "sim_eval_results": results,
+            "sim_eval_run_dir": run_dir_rel,
+            "history": history if isinstance(history, list) else [],
+            "progress": progress,
+        }
+
+    def get_sim_eval_logs(self, job_id: str, tail: int = 200) -> dict:
+        with self._lock:
+            record = self._records.get(job_id)
+            if record is None:
+                raise JobNotFoundError(job_id)
+            run_dir_rel = record.sim_eval_run_dir
+        if not run_dir_rel:
+            return {"log": "", "run_dir": None}
+        log_path = _job_dir(self._output_root, job_id) / run_dir_rel / "log.txt"
+        text = ""
+        if log_path.is_file():
+            with open(log_path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                size = f.tell()
+                f.seek(max(0, size - 256_000))
+                text = f.read().decode("utf-8", errors="replace")
+        # tqdm updates arrive as \r-separated rewrites; keep the last of each line.
+        lines = [ln.split("\r")[-1] for ln in text.splitlines()]
+        lines = [ln for ln in lines if ln.strip()]
+        return {"log": "\n".join(lines[-max(1, tail):]), "run_dir": run_dir_rel}
+
+    def get_sim_eval_artifact(self, job_id: str, rel_path: str) -> Path:
+        """Serve one sim-eval artifact (episode mp4 or json), inside the job dir only."""
+        root = _job_dir(self._output_root, job_id).resolve()
+        candidate = (root / rel_path).resolve()
+        if not str(rel_path).startswith("sim_eval/") or candidate.suffix not in (".mp4", ".json"):
+            raise ValueError("Only sim_eval artifacts can be read")
+        if not candidate.is_relative_to(root) or not candidate.is_file():
+            raise FileNotFoundError(rel_path)
+        return candidate
+
     def _list_checkpoints_unlocked(self, job_id: str) -> list[JobCheckpoint]:
         """Internal: list checkpoints without acquiring the lock."""
         record = self._records.get(job_id)
@@ -2435,6 +2637,21 @@ print(json.dumps(out))
                     record.validation_results = {
                         "error": "Validation was interrupted by a server restart"
                     }
+                self._write_meta(record)
+            if record.sim_eval_state == "running":
+                logger.info("Resetting stale sim_eval_state for job %s", record.id)
+                # The eval subprocess outlives the server; kill it via the pid
+                # file so it does not keep the GPU and display busy.
+                if record.sim_eval_run_dir:
+                    pid_file = _job_dir(self._output_root, record.id) / record.sim_eval_run_dir / "proc.pid"
+                    with contextlib.suppress(OSError, ValueError):
+                        pid = int(pid_file.read_text().strip())
+                        cmdline = Path(f"/proc/{pid}/cmdline").read_bytes()
+                        if b"lerobot_eval" in cmdline:
+                            os.killpg(pid, signal.SIGTERM)
+                record.sim_eval_state = "failed"
+                if record.sim_eval_results is None:
+                    record.sim_eval_results = {"error": "仿真评测被服务重启中断"}
                 self._write_meta(record)
             if (
                 record.runner == "ssh"

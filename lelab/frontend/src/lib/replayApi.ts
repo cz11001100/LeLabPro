@@ -134,3 +134,112 @@ export async function getDatasetStatistics(
     },
   );
 }
+
+// ---------------------------------------------------------------------------
+// Local dataset viewer
+// ---------------------------------------------------------------------------
+
+export interface ViewerEpisode {
+  episode_index: number;
+  length: number;
+  tasks: string[];
+}
+
+export interface DatasetEpisodesInfo {
+  episodes: ViewerEpisode[];
+  cameras: string[];
+  fps: number;
+}
+
+export interface EpisodeSeries {
+  joint_names: string[];
+  frames: number[];
+  action: number[][];
+  state: number[][];
+}
+
+export async function getDatasetEpisodes(
+  baseUrl: string,
+  fetcher: Fetcher,
+  repoId: string,
+  signal?: AbortSignal,
+): Promise<DatasetEpisodesInfo> {
+  return apiRequest<DatasetEpisodesInfo>(
+    baseUrl,
+    fetcher,
+    `/dataset-episodes?repo_id=${encodeURIComponent(repoId)}`,
+    { signal, action: "Get dataset episodes" },
+  );
+}
+
+export function datasetVideoUrl(baseUrl: string, repoId: string, episode: number, camera: string): string {
+  return `${baseUrl}/dataset-video?repo_id=${encodeURIComponent(repoId)}&episode=${episode}&camera=${encodeURIComponent(camera)}`;
+}
+
+export async function getDatasetVideoWindow(
+  baseUrl: string,
+  fetcher: Fetcher,
+  repoId: string,
+  episode: number,
+  camera: string,
+  signal?: AbortSignal,
+): Promise<{ from_timestamp: number; to_timestamp: number }> {
+  return apiRequest(
+    baseUrl,
+    fetcher,
+    `/dataset-video-window?repo_id=${encodeURIComponent(repoId)}&episode=${episode}&camera=${encodeURIComponent(camera)}`,
+    { signal, action: "Get video window" },
+  );
+}
+
+export async function getDatasetEpisodeSeries(
+  baseUrl: string,
+  fetcher: Fetcher,
+  repoId: string,
+  episode: number,
+  signal?: AbortSignal,
+): Promise<EpisodeSeries> {
+  return apiRequest<EpisodeSeries>(
+    baseUrl,
+    fetcher,
+    `/dataset-episode-series?repo_id=${encodeURIComponent(repoId)}&episode=${episode}`,
+    { signal, action: "Get episode series" },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Augmentation preview
+// ---------------------------------------------------------------------------
+
+export interface AugmentPreviewConfig {
+  repo_id: string;
+  n_frames?: number;
+  augmentation_max_num_transforms?: number;
+  augmentation_random_order?: boolean;
+  augmentation_brightness?: boolean;
+  augmentation_contrast?: boolean;
+  augmentation_saturation?: boolean;
+  augmentation_hue?: boolean;
+  augmentation_sharpness?: boolean;
+  augmentation_affine?: boolean;
+}
+
+export interface AugmentPreviewResult {
+  camera: string;
+  original: string[];
+  augmented: string[];
+  transforms: string[];
+  per_transform: { name: string; image: string }[];
+}
+
+export async function getAugmentPreview(
+  baseUrl: string,
+  fetcher: Fetcher,
+  config: AugmentPreviewConfig,
+): Promise<AugmentPreviewResult> {
+  return apiRequest<AugmentPreviewResult>(baseUrl, fetcher, "/augment-preview", {
+    method: "POST",
+    body: config,
+    action: "Preview augmentations",
+  });
+}

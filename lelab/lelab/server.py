@@ -940,6 +940,76 @@ def get_dataset_statistics(request: DatasetInfoRequest):
     return analyze_dataset(request.dataset_repo_id)
 
 
+@app.get("/dataset-episodes")
+def get_dataset_episodes(repo_id: str):
+    """Episode list + cameras for the local dataset viewer."""
+    try:
+        return dataset_browser.dataset_episodes(repo_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/dataset-video")
+def get_dataset_video(repo_id: str, episode: int, camera: str):
+    """One episode's video file; the player seeks to the episode's window."""
+    try:
+        info = dataset_browser.dataset_video_info(repo_id, episode, camera)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return FileResponse(info["path"], media_type="video/mp4")
+
+
+@app.get("/dataset-video-window")
+def get_dataset_video_window(repo_id: str, episode: int, camera: str):
+    """The episode's timestamp window inside its (shared) video file."""
+    try:
+        info = dataset_browser.dataset_video_info(repo_id, episode, camera)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "from_timestamp": info["from_timestamp"],
+        "to_timestamp": info["to_timestamp"],
+    }
+
+
+@app.get("/dataset-episode-series")
+def get_dataset_episode_series(repo_id: str, episode: int, max_points: int = 400):
+    """One episode's action/state curves for the local viewer."""
+    try:
+        return dataset_browser.dataset_episode_series(repo_id, episode, max_points=max_points)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+class AugmentPreviewRequest(BaseModel):
+    repo_id: str
+    n_frames: int = 3
+    augmentation_max_num_transforms: int = 3
+    augmentation_random_order: bool = False
+    augmentation_brightness: bool = True
+    augmentation_contrast: bool = True
+    augmentation_saturation: bool = True
+    augmentation_hue: bool = True
+    augmentation_sharpness: bool = True
+    augmentation_affine: bool = True
+
+
+@app.post("/augment-preview")
+async def augment_preview(body: AugmentPreviewRequest):
+    """Apply the configured training augmentations to sample dataset frames."""
+    from .augment_preview import preview_augmentations
+
+    try:
+        return await run_in_threadpool(
+            preview_augmentations,
+            repo_id=body.repo_id,
+            request=body,
+            n_frames=body.n_frames,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/delete-dataset")
 def delete_dataset(request: DatasetInfoRequest):
     """Remove a recorded dataset directory from local disk."""
@@ -1350,6 +1420,19 @@ class ValidationOptions(BaseModel):
     device: str = "cuda"
 
 
+class SimEvalOptions(BaseModel):
+    """Closed-loop sim evaluation knobs. Omit the body for the defaults."""
+
+    step: int | None = None
+    n_episodes: int = 10
+    batch_size: int = 1
+    seed: int = 1000
+    env_hub_path: str = "lerobot/so101-tabletop-mujoco"
+    # Real-rig episodes run ~20 s; the env's own 3600-step default would make
+    # every sim episode two minutes long.
+    max_episode_steps: int | None = 600
+
+
 @app.post("/jobs/{job_id}/validate")
 def start_job_validation(job_id: str, options: ValidationOptions | None = None):
     """Start the offline evaluation for a completed or imported job.
@@ -1398,6 +1481,55 @@ def get_job_validation(job_id: str):
         return job_registry.get_validation(job_id)
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+
+
+@app.post("/jobs/{job_id}/sim-eval")
+def start_job_sim_eval(job_id: str, options: SimEvalOptions | None = None):
+    """Start closed-loop simulation evaluation (lerobot-eval + EnvHub MuJoCo)."""
+    try:
+        return job_registry.start_sim_eval(job_id, options.model_dump() if options else None)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/jobs/{job_id}/sim-eval/stop")
+def stop_job_sim_eval(job_id: str):
+    try:
+        return job_registry.stop_sim_eval(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+
+
+@app.get("/jobs/{job_id}/sim-eval")
+def get_job_sim_eval(job_id: str):
+    """State, latest results, run history (for ranking) and batch progress."""
+    try:
+        return job_registry.get_sim_eval(job_id)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+
+
+@app.get("/jobs/{job_id}/sim-eval/logs")
+def get_job_sim_eval_logs(job_id: str, tail: int = 200):
+    try:
+        return job_registry.get_sim_eval_logs(job_id, tail=tail)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+
+
+@app.get("/jobs/{job_id}/sim-eval/artifact")
+def get_job_sim_eval_artifact(job_id: str, path: str):
+    """Serve one sim-eval episode video (mp4) or metrics json."""
+    try:
+        artifact = job_registry.get_sim_eval_artifact(job_id, path)
+    except JobNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
+    except (FileNotFoundError, ValueError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    media_type = "video/mp4" if artifact.suffix == ".mp4" else "application/json"
+    return FileResponse(artifact, media_type=media_type)
 
 
 @app.post("/jobs/{job_id}/stop")
@@ -1471,7 +1603,9 @@ def get_runners_hardware():
                 "pretty_name": h.pretty_name,
                 "cpu": h.cpu,
                 "ram": h.ram,
-                "accelerator": h.accelerator,
+                # hub >= 2.x returns a JobAccelerator object; the label only
+                # needs the VRAM (pretty_name already carries count + model).
+                "accelerator": h.accelerator.vram if h.accelerator else None,
                 "unit_cost_usd": h.unit_cost_usd,
                 "unit_label": h.unit_label,
             }

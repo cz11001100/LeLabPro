@@ -42,9 +42,8 @@ const stamp = () => {
 };
 
 /**
- * Fold several local datasets into one. lerobot 0.6 refuses to train on a list
- * of datasets, so this is how correction episodes recorded on the inference
- * page get into a real training run.
+ * Fold several local datasets into one — how correction episodes recorded on
+ * the inference page get into a real training run.
  */
 const MergeSection: React.FC = () => {
   const { baseUrl, fetchWithHeaders } = useApi();

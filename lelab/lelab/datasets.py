@@ -495,3 +495,154 @@ def analyze_dataset(repo_id: str) -> dict[str, Any]:
         "statistics": statistics,
         "anomalies": anomalies,
     }
+
+
+# ---------------------------------------------------------------------------
+# Local dataset visualization: episode list, per-episode video windows, curves
+# ---------------------------------------------------------------------------
+
+
+def _dataset_root_checked(repo_id: str) -> Path:
+    root = _lerobot_cache_root().resolve()
+    dataset_root = (root / repo_id).resolve()
+    if not dataset_root.is_relative_to(root) or not _is_dataset_dir(dataset_root):
+        raise FileNotFoundError(f"Dataset {repo_id} not found")
+    return dataset_root
+
+
+def _load_episodes_meta(dataset_root: Path) -> list[dict[str, Any]]:
+    import json
+
+    episodes: list[dict[str, Any]] = []
+    jsonl = dataset_root / "meta" / "episodes.jsonl"
+    if jsonl.is_file():
+        for line in jsonl.read_text().splitlines():
+            if line.strip():
+                episodes.append(json.loads(line))
+    else:
+        files = sorted(dataset_root.glob("meta/episodes/chunk-*/file-*.parquet"))
+        if files:
+            df = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
+            episodes = df.to_dict(orient="records")
+    for e in episodes:
+        e["episode_index"] = int(e["episode_index"])
+        e["length"] = int(e["length"])
+    episodes.sort(key=lambda e: e["episode_index"])
+    return episodes
+
+
+def dataset_episodes(repo_id: str) -> dict[str, Any]:
+    """Episode list + camera keys for the local viewer."""
+    import json
+
+    dataset_root = _dataset_root_checked(repo_id)
+    info = json.loads((dataset_root / "meta" / "info.json").read_text())
+    cameras = [
+        key
+        for key, ft in (info.get("features") or {}).items()
+        if ft.get("dtype") == "video"
+    ]
+    episodes = [
+        {
+            "episode_index": e["episode_index"],
+            "length": e["length"],
+            "tasks": [str(t) for t in (e.get("tasks") if e.get("tasks") is not None else [])],
+        }
+        for e in _load_episodes_meta(dataset_root)
+    ]
+    return {"episodes": episodes, "cameras": cameras, "fps": float(info.get("fps", 30))}
+
+
+def dataset_video_info(repo_id: str, episode: int, camera: str) -> dict[str, Any]:
+    """Resolve one episode's video file and its timestamp window inside it.
+
+    v3 packs many episodes into one mp4; the player seeks to ``from_timestamp``
+    and stops at ``to_timestamp``. Legacy v2 has one file per episode.
+    """
+    import json
+
+    dataset_root = _dataset_root_checked(repo_id)
+    info = json.loads((dataset_root / "meta" / "info.json").read_text())
+    cameras = {
+        key for key, ft in (info.get("features") or {}).items() if ft.get("dtype") == "video"
+    }
+    if camera not in cameras:
+        raise FileNotFoundError(f"Camera {camera} not in dataset")
+    meta = next(
+        (e for e in _load_episodes_meta(dataset_root) if e["episode_index"] == int(episode)), None
+    )
+    if meta is None:
+        raise FileNotFoundError(f"Episode {episode} not found")
+
+    prefix = f"videos/{camera}/"
+    if prefix + "chunk_index" in meta:
+        ci = int(meta[prefix + "chunk_index"])
+        fi = int(meta[prefix + "file_index"])
+        path = dataset_root / "videos" / camera / f"chunk-{ci:03d}" / f"file-{fi:03d}.mp4"
+        window = {
+            "from_timestamp": float(meta.get(prefix + "from_timestamp") or 0.0),
+            "to_timestamp": float(meta.get(prefix + "to_timestamp") or 0.0),
+        }
+    else:
+        path = dataset_root / "videos" / "chunk-000" / camera / f"episode_{int(episode):06d}.mp4"
+        window = {"from_timestamp": 0.0, "to_timestamp": 0.0}
+    if not path.is_file():
+        raise FileNotFoundError(f"Video file missing: {path.name}")
+    return {"path": path, **window}
+
+
+def dataset_episode_series(repo_id: str, episode: int, max_points: int = 400) -> dict[str, Any]:
+    """One episode's action/state curves, evenly downsampled."""
+    import json
+
+    dataset_root = _dataset_root_checked(repo_id)
+    info = json.loads((dataset_root / "meta" / "info.json").read_text())
+    names = (info.get("features") or {}).get("action", {}).get("names") or []
+    joint_names = [str(n).replace(".pos", "") for n in names]
+
+    meta = next(
+        (e for e in _load_episodes_meta(dataset_root) if e["episode_index"] == int(episode)), None
+    )
+    if meta is None:
+        raise FileNotFoundError(f"Episode {episode} not found")
+
+    df = None
+    if "data/chunk_index" in meta:
+        ci, fi = int(meta["data/chunk_index"]), int(meta["data/file_index"])
+        path = dataset_root / "data" / f"chunk-{ci:03d}" / f"file-{fi:03d}.parquet"
+        if path.is_file():
+            df = pd.read_parquet(path)
+    if df is None:
+        files = sorted(dataset_root.glob("data/chunk-*/file-*.parquet"))
+        if not files:
+            files = sorted(dataset_root.glob("chunk-*/episode_*.parquet"))
+        parts = []
+        for p in files:
+            try:
+                part = pd.read_parquet(p)
+            except Exception:
+                continue
+            if "episode_index" in part.columns:
+                part = part[part["episode_index"].astype(int) == int(episode)]
+                if len(part):
+                    parts.append(part)
+        if not parts:
+            raise FileNotFoundError(f"No frames for episode {episode}")
+        df = pd.concat(parts, ignore_index=True)
+    df = df[df["episode_index"].astype(int) == int(episode)].sort_values("frame_index")
+    if df.empty:
+        raise FileNotFoundError(f"No frames for episode {episode}")
+
+    n = len(df)
+    count = min(n, max_points)
+    idx = [round(i * (n - 1) / max(1, count - 1)) for i in range(count)]
+    idx = sorted(set(idx))
+    sub = df.iloc[idx]
+    return {
+        "joint_names": joint_names,
+        "frames": [int(f) for f in sub["frame_index"]],
+        "action": [[float(v) for v in row] for row in sub["action"]],
+        "state": [[float(v) for v in row] for row in sub["observation.state"]]
+        if "observation.state" in sub.columns
+        else [],
+    }
