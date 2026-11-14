@@ -14,6 +14,7 @@ import {
   startJobSimEval,
   stopJobSimEval,
   JobRecord,
+  SimEvalDiagnostics,
   SimEvalHistoryEntry,
   SimEvalResults,
   SimEvalState,
@@ -32,9 +33,17 @@ interface SimEvalConfig {
   nEpisodes: number;
   batchSize: number;
   envHub: string;
+  smooth: string;
+  ensemble: string;
 }
 
-const DEFAULT_CONFIG: SimEvalConfig = { nEpisodes: 10, batchSize: 1, envHub: DEFAULT_ENV_HUB };
+const DEFAULT_CONFIG: SimEvalConfig = {
+  nEpisodes: 10,
+  batchSize: 1,
+  envHub: DEFAULT_ENV_HUB,
+  smooth: "0",
+  ensemble: "",
+};
 
 const loadConfig = (): SimEvalConfig => {
   try {
@@ -47,6 +56,8 @@ const loadConfig = (): SimEvalConfig => {
       batchSize: typeof p.batchSize === "number" ? p.batchSize : DEFAULT_CONFIG.batchSize,
       // Older saves pointed at the Hub copy of the same scene; prefer the builtin one.
       envHub: savedHub === LEGACY_ENV_HUB ? DEFAULT_CONFIG.envHub : savedHub,
+      smooth: typeof p.smooth === "string" ? p.smooth : DEFAULT_CONFIG.smooth,
+      ensemble: typeof p.ensemble === "string" ? p.ensemble : DEFAULT_CONFIG.ensemble,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -95,6 +106,77 @@ const LogBox: React.FC<{ text: string }> = ({ text }) => {
     >
       {text || "…"}
     </pre>
+  );
+};
+
+const DiagnosticsPanel: React.FC<{ d: SimEvalDiagnostics }> = ({ d }) => {
+  if (d.error)
+    return <div className="text-xs text-slate-500">诊断不可用：{d.error}</div>;
+  const spread = d.traj_spread_norm;
+  const tone =
+    spread == null
+      ? "bg-slate-900/50 text-slate-300"
+      : spread < 0.05
+        ? "bg-red-900/30 text-red-300 border border-red-800/50"
+        : spread < 0.2
+          ? "bg-amber-900/30 text-amber-300 border border-amber-800/50"
+          : "bg-emerald-900/30 text-emerald-300 border border-emerald-800/50";
+  const px = (v: [number, number] | null | undefined) => (v ? `${v[0]}, ${v[1]}` : "—");
+  return (
+    <div className="space-y-3 rounded-lg border border-slate-700 bg-slate-900/40 p-3">
+      <div className="text-sm font-medium text-slate-300">评测诊断</div>
+      {d.verdict && <div className={`text-sm rounded-lg p-2 ${tone}`}>{d.verdict}</div>}
+      <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+        <Metric
+          label="跨集轨迹差异"
+          value={fmt(spread, 3)}
+          hint="0 = 各集完全相同；越大越随画面变化"
+        />
+        <Metric label="轨迹差异（关节度）" value={fmt(d.traj_spread_deg, 2, "°")} />
+        <Metric
+          label="集内步间变化"
+          value={fmt(d.within_motion_norm, 3)}
+          hint="机械臂自身动作幅度，作对照"
+        />
+      </div>
+      {(d.episodes ?? []).length > 0 && (
+        <div className="overflow-x-auto rounded-lg border border-slate-700">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="bg-slate-900/70 text-slate-400">
+                <th className="px-3 py-2 text-left">集</th>
+                <th className="px-3 py-2 text-left">红球（up 像素）</th>
+                <th className="px-3 py-2 text-left">蓝球（up 像素）</th>
+                <th className="px-3 py-2 text-right">步数</th>
+              </tr>
+            </thead>
+            <tbody>
+              {(d.episodes ?? []).map((e) => (
+                <tr key={e.episode} className="border-t border-slate-700/60">
+                  <td className="px-3 py-2 text-white font-mono">{e.episode}</td>
+                  <td className="px-3 py-2 text-slate-200">{px(e.balls_up_px?.red)}</td>
+                  <td className="px-3 py-2 text-slate-200">{px(e.balls_up_px?.blue)}</td>
+                  <td className="px-3 py-2 text-right text-slate-400">{e.steps}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      {d.domain_gap && Object.keys(d.domain_gap).length > 0 && (
+        <div className="text-xs text-slate-400 space-y-1">
+          <div className="text-slate-300">
+            仿真画面 vs 训练画面（均值差 0 = 相同；std 比 1 = 相同）
+          </div>
+          {Object.entries(d.domain_gap).map(([cam, g]) => (
+            <div key={cam}>
+              <span className="font-mono text-slate-200">{cam}</span>：均值差 {g.mean_abs_shift} ·
+              std 比 {g.std_ratio}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 };
 
@@ -159,6 +241,8 @@ const SimEvalCard: React.FC<{
   const [nEpisodes, setNEpisodes] = useState(saved.nEpisodes);
   const [batchSize, setBatchSize] = useState(saved.batchSize);
   const [envHub, setEnvHub] = useState(saved.envHub);
+  const [smooth, setSmooth] = useState(saved.smooth);
+  const [ensemble, setEnsemble] = useState(saved.ensemble);
   const [state, setState] = useState<SimEvalState>(job.sim_eval_state ?? "none");
   const [results, setResults] = useState<SimEvalResults | null>(job.sim_eval_results ?? null);
   const [history, setHistory] = useState<SimEvalHistoryEntry[]>([]);
@@ -230,7 +314,7 @@ const SimEvalCard: React.FC<{
   }, [running, state, baseUrl, fetchWithHeaders, job.id]);
 
   const run = async () => {
-    saveConfig({ nEpisodes, batchSize, envHub });
+    saveConfig({ nEpisodes, batchSize, envHub, smooth, ensemble });
     setStarting(true);
     setState("running");
     setResults(null);
@@ -242,6 +326,8 @@ const SimEvalCard: React.FC<{
         n_episodes: nEpisodes,
         batch_size: batchSize,
         env_hub_path: envHub.trim(),
+        action_smooth: Math.min(0.95, Math.max(0, Number(smooth) || 0)),
+        temporal_ensemble: ensemble.trim() ? Number(ensemble) : undefined,
       });
       toast({ title: "仿真评测已启动" });
     } catch (e) {
@@ -342,6 +428,28 @@ const SimEvalCard: React.FC<{
               留空用仓库内置 sim/so101-tabletop-mujoco（免下载）；可填 Hub 仓库或本地路径
             </div>
           </Field>
+          <Field label="动作平滑（0=关）">
+            <Input
+              value={smooth}
+              onChange={(e) => setSmooth(e.target.value)}
+              placeholder="0"
+              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
+            />
+            <div className="text-[11px] text-slate-500 mt-1">
+              关节目标低通滤波，越大越稳但越滞后；建议 0–0.5
+            </div>
+          </Field>
+          <Field label="时序集成（留空=关）">
+            <Input
+              value={ensemble}
+              onChange={(e) => setEnsemble(e.target.value)}
+              placeholder="0.01"
+              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
+            />
+            <div className="text-[11px] text-slate-500 mt-1">
+              ACT 每步重算动作块并加权平均，更平滑也更跟手；建议 0.01
+            </div>
+          </Field>
         </div>
 
         <div className="flex flex-wrap items-center gap-4">
@@ -430,6 +538,7 @@ const SimEvalCard: React.FC<{
                 ))}
               </div>
             )}
+            {results?.diagnostics && <DiagnosticsPanel d={results.diagnostics} />}
           </>
         )}
 

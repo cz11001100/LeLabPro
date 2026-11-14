@@ -93,6 +93,152 @@ def _make_env_kwargs(checkpoint_path: str, env_hub_path: str) -> dict:
         cameras[name] = target
     return {"cameras": cameras} if cameras else {}
 
+
+def _ball_centers_px(rgb) -> dict:
+    """Red/blue ball centroids (pixels) in an up-camera frame; None if not visible."""
+    import numpy as np
+
+    r = rgb[..., 0].astype(int)
+    g = rgb[..., 1].astype(int)
+    b = rgb[..., 2].astype(int)
+    out = {}
+    for name, mask in (
+        ("red", (r > 120) & (g < 90) & (b < 90)),
+        ("blue", (b > 120) & (r < 90)),
+    ):
+        ys, xs = np.nonzero(mask)
+        out[name] = [round(float(xs.mean()), 1), round(float(ys.mean()), 1)] if len(xs) > 20 else None
+    return out
+
+
+def diagnose_recordings(run_dir: Path, checkpoint_path: str) -> dict:
+    """Did the arm react to the ball at all? Combine the eval recording with the
+    checkpoint's training stats.
+
+    ``--eval.recording=true`` saves every step's actions and camera frames as a
+    LeRobot dataset under ``run_dir/recordings``. From it we compute:
+
+    * per-episode ball positions (read off the first up frame),
+    * cross-episode action-trajectory spread (normalized by the pooled action
+      std): near zero means the arm replays the same motion regardless of where
+      the balls are — the policy is effectively ignoring vision,
+    * sim-vs-train domain gap per camera: mean/std shift of the recorded frames
+      against the normalizer stats the policy was trained with.
+    """
+    import numpy as np
+
+    root = run_dir / "recordings"
+    # Layouts: recordings/env_i (single task) or recordings/<task>/env_i.
+    dirs = sorted({p.parent for p in root.rglob("meta") if p.is_dir()}) if root.is_dir() else []
+    if not dirs:
+        return {"error": "没有录制数据（recordings 目录缺失）"}
+
+    from lerobot.datasets import LeRobotDataset
+
+    episodes: list[dict] = []
+    trajs: list = []
+    frames: dict[str, list] = {"up": [], "side": [], "wrist": []}
+    ep_no = 0
+    for d in dirs:
+        ds = LeRobotDataset(repo_id="eval_recording", root=str(d))
+        hf = ds.hf_dataset
+        ep_ids = hf["episode_index"]
+        for ep in range(int(max(ep_ids)) + 1):
+            idxs = [i for i, e in enumerate(ep_ids) if e == ep]
+            if not idxs:
+                continue
+            acts = np.asarray([hf[i]["action"] for i in idxs], dtype=np.float64)
+            trajs.append(acts[:150])
+            first = ds[idxs[0]]
+            balls: dict = {}
+            for cam in frames:
+                key = f"observation.images.{cam}"
+                if key not in first:
+                    continue
+                img = first[key]
+                arr = (img.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+                if cam == "up":
+                    balls = _ball_centers_px(arr)
+                if len(frames[cam]) < 30:
+                    frames[cam].append(arr)
+            episodes.append({"episode": ep_no, "balls_up_px": balls, "steps": len(idxs)})
+            ep_no += 1
+
+    diag: dict = {"episodes": episodes}
+    if len(trajs) >= 2:
+        t = min(len(x) for x in trajs)
+        a = np.stack([x[:t] for x in trajs])  # (E, T, 6)
+        std = a.reshape(-1, a.shape[-1]).std(axis=0) + 1e-6
+        an = (a - a.mean(axis=(0, 1))) / std
+        pair = [
+            float(np.linalg.norm(an[i] - an[j]) / np.sqrt(6 * t))
+            for i in range(len(a))
+            for j in range(i + 1, len(a))
+        ]
+        spread = float(np.mean(pair))
+        within = float(
+            np.mean([np.linalg.norm(np.diff(x, axis=0)) / np.sqrt(6 * max(t - 1, 1)) for x in an])
+        )
+        raw = float(
+            np.mean(
+                [
+                    np.linalg.norm(a[i] - a[j]) / np.sqrt(6 * t)
+                    for i in range(len(a))
+                    for j in range(i + 1, len(a))
+                ]
+            )
+        )
+        diag.update(traj_spread_norm=round(spread, 3), traj_spread_deg=round(raw, 2), within_motion_norm=round(within, 3))
+        if spread < 0.05:
+            verdict = "各集轨迹几乎相同：机械臂动作对球的位置基本无响应，视觉未起作用"
+        elif spread < 0.2:
+            verdict = "各集轨迹差异很小：对球位置响应弱，视觉利用不足"
+        else:
+            verdict = "各集轨迹随画面变化，但需结合域差判断是否为有效追球"
+    else:
+        verdict = "只有一集录制，无法比较轨迹差异（建议 ≥3 集）"
+
+    try:
+        from safetensors.torch import load_file
+
+        stats = load_file(
+            str(Path(checkpoint_path) / "policy_preprocessor_step_3_normalizer_processor.safetensors")
+        )
+        gap = {}
+        for cam, arrs in frames.items():
+            mk, sk = f"observation.images.{cam}.mean", f"observation.images.{cam}.std"
+            if not arrs or mk not in stats or sk not in stats:
+                continue
+            sim = np.stack(arrs).astype(np.float64) / 255.0
+            sim_mean = sim.mean(axis=(0, 1, 2))
+            sim_std = sim.std(axis=(0, 1, 2)) + 1e-6
+            tm = stats[mk].numpy().flatten()
+            ts = stats[sk].numpy().flatten() + 1e-6
+            gap[cam] = {
+                "mean_abs_shift": round(float(np.abs(sim_mean - tm).mean()), 3),
+                "std_ratio": round(float((sim_std / ts).mean()), 2),
+            }
+        if gap:
+            diag["domain_gap"] = gap
+            worst = max(g["mean_abs_shift"] for g in gap.values())
+            if worst > 0.2:
+                verdict += (
+                    f"；但仿真画面与训练画面差异大（最大均值差 {worst}），"
+                    "策略在半盲状态下动作，轨迹变化不等于有效追球"
+                )
+            else:
+                verdict += "；画面分布与训练接近，轨迹变化可视为对球位的响应"
+    except Exception as exc:  # stats are a bonus, never fail the diagnosis over them
+        logger.warning("Domain-gap stats unavailable: %s", exc)
+    diag["verdict"] = verdict
+
+    try:
+        (run_dir / "diagnostics.json").write_text(json.dumps(diag, indent=2, ensure_ascii=False))
+    except OSError as exc:
+        logger.warning("Could not write diagnostics.json: %s", exc)
+    return diag
+
+
 # tqdm writes "Stepping through eval batches:  40%|██| 2/5 [00:30<00:45, ...]"
 _PROGRESS_RE = re.compile(r"(\d+)/(\d+)\s*\[")
 
@@ -132,6 +278,8 @@ def run_sim_eval(
     batch_size: int = 1,
     seed: int = 1000,
     max_episode_steps: int | None = None,
+    action_smooth: float = 0.0,
+    temporal_ensemble: float | None = None,
     cancel_event=None,
 ) -> dict:
     """Run lerobot-eval once; results and videos land under ``run_dir``.
@@ -155,12 +303,32 @@ def run_sim_eval(
         "--trust_remote_code=true",
         f"--eval.n_episodes={n_episodes}",
         f"--eval.batch_size={batch_size}",
+        # Sync vector env: the async workers cannot render per camera, which
+        # the multi-view eval videos need. MuJoCo stepping is cheap; policy
+        # inference stays batched on GPU, so little is lost.
+        "--eval.use_async_envs=false",
         f"--output_dir={run_dir}",
         f"--seed={seed}",
+        # Record every step's actions + camera frames so the post-run diagnosis
+        # can check whether the arm actually reacts to the ball layout.
+        "--eval.recording=true",
     ]
     if max_episode_steps:
         cmd.append(f"--eval.max_episode_steps={max_episode_steps}")
+    if temporal_ensemble is not None:
+        # ACT default replays whole 100-step chunks open-loop; ensembling
+        # re-predicts every step and weight-averages overlaps (smoother, reactive).
+        # ACT requires n_action_steps=1 when ensembling (query every step).
+        cmd.append(f"--policy.temporal_ensemble_coeff={temporal_ensemble}")
+        cmd.append("--policy.n_action_steps=1")
     env_kwargs = _make_env_kwargs(checkpoint_path, env_hub_path)
+    if max_episode_steps and "so101-tabletop-mujoco" in env_hub_path:
+        # Let the env itself truncate at the cap: the recorder only flushes an
+        # episode on env terminated/truncated, so an eval-side cap alone would
+        # leave the recorded actions unwritten.
+        env_kwargs["episode_length"] = int(max_episode_steps)
+    if action_smooth > 0 and "so101-tabletop-mujoco" in env_hub_path:
+        env_kwargs["action_smooth"] = float(action_smooth)
     if env_kwargs:
         cmd.append(f"--env.make_env_kwargs={json.dumps(env_kwargs)}")
 
@@ -219,12 +387,18 @@ def run_sim_eval(
                 continue
             if (job_dir / rel).is_file():
                 videos.append(str(rel))
+        try:
+            diagnostics = diagnose_recordings(run_dir, checkpoint_path)
+        except Exception as exc:
+            logger.error("Sim eval diagnosis failed: %s", exc, exc_info=True)
+            diagnostics = {"error": str(exc)}
         return {
             "success": True,
             "exit_code": 0,
             "overall": info.get("overall", {}),
             "per_group": info.get("per_group", {}),
             "videos": videos,
+            "diagnostics": diagnostics,
             "run_dir": str(rel_run),
         }
 

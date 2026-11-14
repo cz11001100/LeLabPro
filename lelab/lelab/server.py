@@ -1433,6 +1433,11 @@ class SimEvalOptions(BaseModel):
     # Real-rig episodes run ~20 s; the env's own 3600-step default would make
     # every sim episode two minutes long.
     max_episode_steps: int | None = 600
+    # Joint-target low-pass in the env (0 = off, 0.9 = very smooth but laggy).
+    action_smooth: float = 0.0
+    # ACT temporal ensembling coeff; None keeps the checkpoint's open-loop
+    # chunk replay. ~0.01 re-predicts every step and averages overlaps.
+    temporal_ensemble: float | None = None
 
 
 @app.post("/jobs/{job_id}/validate")

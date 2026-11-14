@@ -162,7 +162,8 @@ def _build_raw_frame(
             if val.dtype == np.float64:
                 val = val.astype(np.float32)
             frame[key] = val
-    frame[ACTION] = action
+    # Policies may emit float16 actions; the dataset schema is float32.
+    frame[ACTION] = np.asarray(action, dtype=np.float32)
     frame["next.reward"] = np.atleast_1d(np.float32(reward))
     frame["next.success"] = np.atleast_1d(np.bool_(success))
     frame["next.done"] = np.atleast_1d(np.bool_(done))
@@ -536,7 +537,19 @@ def eval_policy(
         if n_episodes_rendered >= max_episodes_rendered:
             return
         n_to_render_now = min(max_episodes_rendered - n_episodes_rendered, env.num_envs)
-        if isinstance(env, gym.vector.SyncVectorEnv):
+        # Multi-camera envs (e.g. the SO-101 tabletop sim): record every view the
+        # policy sees, side by side (up | side | wrist), instead of only the
+        # env's default render camera. Single-camera envs keep the old behavior.
+        try:
+            cams = env.get_attr("cameras")
+        except Exception:
+            cams = None
+        if cams and isinstance(cams[0], dict) and len(cams[0]) > 1:
+            keys = [k for k in ("up", "side", "wrist") if k in cams[0]]
+            keys += [k for k in cams[0] if k not in keys]
+            views = [np.stack(env.call("render", k)[:n_to_render_now]) for k in keys]
+            ep_frames.append(np.concatenate(views, axis=2))
+        elif isinstance(env, gym.vector.SyncVectorEnv):
             ep_frames.append(np.stack([env.envs[i].render() for i in range(n_to_render_now)]))  # noqa: B023
         elif hasattr(env, "call"):
             # Here we must render all frames and discard any we don't need.
@@ -882,8 +895,26 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
     )
 
     recording_dir = Path(cfg.output_dir) / "recordings" if cfg.eval.recording else None
-    max_episodes_rendered = 0 if cfg.eval.recording else 10
-    videos_dir = None if cfg.eval.recording else Path(cfg.output_dir) / "videos"
+    # Keep the mp4 rollouts even when recording: the UI plays them, while the
+    # recorded dataset feeds the step-level diagnosis.
+    max_episodes_rendered = 10
+    videos_dir = Path(cfg.output_dir) / "videos"
+    env_features = cfg.env.features
+    if cfg.eval.recording and not env_features:
+        # EnvHub repos rarely declare features; derive them from the canonical
+        # observation/action spaces so recording works out of the box.
+        env_features = {}
+        for key, space in first_env.single_observation_space.spaces.items():
+            if not isinstance(space, gym.spaces.Box):
+                continue
+            visual = space.dtype == np.uint8 and space.ndim == 3
+            env_features[key] = PolicyFeature(
+                type=FeatureType.VISUAL if visual else FeatureType.STATE,
+                shape=tuple(space.shape),
+            )
+        env_features[ACTION] = PolicyFeature(
+            type=FeatureType.ACTION, shape=tuple(first_env.single_action_space.shape)
+        )
 
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
@@ -900,7 +931,7 @@ def eval_main(cfg: EvalPipelineConfig) -> None:
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             recording_dir=recording_dir,
-            env_features=cfg.env.features if cfg.eval.recording else None,
+            env_features=env_features if cfg.eval.recording else None,
             recording_repo_id=cfg.eval.recording_repo_id,
             recording_private=cfg.eval.recording_private,
             max_episode_steps=cfg.eval.max_episode_steps,

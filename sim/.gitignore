@@ -4,3 +4,4 @@ out/
 # 场景本体（env.py / XML / STL 网格）必须入库：LeLab 仿真评测默认用它，
 # 新克隆没有它就只能回退 Hub 下载。只排除场景里的 HF 下载缓存。
 so101-tabletop-mujoco/.cache/
+so101-tabletop-mujoco/MUJOCO_LOG.TXT

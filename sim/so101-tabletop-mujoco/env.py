@@ -369,6 +369,7 @@ class SO101Env(gym.Env):
         initial_joints: Sequence[float] = HOME,
         randomize: Mapping[str, Any] | None = None,
         camera_fovy: Mapping[str, float] | None = None,
+        action_smooth: float = 0.0,
     ):
         super().__init__()
         # None: the repository's tabletop scene, located on first use.
@@ -390,6 +391,11 @@ class SO101Env(gym.Env):
         self.randomize = dict(randomize)
         # MJCF camera name -> vertical field of view in degrees, e.g. to widen the arm's wrist_cam.
         self.camera_fovy = dict(camera_fovy or {})
+        # Exponential low-pass on joint targets (0 = off). Trades a little lag
+        # for visibly smoother arm motion; ACT temporal ensembling is the
+        # preferred smoother and lives in the policy config.
+        self.action_smooth = float(np.clip(action_smooth, 0.0, 0.95))
+        self._smoothed_action: np.ndarray | None = None
         self._world: _World | None = None
         self._target_ball: str | None = None
         self._ball_z0 = 0.0
@@ -439,6 +445,7 @@ class SO101Env(gym.Env):
     def reset(self, seed: int | None = None, **kwargs) -> tuple[dict[str, Any], dict[str, Any]]:
         """Restore the scene's XML state and apply the seeded randomization."""
         world = self._ensure_world()
+        self._smoothed_action = None
         super().reset(seed=seed)
         world.reset(self.np_random, self.initial_joints)
 
@@ -468,6 +475,10 @@ class SO101Env(gym.Env):
         action = np.asarray(action)
         if action.shape != self.action_space.shape:
             raise ValueError(f"Expected action of shape {self.action_space.shape}, got {action.shape}")
+        if self.action_smooth > 0:
+            prev = self._smoothed_action if self._smoothed_action is not None else action
+            action = self.action_smooth * prev + (1 - self.action_smooth) * action
+            self._smoothed_action = action
         world.data.ctrl[world.actuators] = world.to_ctrl(action)
         mujoco.mj_step(world.model, world.data, nstep=world.substeps)
         self._steps += 1

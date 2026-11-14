@@ -361,6 +361,13 @@ class LocalVectorEnv(gym.vector.VectorEnv):
 
     def call(self, name: str, *args: Any, **kwargs: Any) -> tuple[Any, ...]:
         """Return a supported per-environment attribute."""
+        if name == "render" and (args or kwargs):
+            # Fresh per-camera render, e.g. multi-view eval videos (up | side | wrist).
+            # Sync mode only: async workers keep the cached-frame render path.
+            if self.use_async_envs:
+                raise AttributeError("Per-camera render requires use_async_envs=false")
+            self._build()
+            return tuple(env.render(*args, **kwargs) for env in self._envs)
         if args or kwargs:
             raise TypeError("Environment attributes do not take arguments")
         if name == "_max_episode_steps":
@@ -371,6 +378,12 @@ class LocalVectorEnv(gym.vector.VectorEnv):
             return (self.task_group,) * self.num_envs
         if name == "task_description":
             return self.latest.task
+        if name == "cameras":
+            # Observation-key -> camera-name maps of multi-camera envs; None elsewhere.
+            if self.use_async_envs:
+                raise AttributeError("cameras requires use_async_envs=false")
+            self._build()
+            return tuple(getattr(env, "cameras", None) for env in self._envs)
         if name == "render":
             return self.render()
         raise AttributeError(f"Environment attribute is not exposed: {name}")

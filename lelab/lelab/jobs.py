@@ -2429,6 +2429,8 @@ print(json.dumps(out))
             "batch_size": max(1, int(opts.get("batch_size", 1))),
             "seed": int(opts.get("seed", 1000)),
             "max_episode_steps": opts.get("max_episode_steps") or None,
+            "action_smooth": float(opts.get("action_smooth", 0) or 0),
+            "temporal_ensemble": opts.get("temporal_ensemble"),
         }
         started_at = time.time()
 

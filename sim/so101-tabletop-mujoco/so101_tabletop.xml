@@ -12,7 +12,7 @@
   <statistic center="0.35 0 0.1" extent="0.6"/>
 
   <visual>
-    <headlight diffuse="0.35 0.35 0.35" ambient="0.2 0.2 0.2" specular="0 0 0"/>
+    <headlight diffuse="0.35 0.35 0.35" ambient="0.3 0.3 0.3" specular="0 0 0"/>
     <global azimuth="160" elevation="-20" offwidth="1280" offheight="960"/>
   </visual>
 
@@ -55,8 +55,10 @@
   </default>
 
   <worldbody>
-    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
-    <light pos="0.3 -0.4 0.8" dir="-0.3 0.5 -1" diffuse="0.25 0.25 0.25" castshadow="true"/>
+    <!-- Real-rig photos have soft, faint shadows; MuJoCo's projected shadows are
+         hard and large, a visible domain gap. Cast none and lean on ambient. -->
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true" castshadow="false"/>
+    <light pos="0.3 -0.4 0.8" dir="-0.3 0.5 -1" diffuse="0.25 0.25 0.25" castshadow="false"/>
     <!-- Table: 80 x 100 cm top, surface at z=0. Wide enough for the side
          camera's round base (x=40 cm in the user frame) to sit fully on it.
          The arm base rear edge is at x=-0.057, so the table rear edge is there:

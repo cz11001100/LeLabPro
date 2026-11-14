@@ -884,6 +884,20 @@ export interface SimEvalOverall {
   video_paths: string[];
 }
 
+export interface SimEvalDiagnostics {
+  error?: string;
+  verdict?: string;
+  traj_spread_norm?: number;
+  traj_spread_deg?: number;
+  within_motion_norm?: number;
+  episodes?: {
+    episode: number;
+    balls_up_px: Record<string, [number, number] | null>;
+    steps: number;
+  }[];
+  domain_gap?: Record<string, { mean_abs_shift: number; std_ratio: number }>;
+}
+
 export interface SimEvalResults {
   success?: boolean;
   cancelled?: boolean;
@@ -898,6 +912,7 @@ export interface SimEvalResults {
   overall?: SimEvalOverall;
   per_group?: Record<string, unknown>;
   videos?: string[];
+  diagnostics?: SimEvalDiagnostics;
   run_dir?: string;
 }
 
@@ -919,6 +934,8 @@ export interface SimEvalOptions {
   seed?: number;
   env_hub_path?: string;
   max_episode_steps?: number | null;
+  action_smooth?: number;
+  temporal_ensemble?: number | null;
 }
 
 export interface SimEvalStatus {
