@@ -254,6 +254,13 @@ def rollout(
                     features=features,
                     root=root,
                     use_videos=True,
+                    # Encode as frames arrive instead of buffering a whole
+                    # episode: with several envs × long episodes × 3 cameras the
+                    # end-of-episode flush held ~12 GB and the OOM killer
+                    # SIGKILLed the run after it had finished all steps.
+                    streaming_encoding=True,
+                    encoder_threads=2,
+                    encoder_queue_maxsize=16,
                 )
             )
         raw_observation = deepcopy(observation)
@@ -606,7 +613,12 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
-            recording_dir=recording_dir,
+            # One directory per batch: every batch opens the recording dataset
+            # with exist_ok=False, so a shared root failed with FileExistsError
+            # as soon as n_episodes > batch_size.
+            recording_dir=(
+                recording_dir / f"batch_{batch_ix:03d}" if recording_dir is not None else None
+            ),
             env_features=env_features,
             recording_repo_id=recording_repo_id,
             recording_private=recording_private,

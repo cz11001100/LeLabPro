@@ -60,6 +60,8 @@ export interface CameraConfig {
   fps?: number;
   fourcc?: string; // 4-char OpenCV pixel format (e.g. "MJPG"); undefined = auto-detect
   backend?: string; // Cv2Backends name (e.g. "AVFOUNDATION"); undefined = platform default
+  exposure?: number; // V4L2 exposure_time_absolute (100 µs steps); undefined = auto exposure
+  gain?: number; // V4L2 gain; undefined = driver-controlled
   rotation?: 0 | 90 | 180 | 270; // Clockwise quarter-turn applied to a network stream before storage
 }
 
@@ -765,6 +767,28 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                     ))}
                   </SelectContent>
                 </Select>
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-16">Exposure:</span>
+                <NumberInput
+                  value={camera.exposure}
+                  onChange={(v) => onUpdate({ exposure: v })}
+                  className="bg-gray-800 border-gray-700 text-white text-xs h-6 px-2 w-16"
+                  min="0"
+                  placeholder="auto"
+                  title="V4L2 exposure_time_absolute，100 µs 为一档（100 = 10 ms）；留空 = 自动曝光"
+                />
+              </div>
+              <div className="flex items-center gap-2">
+                <span className="w-16">Gain:</span>
+                <NumberInput
+                  value={camera.gain}
+                  onChange={(v) => onUpdate({ gain: v })}
+                  className="bg-gray-800 border-gray-700 text-white text-xs h-6 px-2 w-16"
+                  min="0"
+                  placeholder="auto"
+                  title="V4L2 gain；留空 = 由驱动控制"
+                />
               </div>
               <p className="text-[10px] text-gray-500 leading-tight">
                 Overriding the backend can reorder camera indices on macOS.

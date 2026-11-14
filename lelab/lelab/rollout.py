@@ -352,10 +352,12 @@ def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
     remapped to lerobot's `index_or_path`, and a stream URL has to go out as
     `type: network`: the `opencv` config types that field `int | Path`, so draccus
     coerces the URL into a Path and silently collapses `rtsp://host/live` to
-    `rtsp:/host/live`.
+    `rtsp:/host/live`. Exposure and gain are V4L2 device controls, not lerobot
+    config fields, so they are dropped here and applied via lelab.v4l2 instead.
     """
     from .network_camera import camera_source
 
+    _v4l2_only = ("url", "exposure", "gain")
     parts = []
     for name, cfg in cameras.items():
         kind, source = camera_source(cfg)
@@ -371,7 +373,7 @@ def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
         remapped = {
             ("index_or_path" if k == "camera_index" else k): v
             for k, v in cfg.items()
-            if v is not None and k != "url"
+            if v is not None and k not in _v4l2_only
         }
         body = ", ".join(f"{k}: {v}" for k, v in remapped.items())
         parts.append(f"{name}: {{{body}}}")
@@ -819,7 +821,9 @@ def _apply_v4l2_camera_controls(cameras: dict[str, dict[str, Any]]) -> None:
     train and inference see identical exposure/white balance). Controls are
     device-level, so setting them from here also fixes the frames the policy
     itself sees."""
-    from .v4l2 import apply_camera_controls
+    from .v4l2 import apply_camera_controls, configure_manual_controls
+
+    configure_manual_controls(cameras)
 
     for cam_name, cam_cfg in cameras.items():
         idx = cam_cfg.get("camera_index")

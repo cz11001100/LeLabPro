@@ -291,6 +291,8 @@ const Landing = () => {
           fps: cam.fps,
           ...(cam.fourcc ? { fourcc: cam.fourcc } : {}),
           ...(cam.backend ? { backend: cam.backend } : {}),
+          ...(cam.exposure !== undefined ? { exposure: cam.exposure } : {}),
+          ...(cam.gain !== undefined ? { gain: cam.gain } : {}),
         };
         return acc;
       },
@@ -305,6 +307,8 @@ const Landing = () => {
           fps?: number;
           fourcc?: string;
           backend?: string;
+          exposure?: number;
+          gain?: number;
         }
       >,
     );

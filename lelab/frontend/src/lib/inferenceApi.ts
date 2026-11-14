@@ -14,6 +14,8 @@ export interface StartInferenceRequest {
     width: number;
     height: number;
     fps?: number;
+    exposure?: number;
+    gain?: number;
   }>;
   duration_s: number;
   n_runs: number;

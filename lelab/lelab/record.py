@@ -234,6 +234,12 @@ def create_record_config(request: RecordingRequest) -> RecordConfig:
     # defaults to the platform pin unless the request overrides it per camera.
     camera_configs = _build_camera_configs(request.cameras, _platform_backend())
 
+    # Exposure/gain have no place in OpenCVCameraConfig; lelab.v4l2 holds them
+    # aside and applies them right after each camera connects.
+    from .v4l2 import configure_manual_controls
+
+    configure_manual_controls(request.cameras)
+
     # Create robot config
     robot_config = SO101FollowerConfig(
         port=request.follower_port,

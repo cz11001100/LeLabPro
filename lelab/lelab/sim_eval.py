@@ -372,6 +372,48 @@ def parse_progress(log_path: Path) -> dict | None:
     return {"batches_done": int(done), "batches_total": int(total)}
 
 
+def _recording_footprint(checkpoint_path: str, steps: int) -> tuple[float, int]:
+    """RAM for one env's recording buffer (GB) and the camera count.
+
+    ``--eval.recording=true`` keeps an episode's frames in memory until the env
+    truncates and the writer flushes them, so the peak scales with
+    steps × cameras × H × W × 3.
+    """
+    try:
+        cfg = json.loads((Path(checkpoint_path) / "config.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0.0, 0
+    bytes_per_step = 0
+    n_cams = 0
+    for key, feat in (cfg.get("input_features") or {}).items():
+        if not key.startswith("observation.images."):
+            continue
+        shape = (feat or {}).get("shape") or []
+        if len(shape) != 3:
+            continue
+        n_cams += 1
+        bytes_per_step += int(shape[0]) * int(shape[1]) * int(shape[2])
+    return bytes_per_step * steps / 1e9, n_cams
+
+
+def _safe_batch_size(requested: int, per_env_gb: float, reserve_gb: float = 5.0) -> int:
+    """Largest batch whose recording buffers fit in free RAM next to the policy.
+
+    ``per_env_gb`` must already include the encoder's transient copy: the
+    buffered frames stay resident while each episode is flushed to video.
+    """
+    if per_env_gb <= 0 or requested <= 1:
+        return requested
+    try:
+        import psutil
+
+        avail_gb = psutil.virtual_memory().available / 1e9
+    except Exception:
+        return requested
+    budget = max(1.0, avail_gb * 0.6 - reserve_gb)
+    return max(1, min(requested, int(budget // per_env_gb)))
+
+
 def run_sim_eval(
     *,
     checkpoint_path: str,
@@ -396,6 +438,27 @@ def run_sim_eval(
     log_path = run_dir / "log.txt"
     env_hub_path = resolve_env_path(env_hub_path)
 
+    # The recording buffer is per (env, episode) and lives in RAM until the
+    # episode ends, so a large batch × long episode × multi-camera run gets
+    # OOM-killed mid-rollout (exit -9) instead of finishing.
+    steps = int(max_episode_steps or 400)
+    buffer_gb, n_cams = _recording_footprint(checkpoint_path, steps)
+    # The rollout holds one frame set per env; flushing an episode to video keeps
+    # those frames resident while the encoder works on a second copy, so the
+    # peak is about twice the buffer (measured: batch 4 × 600 steps × 3 cams hit
+    # 12 GB at encode time and was OOM-killed after finishing all 600 steps).
+    peak_gb = buffer_gb * 2
+    safe_batch = _safe_batch_size(batch_size, peak_gb)
+    notes = ""
+    if safe_batch < batch_size:
+        notes = (
+            f"batch_size {batch_size}→{safe_batch}：每集 {steps} 步 × {n_cams} 路相机，"
+            f"录制缓冲 {buffer_gb:.1f} GB/路、编码峰值约 {peak_gb:.1f} GB/路，"
+            "本机可用内存不够"
+        )
+        logger.warning(notes)
+        batch_size = safe_batch
+
     cmd = [
         sys.executable,
         "-m",
@@ -418,7 +481,6 @@ def run_sim_eval(
     ]
     if max_episode_steps:
         cmd.append(f"--eval.max_episode_steps={max_episode_steps}")
-    notes = ""
     if temporal_ensemble is not None:
         # Temporal ensembling is a per-policy capability (ACT today): re-predict
         # every step and weight-average chunk overlaps. Only pass the flags when
@@ -429,7 +491,8 @@ def run_sim_eval(
             if _policy_type(checkpoint_path) == "act":
                 cmd.append("--policy.n_action_steps=1")
         else:
-            notes = "该策略未实现时序集成（目前 ACT 支持），本次按 checkpoint 原生动作回放执行"
+            message = "该策略未实现时序集成（目前 ACT 支持），本次按 checkpoint 原生动作回放执行"
+            notes = f"{notes}；{message}" if notes else message
             logger.warning("temporal_ensemble requested but unsupported: %s", checkpoint_path)
     env_kwargs = _make_env_kwargs(checkpoint_path, env_hub_path)
     if max_episode_steps and "so101-tabletop-mujoco" in env_hub_path:
@@ -520,7 +583,15 @@ def run_sim_eval(
     return {
         "success": False,
         "exit_code": exit_code,
-        "error": f"lerobot-eval 退出码 {exit_code}",
+        "error": (
+            f"lerobot-eval 被系统 OOM 杀掉（SIGKILL，退出码 {exit_code}）。"
+            f"batch_size={batch_size}、每集 {steps} 步 × {n_cams} 路相机，"
+            f"录制缓冲 {buffer_gb * batch_size:.1f} GB（编码峰值约 {peak_gb * batch_size:.1f} GB），"
+            "超出本机可用内存；"
+            "降低 batch_size 或每集步数后重试"
+            if exit_code in (-9, 137)
+            else f"lerobot-eval 退出码 {exit_code}"
+        ),
         "log_tail": tail,
         "notes": notes,
         "run_dir": str(rel_run),

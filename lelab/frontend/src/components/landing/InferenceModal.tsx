@@ -347,6 +347,7 @@ const InferenceModal: React.FC<Props> = ({
     await new Promise((r) => setTimeout(r, 300));
     const cameraDict: Record<string, {
       type: string; camera_index?: number; url?: string; width: number; height: number; fps?: number;
+      exposure?: number; gain?: number;
     }> = {};
     for (const [name, dims] of Object.entries(policyConfig.image_features)) {
       const binding = cameraBindings[name];
@@ -366,12 +367,19 @@ const InferenceModal: React.FC<Props> = ({
           fps: saved?.fps ?? DEFAULT_FPS,
         };
       } else {
+        // Exposure/gain are device-level; reuse what the robot record saved so
+        // the policy sees the same image pipeline the dataset was recorded with.
+        const saved = robot.cameras.find(
+          (c) => c.name.toLowerCase() === name.toLowerCase(),
+        );
         cameraDict[name] = {
           type: "opencv",
           camera_index: binding,
           width: dims.width,
           height: dims.height,
           fps: DEFAULT_FPS,
+          ...(saved?.exposure !== undefined ? { exposure: saved.exposure } : {}),
+          ...(saved?.gain !== undefined ? { gain: saved.gain } : {}),
         };
       }
     }
