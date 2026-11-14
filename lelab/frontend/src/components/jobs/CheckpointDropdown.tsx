@@ -8,6 +8,10 @@ import {
 } from "@/components/ui/select";
 import { JobCheckpoint } from "@/lib/checkpointsApi";
 
+// One width for every first-row control box on the cards — the checkpoint chip
+// here and the dataset card's date box — so the columns line up across sections.
+export const CARD_BOX_W = "w-[104px]";
+
 interface Props {
   checkpoints: JobCheckpoint[];
   selectedStep: number | null;
@@ -25,7 +29,7 @@ export const CheckpointDropdown: React.FC<Props> = ({
   onChange,
   disabled,
   placeholder = "Select checkpoint",
-  triggerClassName = "bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 w-[132px] shrink-0",
+  triggerClassName = `bg-slate-800 border-slate-700 text-white h-8 text-xs px-2 ${CARD_BOX_W} shrink-0`,
 }) => {
   // step 0 is the sentinel for an imported single-model checkpoint (lerobot
   // never saves at step 0), so it has no meaningful step number — show

@@ -53,6 +53,8 @@ import { randomGreeting } from "@/lib/greetings";
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import ScoringModal from "./ScoringModal";
 import EvaluationModal from "./EvaluationModal";
+import SimEvalModal from "./SimEvalModal";
+import { CARD_BOX_W } from "./CheckpointDropdown";
 
 // The registry holds every job ever run; the untracked section collapses
 // finished ones, so a small cap hid whole months of history (26 records were
@@ -169,7 +171,7 @@ const DatasetCard: React.FC<{
           {d.repo_id}
         </div>
         <div className="flex items-center gap-2">
-          <div className="flex h-8 w-[132px] shrink-0 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-2 text-xs text-white">
+          <div className={`flex h-8 ${CARD_BOX_W} shrink-0 items-center gap-1.5 rounded-md border border-slate-700 bg-slate-800 px-2 text-xs text-white`}>
             <CalendarDays className="w-3.5 h-3.5 shrink-0 text-slate-400" />
             <span className="truncate tabular-nums">
               {d.last_modified ? d.last_modified.slice(0, 10) : "—"}
@@ -255,6 +257,9 @@ const JobsSection: React.FC = () => {
   const [evaluationModalOpen, setEvaluationModalOpen] = useState(false);
   const [evaluationJob, setEvaluationJob] = useState<JobRecord | null>(null);
   const [evaluationGroup, setEvaluationGroup] = useState<JobRecord[] | null>(null);
+  const [simEvalModalOpen, setSimEvalModalOpen] = useState(false);
+  const [simEvalJob, setSimEvalJob] = useState<JobRecord | null>(null);
+  const [simEvalGroup, setSimEvalGroup] = useState<JobRecord[] | null>(null);
   const [inferenceJob, setInferenceJob] = useState<JobRecord | null>(null);
   const [inferenceStep, setInferenceStep] = useState<number | null>(null);
   const [sshStatus, setSshStatus] = useState<SSHStatus | null>(null);
@@ -533,16 +538,29 @@ const JobsSection: React.FC = () => {
   // The flask on a model card opens the evaluation dialog; the run itself is
   // started and stopped inside it. Siblings of the same training run come
   // along so the dialog can switch checkpoint.
+  const groupMembersOf = useCallback(
+    (jobId: string) =>
+      importedGroups.find((g) => g.members.some((m) => m.id === jobId))?.members ??
+      null,
+    [importedGroups],
+  );
+
   const handleEvaluate = useCallback(
     (job: JobRecord) => {
-      const group = importedGroups.find((g) =>
-        g.members.some((m) => m.id === job.id),
-      );
       setEvaluationJob(job);
-      setEvaluationGroup(group ? group.members : null);
+      setEvaluationGroup(groupMembersOf(job.id));
       setEvaluationModalOpen(true);
     },
-    [importedGroups],
+    [groupMembersOf],
+  );
+
+  const handleSimEval = useCallback(
+    (job: JobRecord) => {
+      setSimEvalJob(job);
+      setSimEvalGroup(groupMembersOf(job.id));
+      setSimEvalModalOpen(true);
+    },
+    [groupMembersOf],
   );
   // Hub jobs already mirrored by a local JobRecord get their richer card via
   // trackedCloudJobs; everything else from the hub gets a plain HubJobCard.
@@ -714,6 +732,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -726,6 +745,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -738,6 +758,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -772,6 +793,7 @@ const JobsSection: React.FC = () => {
                     onDelete={handleDelete}
                     onPlay={handlePlay}
                     onEvaluate={handleEvaluate}
+                    onSimEval={handleSimEval}
                     onExport={handleExport}
                     onResume={handleResume}
                   />
@@ -852,6 +874,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -864,6 +887,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -876,6 +900,7 @@ const JobsSection: React.FC = () => {
                   onDelete={handleDelete}
                   onPlay={handlePlay}
                   onEvaluate={handleEvaluate}
+                  onSimEval={handleSimEval}
                   onExport={handleExport}
                   onResume={handleResume}
                 />
@@ -909,6 +934,13 @@ const JobsSection: React.FC = () => {
         onOpenChange={setEvaluationModalOpen}
         job={evaluationJob}
         group={evaluationGroup ?? undefined}
+      />
+
+      <SimEvalModal
+        open={simEvalModalOpen}
+        onOpenChange={setSimEvalModalOpen}
+        job={simEvalJob}
+        group={simEvalGroup ?? undefined}
       />
 
       <ScoringModal
