@@ -14,8 +14,11 @@
 
 """Closed-loop simulation evaluation: lerobot-eval + EnvHub (MuJoCo).
 
-Runs in a subprocess because rendering needs its own process: this machine's
-hybrid GPU has no working EGL, so MuJoCo renders through GLFW on the X display.
+Runs in a subprocess because rendering needs its own process. The tabletop
+scene is vendored in this repo under ``sim/so101-tabletop-mujoco`` and is the
+default environment (no Hub download); a Hub repo id or local path overrides it.
+MuJoCo renders offscreen through EGL by default, so no X display is needed;
+set MUJOCO_GL=glfw to render on a display instead.
 Scores rank checkpoints against each other; acceptance stays on the real robot.
 """
 
@@ -35,6 +38,30 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 DEFAULT_ENV_HUB = "lerobot/so101-tabletop-mujoco"
+
+# Values meaning "use the scene vendored in this repo" instead of a Hub download.
+BUILTIN_ALIASES = {"", "builtin", "local", "内置"}
+
+
+def builtin_scene_dir() -> Path | None:
+    """The vendored tabletop scene, if this checkout (or ~/LeLabPro) carries it."""
+    for root in (Path(__file__).resolve().parents[2], Path.home() / "LeLabPro"):
+        scene = root / "sim" / "so101-tabletop-mujoco"
+        if (scene / "env.py").is_file() and (scene / "so101_tabletop.xml").is_file():
+            return scene
+    return None
+
+
+def resolve_env_path(value: str | None) -> str:
+    """Empty/builtin aliases -> the vendored scene; anything else passes through."""
+    value = (value or "").strip()
+    if value in BUILTIN_ALIASES:
+        scene = builtin_scene_dir()
+        if scene is not None:
+            return str(scene)
+        logger.warning("内置仿真场景缺失，回退 Hub 环境 %s", DEFAULT_ENV_HUB)
+        return DEFAULT_ENV_HUB
+    return value
 
 # The tabletop MJCF scene names its cameras top/front/wrist_cam; checkpoints
 # recorded on the real rig use up/side/wrist. Map checkpoint names onto the
@@ -100,7 +127,7 @@ def run_sim_eval(
     *,
     checkpoint_path: str,
     run_dir: str,
-    env_hub_path: str = DEFAULT_ENV_HUB,
+    env_hub_path: str | None = None,
     n_episodes: int = 10,
     batch_size: int = 1,
     seed: int = 1000,
@@ -116,6 +143,7 @@ def run_sim_eval(
     run_dir.mkdir(parents=True, exist_ok=True)
     job_dir = run_dir.parent.parent
     log_path = run_dir / "log.txt"
+    env_hub_path = resolve_env_path(env_hub_path)
 
     cmd = [
         sys.executable,
@@ -137,8 +165,10 @@ def run_sim_eval(
         cmd.append(f"--env.make_env_kwargs={json.dumps(env_kwargs)}")
 
     env = os.environ.copy()
-    env.setdefault("MUJOCO_GL", "glfw")
-    env.setdefault("DISPLAY", ":0")
+    # EGL renders offscreen without an X display; glfw is the opt-in fallback.
+    env.setdefault("MUJOCO_GL", "egl")
+    if env["MUJOCO_GL"] == "glfw":
+        env.setdefault("DISPLAY", ":0")
     env["PYTHONUNBUFFERED"] = "1"
 
     logger.info("Sim eval: %s", " ".join(cmd))

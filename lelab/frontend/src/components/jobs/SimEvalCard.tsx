@@ -23,7 +23,10 @@ import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 import { ModelVariant } from "@/lib/modelGroups";
 
 const SIM_EVAL_CONFIG_KEY = "lelab.simeval.config";
-const DEFAULT_ENV_HUB = "lerobot/so101-tabletop-mujoco";
+// Empty string = the scene vendored in the repo (sim/so101-tabletop-mujoco),
+// resolved by the backend; no Hub download needed.
+const DEFAULT_ENV_HUB = "";
+const LEGACY_ENV_HUB = "lerobot/so101-tabletop-mujoco";
 
 interface SimEvalConfig {
   nEpisodes: number;
@@ -38,10 +41,12 @@ const loadConfig = (): SimEvalConfig => {
     const raw = localStorage.getItem(SIM_EVAL_CONFIG_KEY);
     if (!raw) return DEFAULT_CONFIG;
     const p = JSON.parse(raw);
+    const savedHub = typeof p.envHub === "string" ? p.envHub : DEFAULT_CONFIG.envHub;
     return {
       nEpisodes: typeof p.nEpisodes === "number" ? p.nEpisodes : DEFAULT_CONFIG.nEpisodes,
       batchSize: typeof p.batchSize === "number" ? p.batchSize : DEFAULT_CONFIG.batchSize,
-      envHub: typeof p.envHub === "string" && p.envHub ? p.envHub : DEFAULT_CONFIG.envHub,
+      // Older saves pointed at the Hub copy of the same scene; prefer the builtin one.
+      envHub: savedHub === LEGACY_ENV_HUB ? DEFAULT_CONFIG.envHub : savedHub,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -236,7 +241,7 @@ const SimEvalCard: React.FC<{
         step: step ? Number(step) : undefined,
         n_episodes: nEpisodes,
         batch_size: batchSize,
-        env_hub_path: envHub.trim() || DEFAULT_ENV_HUB,
+        env_hub_path: envHub.trim(),
       });
       toast({ title: "仿真评测已启动" });
     } catch (e) {
@@ -330,9 +335,12 @@ const SimEvalCard: React.FC<{
             <Input
               value={envHub}
               onChange={(e) => setEnvHub(e.target.value)}
-              placeholder={DEFAULT_ENV_HUB}
+              placeholder="留空 = 内置本地场景"
               className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
             />
+            <div className="text-[11px] text-slate-500 mt-1">
+              留空用仓库内置 sim/so101-tabletop-mujoco（免下载）；可填 Hub 仓库或本地路径
+            </div>
           </Field>
         </div>
 

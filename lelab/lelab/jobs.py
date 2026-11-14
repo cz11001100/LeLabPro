@@ -2386,7 +2386,7 @@ print(json.dumps(out))
         subprocess (MuJoCo renders on the local X display); only local and
         imported jobs qualify — SSH/cloud checkpoints must be exported first.
         """
-        from .sim_eval import DEFAULT_ENV_HUB
+        from .sim_eval import resolve_env_path
 
         opts = options or {}
         with self._lock:
@@ -2422,7 +2422,7 @@ print(json.dumps(out))
             self._cancel_events[f"sim_eval:{job_id}"] = cancel_event
 
         self._notify_change()
-        env_hub_path = str(opts.get("env_hub_path") or DEFAULT_ENV_HUB).strip()
+        env_hub_path = resolve_env_path(opts.get("env_hub_path"))
         eval_kwargs = {
             "env_hub_path": env_hub_path,
             "n_episodes": max(1, int(opts.get("n_episodes", 10))),

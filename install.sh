@@ -12,15 +12,17 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
 #
 # 做的事：退出 conda → 装 uv → 建 Python 3.12 虚拟环境 → 装本仓库的 lerobot 与
-# lelab（国内镜像）→ 自检关键模块 → 生成 ./lelab-run.sh
+# lelab（国内镜像）→ 装 MuJoCo 仿真评测依赖 → 自检关键模块 → 生成 ./lelab-run.sh
 #
-# 档位自动选：检测到 NVIDIA GPU 才下 CUDA 版 torch，没有就下 CPU 版（少约 4GB）。
-# 想强制：--full 装 CUDA 版，--lite 装 CPU 版。
+# 档位自动选：检测到 NVIDIA GPU 才下 CUDA 版 torch（cu128，RTX 50 系必需），
+# 没有就下 CPU 版（少约 4GB）。想强制：--full 装 CUDA 版，--lite 装 CPU 版。
 
 REPO_URL="https://github.com/cz11001100/LeLabPro.git"
 MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 # CPU 版 torch 的索引（轻量档用；国内可换 https://mirror.sjtu.edu.cn/pytorch-wheels/cpu）
+# torch 索引：轻量档用 CPU 版，完整档用 cu128 版（国内可换镜像，见下方探测）
 TORCH_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+TORCH_CUDA_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 # GitHub 加速前缀：astral.sh / github.com 直连不通时的回退（用法：$GH_PROXY/<原始 github 地址>）
 GH_PROXY="${LELAB_GH_PROXY:-https://gh-proxy.com}"
 
@@ -380,6 +382,17 @@ if [[ "$PROFILE" == lite ]]; then
     else
         info "轻量档：$(uname -s) 上的 torch 本来就不带 CUDA，无需换索引"
     fi
+elif [[ "$PROFILE" == full && "$(uname -s)" == Linux ]]; then
+    # PyPI/镜像上的 torch==2.7.1 默认带 cu126，只编译到 sm_90；RTX 50 系（sm_120）
+    # 跑任何 CUDA kernel 都报 "no kernel image is available"，必须从 cu128 索引装。
+    # 钉死 +cu128 本地段：只写版本区间时，uv 见到已装的 2.7.1+cu126 会认为已满足而跳过。
+    if [[ -z "${LELAB_TORCH_INDEX:-}" ]]; then
+        info "实测 CUDA torch 索引下载吞吐（各拉 4MB）..."
+        TORCH_CUDA_INDEX=$(pick_fast "torch:2.7." "$TORCH_CUDA_INDEX" "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128")
+    fi
+    info "完整档：从 $(basename "$TORCH_CUDA_INDEX") 装 cu128 版 torch / torchvision（RTX 50 系显卡需要）..."
+    uv pip install --python "$VENV_PY" --default-index "$TORCH_CUDA_INDEX" \
+        "torch==2.7.1+cu128" "torchvision==0.22.1+cu128"
 fi
 info "安装本仓库的 lerobot（含 feetech 电机 / SmolVLA / 训练依赖）..."
 info "  这步要下不少大包，约 5-15 分钟，请耐心等"
@@ -410,6 +423,23 @@ if [[ "$PROFILE" == lite && "$(uname -s)" == Linux ]]; then
     esac
 fi
 
+# 完整档同理：lerobot 的 torch 是版本区间，解析器可能把 cu128 换回 PyPI 的 cu126，
+# 在 RTX 50 系上就是"装好了但一跑 CUDA 就崩"。发现就自愈。
+if [[ "$PROFILE" == full && "$(uname -s)" == Linux ]]; then
+    TORCH_VER=$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)
+    if [[ "$TORCH_VER" != *+cu128* ]]; then
+        warn "  torch 被解析成了 $TORCH_VER（cu126 不支持 RTX 50 系），改回 cu128 版..."
+        uv pip install --python "$VENV_PY" --default-index "$TORCH_CUDA_INDEX" \
+            "torch==2.7.1+cu128" "torchvision==0.22.1+cu128"
+        TORCH_VER=$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null || echo 未知)
+    fi
+    case "$TORCH_VER" in
+        *+cu128) info "  torch $TORCH_VER —— cu128 版，支持 RTX 50 系" ;;
+        *) warn "  torch 仍是 $TORCH_VER，完整档没生效。手动纠正："
+           warn "    uv pip install --python $VENV_PY --default-index $TORCH_CUDA_INDEX 'torch==2.7.1+cu128' 'torchvision==0.22.1+cu128'" ;;
+    esac
+fi
+
 # ---------- RealSense（可选）----------
 FAILED_STEP="步骤4 pyrealsense2（可选，允许失败）"
 if uv pip install --python "$VENV_PY" \
@@ -427,6 +457,12 @@ uv pip install --python "$VENV_PY" \
     "psutil>=5.9.0" "paramiko>=3.4.0"
 info "安装 LeLab..."
 uv pip install --python "$VENV_PY" --no-deps -e "$ROOT/lelab"
+
+# ---------- 仿真评测依赖（MuJoCo 闭环评估）----------
+FAILED_STEP="步骤5c 仿真评测依赖（MuJoCo）"
+info "安装仿真评测依赖（MuJoCo / gymnasium / imageio）..."
+uv pip install --python "$VENV_PY" \
+    "mujoco>=3.3.0,<4" "gymnasium>=0.29" "imageio>=2.31"
 
 # ---------- 修复 torchcodec 缺 FFmpeg 共享库 ----------
 FAILED_STEP="步骤5b torchcodec 的 FFmpeg 共享库"
@@ -486,6 +522,36 @@ check "lerobot 采集与数据集模块"        "from lerobot.scripts.lerobot_re
 check "SO-101 机械臂配置"              "from lerobot.robots.so_follower import SO101FollowerConfig"
 check "rewards（RA-BC 打分）"          "from lerobot.rewards.robometer import compute_rabc_weights"
 check "LeLab 后端（启动入口）"          "import lelab.server"
+check "MuJoCo 仿真评测"                "import mujoco, gymnasium"
+if MUJOCO_GL=egl "$VENV_PY" - <<'PY' >/dev/null 2>&1
+import mujoco
+m = mujoco.MjModel.from_xml_string('<mujoco><worldbody><geom type="plane" size="1 1 0.1"/></worldbody></mujoco>')
+d = mujoco.MjData(m)
+r = mujoco.Renderer(m, 64, 64)
+r.update_scene(d)
+r.render()
+PY
+then
+    echo "  [OK] MuJoCo EGL 离屏渲染（仿真评测不需要显示器）"
+else
+    warn "  [!] EGL 离屏渲染不可用 —— 仿真评测需设 MUJOCO_GL=glfw 并有 X 显示"
+fi
+if [[ -f "$ROOT/sim/so101-tabletop-mujoco/env.py" ]]; then
+    echo "  [OK] 内置仿真场景 sim/so101-tabletop-mujoco（仿真评测默认环境）"
+else
+    warn "  [!] 仓库缺少 sim/ 场景目录 —— 仿真评测会改从 HuggingFace Hub 下载环境"
+fi
+# import torch 成功 ≠ CUDA 能跑：cu126 轮子在 RTX 50 系（sm_120）上 import 正常，
+# 一跑 kernel 才报 no kernel image。这里真算一次矩阵乘才算数。
+if has_nvidia_gpu; then
+    if "$VENV_PY" -c "import torch; x = torch.randn(16, 16, device='cuda'); (x @ x).sum().item(); torch.cuda.synchronize()" >/dev/null 2>&1; then
+        echo "  [OK] CUDA kernel 实测（$("$VENV_PY" -c 'import torch;print(torch.__version__)' 2>/dev/null)，本地训练/仿真评测可用）"
+    else
+        warn "  [X] CUDA kernel 跑不起来 —— torch 与 GPU 架构不匹配（RTX 50 系需 cu128 版）"
+        warn "      修复: uv pip install --python $VENV_PY --default-index https://download.pytorch.org/whl/cu128 'torch==2.7.1+cu128' 'torchvision==0.22.1+cu128'"
+        OK=false
+    fi
+fi
 if "$VENV_PY" -c "from torchcodec.decoders import VideoDecoder" >/dev/null 2>&1; then
     echo "  [OK] torchcodec（FFmpeg 硬解，$("$VENV_PY" -c 'import json;from torchcodec._core.ops import _get_json_ffmpeg_library_versions as j;print(json.loads(j())["ffmpeg_version"])' 2>/dev/null)）"
 else

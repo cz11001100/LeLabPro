@@ -1427,7 +1427,9 @@ class SimEvalOptions(BaseModel):
     n_episodes: int = 10
     batch_size: int = 1
     seed: int = 1000
-    env_hub_path: str = "lerobot/so101-tabletop-mujoco"
+    # Empty = the scene vendored in this repo (sim/so101-tabletop-mujoco);
+    # a Hub repo id or a local directory path overrides it.
+    env_hub_path: str = ""
     # Real-rig episodes run ~20 s; the env's own 3600-step default would make
     # every sim episode two minutes long.
     max_episode_steps: int | None = 600
