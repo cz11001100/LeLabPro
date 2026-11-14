@@ -108,9 +108,11 @@ from .ssh_remote_env import start_sarm_training_remote as _start_sarm_training
 
 # Import our custom teleoperation functionality
 from .teleoperate import (
+    SetTeleopModeRequest,
     TeleoperateRequest,
     UpdateEmaRequest,
     handle_get_joint_positions,
+    handle_set_teleop_mode,
     handle_start_teleoperation,
     handle_stop_teleoperation,
     handle_teleoperation_status,
@@ -373,6 +375,12 @@ def stop_teleoperation():
 def teleoperation_status():
     """Get the current teleoperation status"""
     return handle_teleoperation_status()
+
+
+@app.post("/set-teleop-mode")
+def set_teleop_mode(request: SetTeleopModeRequest):
+    """Switch the global teleop mode (applies to teleoperation and recording)"""
+    return handle_set_teleop_mode(request, manager)
 
 
 @app.post("/update-ema")
