@@ -42,6 +42,7 @@ from .dataset_repair import (
 from .keyboard_ee import (
     TELEOP_MODE_KEYBOARD_EE,
     build_keyboard_ee_pipeline,
+    make_keyboard_ee_teleop,
     normalize_teleop_mode,
 )
 from .utils.config import (
@@ -1562,11 +1563,14 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     global current_phase, phase_start_time, current_episode, saved_episodes, current_robot
 
     robot = make_robot_from_config(cfg.robot)
-    teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     # Keyboard EE sends Cartesian deltas; route them through the FK/IK pipeline
     # so the rest of the loop still sees joint targets.
     keyboard_ee_mode = cfg.teleop is not None and cfg.teleop.type == TELEOP_MODE_KEYBOARD_EE
+    if keyboard_ee_mode:
+        teleop = make_keyboard_ee_teleop()
+    else:
+        teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
     if keyboard_ee_mode:

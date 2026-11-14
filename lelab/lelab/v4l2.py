@@ -67,12 +67,20 @@ def _set_ctrl(device_path: str, ctrl: str) -> bool:
             ["v4l2-ctl", "-d", device_path, f"--set-ctrl={ctrl}"],
             check=False,
             capture_output=True,
+            text=True,
             timeout=5,
         )
-        return result.returncode == 0
     except Exception as exc:
-        logger.debug("v4l2-ctl set %s on %s failed: %s", ctrl, device_path, exc)
+        logger.warning("v4l2-ctl set %s on %s failed: %s", ctrl, device_path, exc)
         return False
+    if result.returncode != 0:
+        logger.warning(
+            "v4l2-ctl set %s on %s failed: %s",
+            ctrl,
+            device_path,
+            (result.stderr or result.stdout).strip() or f"exit {result.returncode}",
+        )
+    return result.returncode == 0
 
 
 def _supports(device_path: str, ctrl_name: str) -> bool:
@@ -114,3 +122,42 @@ def apply_camera_controls(device_path: str, label: str = "") -> None:
     if "gain" in manual:
         parts.append(f"gain={manual['gain']}")
     logger.info("Applied %s to %s", " + ".join(parts), name)
+
+
+def apply_live_controls(
+    device_path: str, exposure: int | None, gain: int | None
+) -> dict[str, object]:
+    """Apply one camera's exposure/gain immediately (configuration-panel path).
+
+    The panel's preview is the browser's getUserMedia stream, which never asks
+    the driver for these values, so writing them device-side is the only way a
+    change becomes visible before a recording starts. Unlike
+    apply_camera_controls this touches only the two requested controls (white
+    balance / power line stay as they are), and a cleared exposure hands the
+    device back to driver-controlled metering, matching the record-time default.
+    """
+    applied: list[str] = []
+    failed: dict[str, str] = {}
+
+    if gain is not None:
+        if not _supports(device_path, "gain"):
+            failed["gain"] = "device has no gain control"
+        elif _set_ctrl(device_path, f"gain={gain}"):
+            applied.append("gain")
+        else:
+            failed["gain"] = f"gain={gain} rejected by driver"
+
+    if exposure is not None:
+        if not _supports(device_path, "auto_exposure"):
+            failed["exposure"] = "device has no auto_exposure control"
+        elif not _set_ctrl(device_path, f"auto_exposure={_AUTO_EXPOSURE_MANUAL}"):
+            failed["exposure"] = "driver refused manual exposure mode"
+        elif _set_ctrl(device_path, f"exposure_time_absolute={exposure}"):
+            applied.append("exposure")
+        else:
+            failed["exposure"] = f"exposure={exposure} rejected (out of driver range?)"
+    elif _supports(device_path, "auto_exposure"):
+        _set_ctrl(device_path, f"auto_exposure={_AUTO_EXPOSURE_DRIVER}")
+        applied.append("auto_exposure")
+
+    return {"applied": applied, "failed": failed}

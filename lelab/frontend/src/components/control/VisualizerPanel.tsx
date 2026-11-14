@@ -10,12 +10,15 @@ interface VisualizerPanelProps {
   className?: string;
   /** Optional content rendered as a column beside the 3D viewer (e.g. a camera panel). */
   rightSlot?: React.ReactNode;
+  /** Optional controls rendered on the right side of the header row. */
+  headerExtra?: React.ReactNode;
 }
 
 const VisualizerPanel: React.FC<VisualizerPanelProps> = ({
   onGoBack,
   className,
   rightSlot,
+  headerExtra,
 }) => {
   return (
     <div
@@ -37,6 +40,7 @@ const VisualizerPanel: React.FC<VisualizerPanelProps> = ({
           <Logo iconOnly={true} />
           <div className="w-px h-6 bg-gray-700" />
           <h2 className="text-xl font-medium text-gray-200">Teleoperation</h2>
+          {headerExtra && <div className="ml-auto flex items-center gap-2">{headerExtra}</div>}
         </div>
         <div className="flex-1 bg-black rounded border border-gray-800 min-h-[50vh] lg:min-h-0">
           <UrdfViewer />

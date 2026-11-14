@@ -3,6 +3,7 @@ import { useNavigate } from "react-router-dom";
 import { useApi } from "@/contexts/ApiContext";
 import { useToast } from "@/hooks/use-toast";
 import { RobotRecord } from "@/hooks/useRobots";
+import { getTeleopMode } from "@/lib/teleopMode";
 import RobotTile from "./RobotTile";
 
 interface RobotConfigManagerProps {
@@ -44,6 +45,7 @@ const RobotConfigManager: React.FC<RobotConfigManagerProps> = ({
         leader_config: robot.leader_config,
         follower_config: robot.follower_config,
         ema_alpha: emaEnabled ? emaAlpha : null,
+        teleop_mode: getTeleopMode(),
       };
       console.log("Starting teleoperation with request:", requestBody);
       

@@ -26,6 +26,7 @@ import {
   playAutoAdvanceWarning,
 } from "@/lib/recordingAudio";
 import { useApi } from "@/contexts/ApiContext";
+import { getTeleopMode } from "@/lib/teleopMode";
 import {
   AlertDialog,
   AlertDialogAction,
@@ -52,6 +53,7 @@ interface RecordingConfig {
   push_to_hub: boolean;
   resume: boolean;
   streaming_encoding: boolean;
+  teleop_mode?: "leader" | "keyboard_ee";
 }
 
 type Phase = "preparing" | "recording" | "resetting" | "completed";
@@ -475,10 +477,13 @@ const Recording = () => {
       if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
         return;
       }
-      if (e.key === " " || e.code === "Space" || e.key === "ArrowRight") {
+      // Keyboard EE drives the arm with the arrow keys; don't also trigger the
+      // episode shortcuts or every nudge would exit/re-record the episode.
+      const arrowIsTeleop = (recordingConfig?.teleop_mode ?? getTeleopMode()) === "keyboard_ee";
+      if (!arrowIsTeleop && (e.key === " " || e.code === "Space" || e.key === "ArrowRight")) {
         e.preventDefault();
         handlersRef.current.handleExitEarly();
-      } else if (e.key === "ArrowLeft") {
+      } else if (!arrowIsTeleop && e.key === "ArrowLeft") {
         e.preventDefault();
         handlersRef.current.handleRerecordEpisode();
       } else if (e.key === "Escape") {

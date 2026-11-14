@@ -45,8 +45,21 @@ def so101_urdf_path() -> Path:
     return Path(__file__).resolve().parent / "assets" / "so101_new_calib.urdf"
 
 
-def make_keyboard_ee_teleop() -> KeyboardEndEffectorTeleop:
-    return KeyboardEndEffectorTeleop(KeyboardEndEffectorTeleopConfig(id="lelab_keyboard"))
+class LeLabKeyboardEE(KeyboardEndEffectorTeleop):
+    """Keyboard EE teleoperator with ESC left to the web UI.
+
+    The upstream ``_on_release`` disconnects on ESC. In LeLab ESC is the
+    stop-recording shortcut, so disconnecting the listener there would kill the
+    active session; the page already owns shutdown.
+    """
+
+    def _on_release(self, key):
+        char = getattr(key, "char", None)
+        self.event_queue.put((char if isinstance(char, str) else key, False))
+
+
+def make_keyboard_ee_teleop() -> LeLabKeyboardEE:
+    return LeLabKeyboardEE(KeyboardEndEffectorTeleopConfig(id="lelab_keyboard"))
 
 
 @ProcessorStepRegistry.register("lelab_keyboard_ee_to_target")

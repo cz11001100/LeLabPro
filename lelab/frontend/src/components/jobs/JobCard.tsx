@@ -28,7 +28,7 @@ import {
   ShieldAlert,
   FlaskConical,
   CloudUpload,
-  Gamepad2,
+  Boxes,
 } from "lucide-react";
 import { useApi } from "@/contexts/ApiContext";
 import { useHfAuth } from "@/contexts/HfAuthContext";
@@ -685,7 +685,7 @@ const JobCard: React.FC<Props> = ({ job: jobProp, group, onStop, onDelete, onPla
                 {job.sim_eval_state === "running" ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
-                  <Gamepad2 className="w-4 h-4" />
+                  <Boxes className="w-4 h-4" />
                 )}
               </Button>
             ) : null}

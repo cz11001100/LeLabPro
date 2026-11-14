@@ -48,6 +48,7 @@ interface DatasetInfo {
 }
 
 import MergeSection from "@/components/dataset/MergeSection";
+import DatasetTransferSection from "@/components/dataset/DatasetTransferSection";
 import RolloutScoreCard from "@/components/jobs/RolloutScoreCard";
 import SarmTrainCard from "@/components/jobs/SarmTrainCard";
 import DatasetViewer from "@/components/datasets/DatasetViewer";
@@ -613,6 +614,7 @@ const Upload = () => {
             </Button>
             <h1 className="text-3xl font-bold">数据集</h1>
           </div>
+          <DatasetTransferSection />
           <MergeSection />
           <div id="dataset-scoring" className="mt-8">
             <RolloutScoreCard initialRepoId={scoreRepoId} />
@@ -999,6 +1001,8 @@ const Upload = () => {
             )}
           </div>
         )}
+
+        <DatasetTransferSection />
 
         <MergeSection />
 

@@ -22,7 +22,11 @@ dependencies = [
     "mujoco>=3.3.0,<4",
     "gymnasium>=0.29",
     "imageio>=2.31",
-    "lerobot[core_scripts,feetech,smolvla,training] @ git+https://github.com/cz11001100/LeLabPro.git@main#subdirectory=lerobot",
+    # Dataset format import/export (lelab/dataset_io): ALOHA/robomimic HDF5
+    # and Diffusion Policy Zarr. zarr 3 changed the write API; pin to 2.x.
+    "h5py>=3.10",
+    "zarr>=2.18,<3",
+    "lerobot[core_scripts,feetech,smolvla,training,placo-dep] @ git+https://github.com/cz11001100/LeLabPro.git@main#subdirectory=lerobot",
     # Windows-only: real DirectShow camera names for /available-cameras so the
     # frontend can match a camera to its browser deviceId (issues #12, #16).
     # Guarded by try/except at the call site, so its absence degrades gracefully.

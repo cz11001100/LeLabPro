@@ -78,7 +78,7 @@ on_error() {
         *uv*)     echo "  网络访问不了 astral.sh 时：pip install uv 后重跑" ;;
         *环境*)   echo "  uv 下 Python 3.12 超时：sudo apt install python3.12 python3.12-venv 后重跑" ;;
         *lerobot*) echo "  多为下载超时或磁盘不足。查 df -h ~ （需 ≥${NEED_GB}GB），再单独重试："
-                   echo "    uv pip install --python \$VENV/bin/python -e ./lerobot[core_scripts,feetech,smolvla,training]" ;;
+                   echo "    uv pip install --python \$VENV/bin/python -e ./lerobot[core_scripts,feetech,smolvla,training,placo-dep]" ;;
         *lelab*)  echo "  单独重试：uv pip install --python \$VENV/bin/python fastapi[standard] websockets uvicorn psutil paramiko" ;;
         *自检*)   echo "  依赖装了但代码对不上，把上面 [X] 的报错原文发给维护者" ;;
     esac
@@ -394,10 +394,10 @@ elif [[ "$PROFILE" == full && "$(uname -s)" == Linux ]]; then
     uv pip install --python "$VENV_PY" --default-index "$TORCH_CUDA_INDEX" \
         "torch==2.7.1+cu128" "torchvision==0.22.1+cu128"
 fi
-info "安装本仓库的 lerobot（含 feetech 电机 / SmolVLA / 训练依赖）..."
+info "安装本仓库的 lerobot（含 feetech 电机 / SmolVLA / 训练 / IK 依赖）..."
 info "  这步要下不少大包，约 5-15 分钟，请耐心等"
 uv pip install --python "$VENV_PY" \
-    -e "$ROOT/lerobot[core_scripts,feetech,smolvla,training]"
+    -e "$ROOT/lerobot[core_scripts,feetech,smolvla,training,placo-dep]"
 
 # 装完 lerobot 再确认一次 torch 仍是 CPU 版：lerobot 的依赖里 torch 是版本区间，
 # 理论上已被满足，但解析器一旦把候选集扩到 PyPI，就会选回不带 +cpu 的那个版本，

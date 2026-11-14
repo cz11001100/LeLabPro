@@ -9,6 +9,7 @@ def _fake_v4l2(monkeypatch, supported=True, fail_ctrls=()):
         class Result:
             returncode = 0
             stdout = b"auto_exposure gain white_balance_automatic" if supported else b""
+            stderr = b""
 
         if cmd[-1].startswith("--set-ctrl="):
             ctrl = cmd[-1][len("--set-ctrl="):]

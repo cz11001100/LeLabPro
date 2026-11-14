@@ -17,6 +17,7 @@ import {
   CollapsibleTrigger,
 } from "@/components/ui/collapsible";
 import { useToast } from "@/hooks/use-toast";
+import { useApi } from "@/contexts/ApiContext";
 import { useAvailableCameras } from "@/hooks/useAvailableCameras";
 import { useCameraStream } from "@/hooks/useCameraStream";
 import { useNetworkCameraSource } from "@/hooks/useNetworkCameraSource";
@@ -82,6 +83,73 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
   readOnly = false,
 }) => {
   const { toast } = useToast();
+  const { baseUrl, fetchWithHeaders } = useApi();
+
+  // Exposure/gain are device-level V4L2 controls: the browser preview never
+  // requests them, so typing a value only shows up once the backend writes it
+  // to the device. A per-camera debounce keeps typing "100" from firing a
+  // v4l2-ctl call per keystroke.
+  const [controlErrors, setControlErrors] = useState<Record<string, string>>({});
+  const camerasRef = React.useRef(cameras);
+  camerasRef.current = cameras;
+  const controlTimersRef = React.useRef<
+    Record<string, ReturnType<typeof setTimeout>>
+  >({});
+
+  const applyControlsSoon = (cameraId: string) => {
+    const pending = controlTimersRef.current[cameraId];
+    if (pending) clearTimeout(pending);
+    controlTimersRef.current[cameraId] = setTimeout(async () => {
+      delete controlTimersRef.current[cameraId];
+      const cam = camerasRef.current.find((c) => c.id === cameraId);
+      if (!cam || cam.type === "network" || cam.camera_index === undefined) {
+        return;
+      }
+      const setError = (message: string | null) =>
+        setControlErrors((prev) => {
+          if (message === null) {
+            if (!(cameraId in prev)) return prev;
+            const next = { ...prev };
+            delete next[cameraId];
+            return next;
+          }
+          return { ...prev, [cameraId]: message };
+        });
+      try {
+        const res = await fetchWithHeaders(
+          `${baseUrl}/cameras/${cam.camera_index}/controls`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              exposure: cam.exposure ?? null,
+              gain: cam.gain ?? null,
+            }),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        const failed = data?.failed as Record<string, string> | undefined;
+        if (!res.ok || (failed && Object.keys(failed).length > 0)) {
+          setError(
+            failed && Object.keys(failed).length > 0
+              ? Object.values(failed).join("; ")
+              : data?.message ?? `Apply failed (${res.status})`
+          );
+        } else {
+          setError(null);
+        }
+      } catch {
+        setError("Backend unreachable");
+      }
+    }, 400);
+  };
+
+  // Drop pending applies when the panel unmounts.
+  React.useEffect(() => {
+    const timers = controlTimersRef.current;
+    return () => {
+      Object.values(timers).forEach(clearTimeout);
+    };
+  }, []);
 
   const {
     cameras: availableCameras,
@@ -284,6 +352,11 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
         cam.id === cameraId ? { ...cam, ...updates } : cam
       )
     );
+    // Changing either control should show up in the live preview right away,
+    // not only once the next recording starts.
+    if ("exposure" in updates || "gain" in updates) {
+      applyControlsSoon(cameraId);
+    }
   };
 
   // When the recording session is starting, the parent calls
@@ -505,6 +578,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
                 camera={camera}
                 paused={streamsPaused}
                 readOnly={readOnly}
+                controlError={controlErrors[camera.id]}
                 onRemove={() => removeCamera(camera.id)}
                 onUpdate={(updates) => updateCamera(camera.id, updates)}
               />
@@ -531,6 +605,7 @@ interface CameraPreviewProps {
   camera: CameraConfig;
   paused: boolean;
   readOnly: boolean;
+  controlError?: string;
   onRemove: () => void;
   onUpdate: (updates: Partial<CameraConfig>) => void;
 }
@@ -539,6 +614,7 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
   camera,
   paused,
   readOnly,
+  controlError,
   onRemove,
   onUpdate,
 }) => {
@@ -790,6 +866,11 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                   title="V4L2 gain；留空 = 由驱动控制"
                 />
               </div>
+              {controlError && (
+                <p className="text-[10px] text-amber-400 leading-tight">
+                  {controlError}
+                </p>
+              )}
               <p className="text-[10px] text-gray-500 leading-tight">
                 Overriding the backend can reorder camera indices on macOS.
               </p>

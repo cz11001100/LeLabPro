@@ -101,6 +101,15 @@ from .rollout_eval import (
     read_take_stats,
 )
 from .dataset_merge import MergeRequest, handle_merge, handle_merge_status, inspect_merge_sources
+from .dataset_io import (
+    FORMATS as DATASET_IO_FORMATS,
+    ExportRequest as DatasetExportRequest,
+    ImportRequest as DatasetImportRequest,
+    InspectRequest as DatasetInspectRequest,
+    get_io_progress,
+    start_export as start_dataset_export,
+    start_import as start_dataset_import,
+)
 from .model_push import PushModelRequest, handle_push_model, push_status
 from .ssh_remote_env import sarm_training_status as _sarm_training_status
 from .ssh_remote_env import ssh_connection_status as _ssh_connection_status
@@ -678,6 +687,77 @@ def datasets_list():
     Each entry carries a `source` field: "local", "hub", or "both".
     """
     return dataset_browser.list_all_datasets()
+
+
+@app.get("/dataset-io/formats")
+def dataset_io_formats():
+    """External formats the converter can read/write, with hints for the UI."""
+    return {"formats": DATASET_IO_FORMATS}
+
+
+@app.post("/dataset-io/inspect")
+def dataset_io_inspect(body: DatasetInspectRequest):
+    """Detect a source path's format and summarize episodes/cameras/dimensions."""
+    from .dataset_io import inspect_source
+
+    try:
+        return inspect_source(body.path, body.preset)
+    except (FileNotFoundError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/dataset-io/import")
+def dataset_io_import(body: DatasetImportRequest):
+    """Convert an HDF5/Zarr source into a local LeRobotDataset v3."""
+    try:
+        return start_dataset_import(body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, FileExistsError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/dataset-io/export")
+def dataset_io_export(body: DatasetExportRequest):
+    """Export a local LeRobot dataset into HDF5/Zarr."""
+    try:
+        return start_dataset_export(body)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except (ValueError, FileExistsError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/dataset-io/progress")
+def dataset_io_progress_sse():
+    """SSE stream for the active import/export job."""
+
+    async def event_generator():
+        last_data = None
+        while True:
+            data = get_io_progress()
+            if data != last_data:
+                yield f"data: {json.dumps(data, ensure_ascii=False, default=str)}\n\n"
+                last_data = data
+                if not data.get("active") and (data.get("completed") or data.get("error")):
+                    break
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/dataset-io/progress/current")
+def dataset_io_progress_current():
+    """Non-streaming snapshot; the page polls this after a refresh."""
+    return get_io_progress()
 
 
 @app.get("/ws-test")
@@ -2272,6 +2352,49 @@ def get_available_cameras():
 
 
 RobotSideLiteral = Literal["leader", "follower"]
+
+
+class CameraControlsBody(BaseModel):
+    exposure: int | None = None
+    gain: int | None = None
+
+
+@app.post("/cameras/{camera_index}/controls")
+def set_camera_controls(camera_index: int, body: CameraControlsBody):
+    """Apply exposure/gain to a camera's V4L2 device right away.
+
+    The configuration panel previews the browser's own getUserMedia stream, so
+    a value typed there only becomes visible once the device control is
+    written; previously the values sat in the robot record until the next
+    recording or inference started. Raw V4L2 units: exposure_time_absolute is
+    100 µs per step (100 = 10 ms), null = driver-metered exposure.
+    """
+    import platform
+
+    if platform.system() != "Linux":
+        return JSONResponse(
+            status_code=400,
+            content={
+                "status": "error",
+                "message": "Live exposure/gain control requires Linux (V4L2)",
+            },
+        )
+    device_path = f"/dev/video{camera_index}"
+    if not os.path.exists(device_path):
+        return JSONResponse(
+            status_code=404,
+            content={"status": "error", "message": f"{device_path} not found"},
+        )
+
+    from .v4l2 import apply_live_controls
+
+    result = apply_live_controls(device_path, body.exposure, body.gain)
+    failed = result["failed"]
+    return {
+        "status": "success" if not failed else "error",
+        "device": device_path,
+        **result,
+    }
 
 
 class PortDetectionBody(BaseModel):

@@ -33,6 +33,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { isHostedSpace } from "@/lib/isHostedSpace";
+import { getTeleopMode } from "@/lib/teleopMode";
 import { useApi } from "@/contexts/ApiContext";
 import { listJobs, JobRecord } from "@/lib/jobsApi";
 import { groupImportedByRun, modelStepOf, variantsOf, ModelGroup } from "@/lib/modelGroups";
@@ -330,6 +331,7 @@ const Landing = () => {
       streaming_encoding: streamingEncoding,
       cameras: cameraDict,
       ema_alpha: emaEnabled ? emaAlpha : null,
+      teleop_mode: getTeleopMode(),
     };
 
     setShowRecordingModal(false);

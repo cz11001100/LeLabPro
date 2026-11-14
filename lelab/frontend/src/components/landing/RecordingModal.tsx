@@ -23,6 +23,7 @@ import CameraConfiguration, {
 } from "@/components/recording/CameraConfiguration";
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import { RobotRecord } from "@/hooks/useRobots";
+import { getTeleopMode, TELEOP_MODE_LABELS } from "@/lib/teleopMode";
 
 interface RecordingModalProps {
   open: boolean;
@@ -303,6 +304,12 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                       the slower PNG-then-encode flow.
                     </p>
                   </div>
+                </div>
+                <div className="flex items-center justify-between pt-2 border-t border-gray-700">
+                  <span className="text-sm text-gray-300">Teleop input</span>
+                  <span className="text-sm font-medium text-gray-100">
+                    {TELEOP_MODE_LABELS[getTeleopMode()]}
+                  </span>
                 </div>
                 <div className="space-y-3 pt-2 border-t border-gray-700">
                   <div className="flex items-start gap-3">

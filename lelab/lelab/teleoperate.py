@@ -382,12 +382,22 @@ def handle_set_teleop_mode(
 
     if not teleoperation_active:
         current_teleop_mode = mode
-        return {
-            "success": True,
-            "mode": mode,
-            "restarted": False,
-            "message": "Teleop mode saved. It applies the next time teleoperation or recording starts.",
-        }
+        # The page that owns the switch is reachable only after a session
+        # started, so a stopped session means a crashed/ended one: bring it
+        # back in the new mode rather than leaving the user with a dead page.
+        if _last_request is None:
+            return {
+                "success": True,
+                "mode": mode,
+                "restarted": False,
+                "message": "Teleop mode saved. It applies the next time teleoperation or recording starts.",
+            }
+        result = handle_start_teleoperation(
+            _last_request.model_copy(update={"teleop_mode": mode}), websocket_manager
+        )
+        result["mode"] = mode
+        result["restarted"] = bool(result.get("success"))
+        return result
 
     if mode == previous:
         return {"success": True, "mode": mode, "restarted": False, "message": "Teleop mode unchanged."}

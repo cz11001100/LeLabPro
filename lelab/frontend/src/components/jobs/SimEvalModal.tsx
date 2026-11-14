@@ -17,7 +17,7 @@ import {
 } from "@/components/ui/select";
 import {
   Film,
-  Gamepad2,
+  Boxes,
   Loader2,
   ShieldAlert,
   Square,
@@ -282,7 +282,7 @@ const SimEvalModal: React.FC<Props> = ({ open, onOpenChange, job, group }) => {
               {busy ? (
                 <Loader2 className="w-4 h-4 mr-2 animate-spin" />
               ) : (
-                <Gamepad2 className="w-4 h-4 mr-2" />
+                <Boxes className="w-4 h-4 mr-2" />
               )}
               {results ? "重新仿真评测" : "开始仿真评测"}
             </Button>
