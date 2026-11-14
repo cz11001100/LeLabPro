@@ -62,6 +62,9 @@ class InferenceRequest(BaseModel):
     # inside the policy instead of post-filtering. Mutually exclusive with
     # chunk_smooth — when rtc is on we force alpha 1.0 (no double smoothing).
     rtc: bool = False
+    # RTC guidance strength (max_guidance_weight). 10.0 is the tuned default;
+    # higher steers the executed chunk harder toward the fresh prediction.
+    rtc_guidance: float = 10.0
     # Data collection during rollout. 'base' runs the policy without recording;
     # the others select a lerobot rollout strategy that writes episodes.
     capture_mode: str = "base"  # base | dagger | highlight | sentry
@@ -287,7 +290,9 @@ def _hf_offline_env(policy_path: str) -> dict[str, str]:
     return {"HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"}
 
 
-def _rollout_inference_args(policy_path: str, force_rtc: bool = False) -> list[str]:
+def _rollout_inference_args(
+    policy_path: str, force_rtc: bool = False, rtc_guidance: float = 10.0
+) -> list[str]:
     """Return extra lerobot-rollout flags for policies that reject sync inference.
 
     GR00T and other relative-action policies decode action chunks against the
@@ -318,7 +323,7 @@ def _rollout_inference_args(policy_path: str, force_rtc: bool = False) -> list[s
         args = [
             "--inference.type=rtc",
             "--inference.rtc.execution_horizon=20",
-            "--inference.rtc.max_guidance_weight=10.0",
+            f"--inference.rtc.max_guidance_weight={max(0.5, float(rtc_guidance))}",
             "--inference.queue_threshold=20",
         ]
         return args
@@ -1088,7 +1093,9 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             # A capture session is bounded by 段数上限 and the per-episode
             # ceiling, not by wall clock: the rest screen waits on the operator.
             f"--duration={0 if _mode == 'dagger' else request.duration_s}",
-            *_rollout_inference_args(policy_path, force_rtc=request.rtc),
+            *_rollout_inference_args(
+                policy_path, force_rtc=request.rtc, rtc_guidance=request.rtc_guidance
+            ),
             *capture_args,
         ]
         if request.cameras:
@@ -1198,6 +1205,7 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             "chunk_smooth": request.chunk_smooth,
             "chunk_smooth_strength": request.chunk_smooth_strength,
             "rtc": request.rtc,
+            "rtc_guidance": request.rtc_guidance,
             "capture_mode": request.capture_mode,
             "dataset_repo_id": request.dataset_repo_id,
             "dataset_fps": request.dataset_fps,

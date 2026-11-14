@@ -20,6 +20,7 @@ export interface StartInferenceRequest {
   chunk_smooth?: boolean;
   chunk_smooth_strength?: number;
   rtc?: boolean;
+  rtc_guidance?: number;
   capture_mode?: CaptureMode;
   dataset_repo_id?: string;
   dataset_fps?: number;

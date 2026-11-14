@@ -11,7 +11,6 @@ import {
   DialogDescription,
 } from "@/components/ui/dialog";
 import { Alert, AlertDescription } from "@/components/ui/alert";
-import { Switch } from "@/components/ui/switch";
 import {
   Select,
   SelectContent,
@@ -134,9 +133,11 @@ const InferenceModal: React.FC<Props> = ({
   const [taskIsCustom, setTaskIsCustom] = useState(false);
   const [durationS, setDurationS] = useState(60);
   const [nRuns, setNRuns] = useState(1);
-  const [chunkSmooth, setChunkSmooth] = useState(false);
-  const [smoothStrength, setSmoothStrength] = useState(50);
-  const [rtc, setRtc] = useState(false);
+  // Both smoothers are 0=off sliders. RTC guidance (max_guidance_weight) and
+  // the chunk low-pass are mutually exclusive.
+  const [smoothStrength, setSmoothStrength] = useState(0);
+  const [rtcGuidance, setRtcGuidance] = useState(0);
+  const chunkSmooth = smoothStrength > 0;
   // Data collection during rollout. 'base' just runs the policy; the other
   // modes are lerobot rollout strategies that write episodes as it drives.
   const [captureMode, setCaptureMode] = useState<CaptureMode>("base");
@@ -385,7 +386,8 @@ const InferenceModal: React.FC<Props> = ({
         n_runs: nRuns,
         chunk_smooth: chunkSmooth,
         chunk_smooth_strength: smoothStrength / 100,
-        rtc,
+        rtc: rtcGuidance > 0,
+        rtc_guidance: rtcGuidance,
         capture_mode: captureMode,
         dataset_repo_id: datasetName,
         num_episodes: nRuns,
@@ -710,63 +712,61 @@ const InferenceModal: React.FC<Props> = ({
               )}
             </div>
             <div className="space-y-3 rounded-lg border border-gray-700 bg-gray-800/40 p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <Label htmlFor="rtc" className="text-sm font-medium text-gray-200">
+              <div className="space-y-1">
+                <div className="flex items-baseline justify-between gap-4">
+                  <Label className="text-sm font-medium text-gray-200">
                     RTC 平滑执行（Real-Time Chunking）
                   </Label>
-                  <p className="text-xs text-gray-500">
-                    Official smooth execution for slow VLA models: replans every 10
-                    steps and blends chunks inside the policy. Recommended for
-                    SmolVLA; mutually exclusive with chunk smoothing below.
-                  </p>
+                  <span className="text-xs text-gray-400 whitespace-nowrap">
+                    当前 {rtcGuidance}（0=关）
+                  </span>
                 </div>
-                <Switch
-                  id="rtc"
-                  checked={rtc}
-                  onCheckedChange={(v) => {
-                    setRtc(v);
-                    if (v) setChunkSmooth(false);
+                <p className="text-xs text-gray-500">
+                  官方平滑执行：每执行视野步重规划并在策略内部混合动作块，适合
+                  SmolVLA 等慢 VLA；数值为引导强度，越大越跟手。与下方 Chunk
+                  间平滑互斥。
+                </p>
+                <input
+                  type="range"
+                  min={0}
+                  max={30}
+                  step={1}
+                  value={rtcGuidance}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setRtcGuidance(v);
+                    if (v > 0) setSmoothStrength(0);
                   }}
+                  className="w-full accent-green-500"
                 />
               </div>
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <Label htmlFor="chunk-smooth" className="text-sm font-medium text-gray-200">
+              <div className="space-y-1">
+                <div className="flex items-baseline justify-between gap-4">
+                  <Label className="text-sm font-medium text-gray-200">
                     Chunk smoothing（Chunk 间平滑）
                   </Label>
-                  <p className="text-xs text-gray-500">
-                    Low-pass filters the executed actions so the jump between
-                    two action chunks becomes a short ramp. Adds a little lag;
-                    the gripper channel is never filtered.
-                  </p>
+                  <span className="text-xs text-gray-400 whitespace-nowrap">
+                    当前 {smoothStrength}%（0=关）
+                  </span>
                 </div>
-                <Switch
-                  id="chunk-smooth"
-                  checked={chunkSmooth}
-                  onCheckedChange={(v) => {
-                    setChunkSmooth(v);
-                    if (v) setRtc(false);
+                <p className="text-xs text-gray-500">
+                  对执行动作做低通滤波，两块动作切换的跳变变成短斜坡；会多一点滞后，
+                  夹爪通道不过滤。与上方 RTC 互斥。
+                </p>
+                <input
+                  type="range"
+                  min={0}
+                  max={95}
+                  step={5}
+                  value={smoothStrength}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    setSmoothStrength(v);
+                    if (v > 0) setRtcGuidance(0);
                   }}
+                  className="w-full accent-green-500"
                 />
               </div>
-              {chunkSmooth && (
-                <div className="space-y-1">
-                  <div className="flex justify-between text-xs text-gray-400">
-                    <span>Strength（强度）</span>
-                    <span>{smoothStrength}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min={0}
-                    max={95}
-                    step={5}
-                    value={smoothStrength}
-                    onChange={(e) => setSmoothStrength(Number(e.target.value))}
-                    className="w-full accent-green-500"
-                  />
-                </div>
-              )}
             </div>
           </div>
 
