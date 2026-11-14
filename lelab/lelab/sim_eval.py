@@ -63,6 +63,51 @@ def resolve_env_path(value: str | None) -> str:
         return DEFAULT_ENV_HUB
     return value
 
+
+def available_environments() -> list[dict]:
+    """Entries for the 环境仓库 picker: builtin scene, local scene dirs, Hub default."""
+    entries = [{"label": "内置场景（sim/so101-tabletop-mujoco）", "value": "", "kind": "builtin"}]
+    repo_root = Path(__file__).resolve().parents[2]
+    sim_root = repo_root / "sim"
+    builtin = builtin_scene_dir()
+    if sim_root.is_dir():
+        for d in sorted(sim_root.iterdir()):
+            if not (d.is_dir() and (d / "env.py").is_file()):
+                continue
+            if builtin is not None and d.resolve() == builtin.resolve():
+                continue
+            entries.append({"label": f"本地：{d.name}", "value": str(d), "kind": "local"})
+    entries.append({"label": f"Hub：{DEFAULT_ENV_HUB}", "value": DEFAULT_ENV_HUB, "kind": "hub"})
+    return entries
+
+
+def _policy_type(checkpoint_path: str) -> str:
+    try:
+        cfg = json.loads((Path(checkpoint_path) / "config.json").read_text())
+        return str(cfg.get("type") or "").lower()
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def policy_supports_temporal_ensemble(checkpoint_path: str) -> bool:
+    """Whether the checkpoint's policy implements temporal ensembling (ACT today).
+
+    Checked against the policy config dataclass so future policies that add the
+    knob work without changes here; unknown configs fall back to the type name.
+    """
+    ptype = _policy_type(checkpoint_path)
+    if not ptype:
+        return False
+    try:
+        import dataclasses
+
+        from lerobot.configs.policies import PreTrainedConfig
+
+        cls = PreTrainedConfig.get_choice_class(ptype)
+        return "temporal_ensemble_coeff" in {f.name for f in dataclasses.fields(cls)}
+    except Exception:
+        return ptype == "act"
+
 # The tabletop MJCF scene names its cameras top/front/wrist_cam; checkpoints
 # recorded on the real rig use up/side/wrist. Map checkpoint names onto the
 # scene so the env renders exactly the views the policy was trained on.
@@ -315,12 +360,19 @@ def run_sim_eval(
     ]
     if max_episode_steps:
         cmd.append(f"--eval.max_episode_steps={max_episode_steps}")
+    notes = ""
     if temporal_ensemble is not None:
-        # ACT default replays whole 100-step chunks open-loop; ensembling
-        # re-predicts every step and weight-averages overlaps (smoother, reactive).
-        # ACT requires n_action_steps=1 when ensembling (query every step).
-        cmd.append(f"--policy.temporal_ensemble_coeff={temporal_ensemble}")
-        cmd.append("--policy.n_action_steps=1")
+        # Temporal ensembling is a per-policy capability (ACT today): re-predict
+        # every step and weight-average chunk overlaps. Only pass the flags when
+        # the checkpoint's config defines them; other policies keep their replay.
+        if policy_supports_temporal_ensemble(checkpoint_path):
+            cmd.append(f"--policy.temporal_ensemble_coeff={temporal_ensemble}")
+            # ACT requires n_action_steps=1 when ensembling (query every step).
+            if _policy_type(checkpoint_path) == "act":
+                cmd.append("--policy.n_action_steps=1")
+        else:
+            notes = "该策略未实现时序集成（目前 ACT 支持），本次按 checkpoint 原生动作回放执行"
+            logger.warning("temporal_ensemble requested but unsupported: %s", checkpoint_path)
     env_kwargs = _make_env_kwargs(checkpoint_path, env_hub_path)
     if max_episode_steps and "so101-tabletop-mujoco" in env_hub_path:
         # Let the env itself truncate at the cap: the recorder only flushes an
@@ -399,6 +451,7 @@ def run_sim_eval(
             "per_group": info.get("per_group", {}),
             "videos": videos,
             "diagnostics": diagnostics,
+            "notes": notes,
             "run_dir": str(rel_run),
         }
 
@@ -411,5 +464,6 @@ def run_sim_eval(
         "exit_code": exit_code,
         "error": f"lerobot-eval 退出码 {exit_code}",
         "log_tail": tail,
+        "notes": notes,
         "run_dir": str(rel_run),
     }

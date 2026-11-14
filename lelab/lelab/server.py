@@ -1509,6 +1509,14 @@ def stop_job_sim_eval(job_id: str):
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
 
 
+@app.get("/sim-eval/environments")
+def list_sim_environments():
+    """Environment repos the sim-eval card can pick: builtin, local scenes, Hub."""
+    from .sim_eval import available_environments
+
+    return {"environments": available_environments()}
+
+
 @app.get("/jobs/{job_id}/sim-eval")
 def get_job_sim_eval(job_id: str):
     """State, latest results, run history (for ranking) and batch progress."""

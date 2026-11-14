@@ -8,12 +8,21 @@ import { Box, Loader2, Play, Square } from "lucide-react";
 import { useApi } from "@/contexts/ApiContext";
 import { useToast } from "@/hooks/use-toast";
 import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
   getJobSimEval,
   getJobSimEvalLogs,
+  listSimEnvironments,
   simEvalArtifactUrl,
   startJobSimEval,
   stopJobSimEval,
   JobRecord,
+  SimEnvOption,
   SimEvalDiagnostics,
   SimEvalHistoryEntry,
   SimEvalResults,
@@ -243,6 +252,8 @@ const SimEvalCard: React.FC<{
   const [envHub, setEnvHub] = useState(saved.envHub);
   const [smooth, setSmooth] = useState(saved.smooth);
   const [ensemble, setEnsemble] = useState(saved.ensemble);
+  const [envOptions, setEnvOptions] = useState<SimEnvOption[]>([]);
+  const [showCustomEnv, setShowCustomEnv] = useState(false);
   const [state, setState] = useState<SimEvalState>(job.sim_eval_state ?? "none");
   const [results, setResults] = useState<SimEvalResults | null>(job.sim_eval_results ?? null);
   const [history, setHistory] = useState<SimEvalHistoryEntry[]>([]);
@@ -254,6 +265,8 @@ const SimEvalCard: React.FC<{
   const [stopping, setStopping] = useState(false);
 
   const localOnly = job.runner === "local" || job.runner === "imported";
+  const knownEnv = envHub === "" || envOptions.some((o) => o.value === envHub);
+  const customEnv = showCustomEnv || !knownEnv;
   const running = state === "running";
 
   useEffect(() => {
@@ -267,6 +280,14 @@ const SimEvalCard: React.FC<{
       .catch(() => {});
     return () => controller.abort();
   }, [baseUrl, fetchWithHeaders, job.id]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    listSimEnvironments(baseUrl, fetchWithHeaders, controller.signal)
+      .then(setEnvOptions)
+      .catch(() => {});
+    return () => controller.abort();
+  }, [baseUrl, fetchWithHeaders]);
 
   useEffect(() => {
     setState(job.sim_eval_state ?? "none");
@@ -418,25 +439,53 @@ const SimEvalCard: React.FC<{
             />
           </Field>
           <Field label="环境仓库">
-            <Input
-              value={envHub}
-              onChange={(e) => setEnvHub(e.target.value)}
-              placeholder="留空 = 内置本地场景"
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
-            />
+            <Select
+              value={customEnv ? "__custom__" : envHub || "builtin"}
+              onValueChange={(v) => {
+                if (v === "__custom__") {
+                  setShowCustomEnv(true);
+                  return;
+                }
+                setShowCustomEnv(false);
+                setEnvHub(v === "builtin" ? "" : v);
+              }}
+            >
+              <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
+                <SelectValue placeholder="选择环境" />
+              </SelectTrigger>
+              <SelectContent>
+                {envOptions.map((o) => (
+                  <SelectItem key={o.value || "builtin"} value={o.value || "builtin"}>
+                    {o.label}
+                  </SelectItem>
+                ))}
+                <SelectItem value="__custom__">自定义（Hub 仓库或本地路径）</SelectItem>
+              </SelectContent>
+            </Select>
+            {(showCustomEnv || !knownEnv) && (
+              <Input
+                value={envHub}
+                onChange={(e) => setEnvHub(e.target.value)}
+                placeholder="例如 username/repo 或 /path/to/env"
+                className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
+              />
+            )}
             <div className="text-[11px] text-slate-500 mt-1">
-              留空用仓库内置 sim/so101-tabletop-mujoco（免下载）；可填 Hub 仓库或本地路径
+              默认内置场景；可选本机 sim/ 下的其它场景，或任意 Hub 仓库
             </div>
           </Field>
-          <Field label="动作平滑（0=关）">
-            <Input
-              value={smooth}
+          <Field label="动作平滑">
+            <input
+              type="range"
+              min={0}
+              max={0.9}
+              step={0.05}
+              value={Number(smooth) || 0}
               onChange={(e) => setSmooth(e.target.value)}
-              placeholder="0"
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
+              className="w-full mt-2 accent-cyan-500"
             />
             <div className="text-[11px] text-slate-500 mt-1">
-              关节目标低通滤波，越大越稳但越滞后；建议 0–0.5
+              当前 {Number(smooth) || 0}（0=关；越大越稳但越滞后）
             </div>
           </Field>
           <Field label="时序集成（留空=关）">
@@ -447,7 +496,7 @@ const SimEvalCard: React.FC<{
               className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
             />
             <div className="text-[11px] text-slate-500 mt-1">
-              ACT 每步重算动作块并加权平均，更平滑也更跟手；建议 0.01
+              支持该特性的策略（如 ACT）自动启用，其它策略自动跳过；建议 0.01
             </div>
           </Field>
         </div>
@@ -536,6 +585,11 @@ const SimEvalCard: React.FC<{
                     className="w-full rounded-lg border border-slate-700 bg-black"
                   />
                 ))}
+              </div>
+            )}
+            {results?.notes && (
+              <div className="text-xs text-amber-300 bg-amber-900/20 border border-amber-800/40 rounded-lg p-2">
+                {results.notes}
               </div>
             )}
             {results?.diagnostics && <DiagnosticsPanel d={results.diagnostics} />}

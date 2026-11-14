@@ -913,6 +913,7 @@ export interface SimEvalResults {
   per_group?: Record<string, unknown>;
   videos?: string[];
   diagnostics?: SimEvalDiagnostics;
+  notes?: string;
   run_dir?: string;
 }
 
@@ -980,6 +981,26 @@ export async function getJobSimEval(
     signal,
     action: "Get sim eval",
   });
+}
+
+export interface SimEnvOption {
+  label: string;
+  value: string;
+  kind: "builtin" | "local" | "hub";
+}
+
+export async function listSimEnvironments(
+  baseUrl: string,
+  fetcher: Fetcher,
+  signal?: AbortSignal,
+): Promise<SimEnvOption[]> {
+  const r = await apiRequest<{ environments: SimEnvOption[] }>(
+    baseUrl,
+    fetcher,
+    "/sim-eval/environments",
+    { signal, action: "List sim environments" },
+  );
+  return r.environments ?? [];
 }
 
 export async function getJobSimEvalLogs(
