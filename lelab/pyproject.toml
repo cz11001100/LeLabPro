@@ -50,6 +50,7 @@ include = ["lelab*", "frontend"]
 
 [tool.setuptools.package-data]
 frontend = ["dist/**/*"]
+lelab = ["assets/**/*"]
 
 [tool.ruff]
 target-version = "py312"

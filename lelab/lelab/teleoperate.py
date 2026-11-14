@@ -23,7 +23,14 @@ from pydantic import BaseModel
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
-from .utils.config import setup_calibration_files
+from .keyboard_ee import (
+    TELEOP_MODE_KEYBOARD_EE,
+    TELEOP_MODE_LEADER,
+    build_keyboard_ee_pipeline,
+    make_keyboard_ee_teleop,
+    normalize_teleop_mode,
+)
+from .utils.config import setup_calibration_files, setup_follower_calibration_file
 from .utils.devices import safe_disconnect_device
 
 logger = logging.getLogger(__name__)
@@ -33,6 +40,9 @@ teleoperation_active = False
 teleoperation_thread: threading.Thread | None = None
 current_robot = None
 current_teleop = None
+current_teleop_mode: str = TELEOP_MODE_LEADER
+# Last accepted request, so a mode switch can restart the same session.
+_last_request: "TeleoperateRequest | None" = None
 # Guards the start path; the worker owns disconnect so stop() does not race.
 _state_lock = threading.Lock()
 
@@ -43,9 +53,10 @@ class TeleoperateRequest(BaseModel):
     leader_config: str
     follower_config: str
     ema_alpha: float | None = None  # EMA low-pass filter for jitter reduction
+    teleop_mode: str = TELEOP_MODE_LEADER  # "leader" or "keyboard_ee"
 
 
-def get_joint_positions_from_robot(robot) -> dict[str, float]:
+def get_joint_positions_from_robot(robot, observation: dict | None = None) -> dict[str, float]:
     """
     Extract current joint positions from the robot and convert to URDF joint format.
 
