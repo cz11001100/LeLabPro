@@ -435,3 +435,31 @@ def test_extract_error_from_log_pulls_exception_tail(tmp_path) -> None:
     assert out is not None and "RuntimeError: gripper overload during shutdown" in out
     assert _extract_error_from_log(None) is None
     assert _extract_error_from_log(str(tmp_path / "missing.log")) is None
+
+
+def test_format_cameras_arg_keeps_v4l2_controls_out_of_lerobot_config() -> None:
+    from lelab.rollout import _format_cameras_arg
+
+    result = _format_cameras_arg(
+        {"wrist": {"camera_index": 6, "exposure": 10, "gain": 32, "fps": 30}}
+    )
+    assert "exposure" not in result
+    assert "gain" not in result
+    assert "index_or_path: 6" in result
+
+
+def test_apply_v4l2_camera_controls_registers_manual_controls(monkeypatch) -> None:
+    from lelab import rollout, v4l2
+
+    seen = {}
+    monkeypatch.setattr(
+        v4l2, "configure_manual_controls", lambda cams: seen.update(configure=cams)
+    )
+    applied = []
+    monkeypatch.setattr(
+        v4l2, "apply_camera_controls", lambda path, label="": applied.append((path, label))
+    )
+    cameras = {"wrist": {"camera_index": 6, "exposure": 10}}
+    rollout._apply_v4l2_camera_controls(cameras)
+    assert seen["configure"] == cameras
+    assert applied == [("/dev/video6", "wrist")]

@@ -286,7 +286,7 @@ def _walk_home(strategy, ctx) -> None:
     if moving is not None:
         moving.set()
     try:
-        strategy._return_to_initial_position(ctx.hardware)
+        strategy.return_to_initial_position(ctx.hardware)
     except Exception:
         logger.warning("Could not walk the follower home at the take boundary", exc_info=True)
     finally:
@@ -583,6 +583,11 @@ class SmoothingInferenceEngine:
         self._last = None
         self._alpha_vec = None
         self._snapshot_buffer = snapshot_buffer
+
+    def __getattr__(self, name):
+        # lerobot's engine interface grows over time (latency, pump_query,
+        # dispatch gating, task ownership); forward anything not overridden.
+        return getattr(self._inner, name)
 
     def _coeffs(self, action):
         if self._alpha_vec is None or self._alpha_vec.numel() != action.numel():
@@ -971,44 +976,48 @@ def _run_one_round(strategy, ctx, round_end: Path) -> None:
     never reloaded. A hard stop still goes through ``shutdown_event``.
     """
     from lerobot.rollout.strategies.core import send_next_action
-    from lerobot.utils.robot_utils import precise_sleep
+    from lerobot.utils.cycle_timer import CycleTimer
 
     engine = strategy._engine
     cfg = ctx.runtime.cfg
     robot = ctx.hardware.robot_wrapper
     interpolator = strategy._interpolator
-    interval = interpolator.get_control_interval(cfg.fps)
+    timer = CycleTimer(
+        cfg.fps,
+        interpolator.multiplier,
+        records_data=False,
+        report=ctx.runtime.cadence_report,
+    )
     start = time.perf_counter()
     engine.resume()
     logger.info("Base strategy control loop started")
-    while not ctx.runtime.shutdown_event.is_set():
-        if round_end.exists():
-            try:
-                round_end.unlink()
-            except OSError:
-                pass
-            logger.info("Round ended early: operator marked success")
-            return
-        loop_start = time.perf_counter()
-        if cfg.duration > 0 and (time.perf_counter() - start) >= cfg.duration:
-            logger.info("Duration limit reached (%.0fs)", cfg.duration)
-            return
-        obs = robot.get_observation()
-        obs_processed = strategy._process_observation_and_notify(ctx.processors, obs)
-        if strategy._handle_warmup(cfg.use_torch_compile, loop_start, interval):
-            continue
-        action_dict = send_next_action(obs_processed, obs, ctx, interpolator)
-        if hasattr(strategy, "_log_telemetry"):
-            strategy._log_telemetry(obs_processed, action_dict, ctx.runtime)
-        dt = time.perf_counter() - loop_start
-        if (sleep_t := interval - dt) > 0:
-            precise_sleep(sleep_t)
-        else:
-            logger.warning(
-                "Record loop is running slower (%.1f Hz) than the target FPS (%.0f Hz).",
-                1 / dt,
-                cfg.fps,
-            )
+    try:
+        while not ctx.runtime.shutdown_event.is_set():
+            if round_end.exists():
+                try:
+                    round_end.unlink()
+                except OSError:
+                    pass
+                logger.info("Round ended early: operator marked success")
+                return
+            strategy._tick(timer, new_cycle=interpolator.needs_new_action())
+            if cfg.duration > 0 and (time.perf_counter() - start) >= cfg.duration:
+                logger.info("Duration limit reached (%.0fs)", cfg.duration)
+                return
+            with timer.section("observe"):
+                obs = robot.get_observation()
+            with timer.section("process_obs"):
+                obs_processed = strategy._process_observation_and_notify(ctx.processors, obs)
+            if strategy._handle_warmup(cfg.use_torch_compile, timer):
+                continue
+            step = send_next_action(obs_processed, obs, ctx, interpolator, timer)
+            with timer.section("telemetry"):
+                strategy._log_telemetry(obs_processed, step, ctx.runtime)
+            with timer.section("query"):
+                engine.pump_query(obs_processed)
+            timer.wait()
+    finally:
+        timer.log_run_summary()
 
 
 def _settle(ctx, seconds: float) -> None:
@@ -1166,7 +1175,7 @@ def main() -> None:
                     except Exception:
                         logger.warning("Engine reset between rounds failed", exc_info=True)
                     try:
-                        _strategy._return_to_initial_position(ctx.hardware)
+                        _strategy.return_to_initial_position(ctx.hardware)
                     except Exception:
                         logger.warning("Return-to-home between rounds failed", exc_info=True)
                     _settle(ctx, rest_s)
