@@ -30,6 +30,7 @@ from lerobot.utils.constants import HF_LEROBOT_HOME
 
 # Import the main record functionality to reuse it
 from lerobot.scripts.lerobot_record import RecordConfig
+from lerobot.teleoperators.keyboard import KeyboardEndEffectorTeleopConfig
 from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
 from .dataset_repair import (
@@ -38,7 +39,16 @@ from .dataset_repair import (
     reindex_episodes_to_contiguous,
     repair_local_dataset,
 )
-from .utils.config import setup_calibration_files, with_lelab_tag
+from .keyboard_ee import (
+    TELEOP_MODE_KEYBOARD_EE,
+    build_keyboard_ee_pipeline,
+    normalize_teleop_mode,
+)
+from .utils.config import (
+    setup_calibration_files,
+    setup_follower_calibration_file,
+    with_lelab_tag,
+)
 from .utils.devices import safe_disconnect_device
 
 logger = logging.getLogger(__name__)
@@ -98,6 +108,7 @@ class RecordingRequest(BaseModel):
     cameras: dict = {}
     test_mode: bool = False  # Skip robot connection for testing
     ema_alpha: float | None = None  # EMA low-pass filter for jitter reduction
+    teleop_mode: str = "leader"  # "leader" or "keyboard_ee"
 
 
 class UploadRequest(BaseModel):
@@ -224,11 +235,15 @@ def _build_camera_configs(cameras: dict, default_backend) -> dict:
 def create_record_config(request: RecordingRequest) -> RecordConfig:
     """Create a RecordConfig from the recording request"""
     logger.info(f"Recording request ema_alpha: {request.ema_alpha}")
-    
-    # Setup calibration files
-    leader_config_name, follower_config_name = setup_calibration_files(
-        request.leader_config, request.follower_config
-    )
+    mode = normalize_teleop_mode(request.teleop_mode)
+
+    # Setup calibration files. Keyboard mode never touches the leader.
+    if mode == TELEOP_MODE_KEYBOARD_EE:
+        follower_config_name = setup_follower_calibration_file(request.follower_config)
+    else:
+        _, follower_config_name = setup_calibration_files(
+            request.leader_config, request.follower_config
+        )
 
     # Convert the frontend camera dict into OpenCVCameraConfig objects. Backend
     # defaults to the platform pin unless the request overrides it per camera.
@@ -249,11 +264,16 @@ def create_record_config(request: RecordingRequest) -> RecordConfig:
     )
     logger.info(f"Recording robot config created with ema_alpha={robot_config.ema_alpha}")
 
-    # Create teleop config
-    teleop_config = SO101LeaderConfig(
-        port=request.leader_port,
-        id=leader_config_name,
-    )
+    # Create teleop config: the leader arm, or a keyboard listener whose
+    # Cartesian deltas are turned into joints by the IK pipeline in the loop.
+    if mode == TELEOP_MODE_KEYBOARD_EE:
+        teleop_config = KeyboardEndEffectorTeleopConfig(id="lelab_keyboard")
+        logger.info("Recording teleop mode: keyboard_ee (IK)")
+    else:
+        teleop_config = SO101LeaderConfig(
+            port=request.leader_port,
+            id=request.leader_config.removesuffix(".json"),
+        )
 
     # Create dataset config
     dataset_config = DatasetRecordConfig(
@@ -1544,7 +1564,13 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
+    # Keyboard EE sends Cartesian deltas; route them through the FK/IK pipeline
+    # so the rest of the loop still sees joint targets.
+    keyboard_ee_mode = cfg.teleop is not None and cfg.teleop.type == TELEOP_MODE_KEYBOARD_EE
+
     teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    if keyboard_ee_mode:
+        teleop_action_processor = build_keyboard_ee_pipeline(robot)
 
     action_features = hw_to_dataset_features(robot.action_features, "action", cfg.dataset.video)
     obs_features = hw_to_dataset_features(robot.observation_features, "observation", cfg.dataset.video)
@@ -1684,8 +1710,16 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         if teleop is not None:
             try:
                 logger.info("🔧 TELEOP CONNECTION: Attempting to connect teleoperator...")
-                teleop.bus.connect()
-                logger.info("✅ TELEOP CONNECTION: Teleoperator bus connected successfully")
+                if keyboard_ee_mode:
+                    teleop.connect()
+                    if not teleop.is_connected:
+                        raise RuntimeError(
+                            "Keyboard teleoperation is unavailable: pynput needs an X11/Windows/macOS "
+                            "desktop session (not Wayland or headless)."
+                        )
+                else:
+                    teleop.bus.connect()
+                logger.info("✅ TELEOP CONNECTION: Teleoperator connected successfully")
             except Exception as e:
                 logger.error(f"❌ TELEOP CONNECTION: Failed to connect teleoperator: {e}")
                 raise
@@ -1694,7 +1728,7 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
         # calibration registers requires.
         logger.info("Writing calibration to motors...")
         robot.bus.write_calibration(robot.calibration)
-        if teleop is not None:
+        if teleop is not None and not keyboard_ee_mode:
             teleop.bus.write_calibration(teleop.calibration)
 
         try:
