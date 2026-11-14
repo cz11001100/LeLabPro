@@ -491,7 +491,9 @@ DEFAULTS: dict[str, Any] = {
         "bodies": {},
         "cameras": {},
         # Ball centers are sampled in the user frame (cm): x right, y forward.
-        "ball_workspace": {"x": [-10.0, 30.0], "y": [10.0, 40.0]},
+        # Keep the whole ball inside the up camera: it covers y <= 31 cm (v=480 is
+        # the bottom edge), and the 2 cm radius needs ~2 cm of margin.
+        "ball_workspace": {"x": [-10.0, 24.0], "y": [10.0, 28.0]},
         # Reject poses inside these rectangles (cm) plus margin (cm).
         "ball_keepouts": [
             {"x": [15.0, 25.0], "y": [20.0, 30.0], "margin": 2.0},  # plate
