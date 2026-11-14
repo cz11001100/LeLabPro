@@ -2019,21 +2019,26 @@ print(json.dumps(out))
     def start_validation(self, job_id: str, options: dict | None = None) -> dict:
         """Trigger the offline evaluator for a job's checkpoint.
 
-        Options (all optional): ``step`` — which checkpoint, ``num_batches`` /
-        ``batch_size`` / ``seed`` — sampling, ``holdout_episodes`` — exclude the
-        last K episodes, ``episodes`` — explicit list, ``probe`` — run the
-        vision/language sensitivity probe, ``device``.
+        Options (all optional): ``mode`` — ``offline`` or ``sim``; ``step`` —
+        which checkpoint; offline sampling knobs; or ``sim_episodes`` /
+        ``sim_max_steps`` / ``sim_task`` / ``sim_seed`` for the MuJoCo
+        closed-loop evaluator. ``device`` selects CUDA or CPU.
 
         Runs in a background thread. Only works where the checkpoint and the
-        dataset are reachable: locally, or on the SSH remote.
+        dataset are reachable: locally, or on the SSH remote (offline only).
         """
         opts = options or {}
+        mode = str(opts.get("mode", "offline"))
+        if mode not in ("offline", "sim"):
+            raise ValueError(f"Unknown validation mode {mode!r}; expected 'offline' or 'sim'")
         with self._lock:
             record = self._records.get(job_id)
             if record is None:
                 raise JobNotFoundError(job_id)
             if record.runner not in ("local", "imported", "ssh"):
                 raise ValueError(f"Validation is only supported for local/imported/ssh jobs, not {record.runner!r}")
+            if mode == "sim" and record.runner not in ("local", "imported"):
+                raise ValueError("Simulation evaluation only works for local or imported checkpoints")
             if record.validation_state == "running":
                 return {"validation_state": "running", "message": "Validation already in progress"}
 
@@ -2092,6 +2097,15 @@ print(json.dumps(out))
             "aim_frames": int(opts.get("aim_frames", 0)),
             "device": str(opts.get("device", "cuda")),
         }
+        sim_kwargs: dict = {
+            "task": str(opts.get("sim_task", "grasp the red ball")),
+            "episodes": int(opts.get("sim_episodes", 5)),
+            "max_steps": int(opts.get("sim_max_steps", 300)),
+            "seed": int(opts.get("sim_seed", 0)),
+            "replan_steps": int(opts.get("sim_replan_steps", 20)),
+            "device": str(opts.get("device", "cuda")),
+            "scene_dir": opts.get("sim_scene") or None,
+        }
 
         if opts.get("dataset_repo_id"):
             # Evaluate against a separately recorded validation set instead of a
@@ -2108,6 +2122,11 @@ print(json.dumps(out))
                 job_root = _job_dir(self._output_root, job_id).resolve()
                 rel_base = Path(chart_root).resolve().relative_to(job_root)
                 results["charts"] = {key: str(rel_base / name) for key, name in charts.items()}
+            videos = results.get("videos")
+            if videos:
+                job_root = _job_dir(self._output_root, job_id).resolve()
+                rel_base = Path(chart_dir).resolve().relative_to(job_root)
+                results["videos"] = [str(rel_base / name) for name in videos]
             with self._lock:
                 rec = self._records.get(job_id)
                 if rec is not None:
@@ -2123,7 +2142,17 @@ print(json.dumps(out))
 
         def _run():
             try:
-                if runner_type == "ssh":
+                if mode == "sim":
+                    from .sim_eval import run_sim_evaluation
+
+                    results = run_sim_evaluation(
+                        checkpoint_path=latest.ref,
+                        dataset_repo_id=dataset_repo_id,
+                        output_dir=str(chart_dir),
+                        cancel_event=cancel_event,
+                        **sim_kwargs,
+                    )
+                elif runner_type == "ssh":
                     results = self._run_ssh_validation(
                         ssh_config_id=ssh_config_id,
                         remote_checkpoint=latest.ref,
@@ -2347,11 +2376,11 @@ print(json.dumps(out))
             return ""
 
     def get_evaluation_artifact(self, job_id: str, rel_path: str) -> Path:
-        """Resolve a chart PNG produced by the evaluator, inside the job dir only."""
+        """Resolve an evaluator image or video inside the job dir only."""
         root = _job_dir(self._output_root, job_id).resolve()
         candidate = (root / rel_path).resolve()
-        if not str(rel_path).startswith("evaluation/") or candidate.suffix != ".png":
-            raise ValueError("Only evaluation chart files can be read")
+        if not str(rel_path).startswith("evaluation/") or candidate.suffix.lower() not in (".png", ".mp4"):
+            raise ValueError("Only evaluation artifacts (PNG/MP4) can be read")
         if not candidate.is_relative_to(root) or not candidate.is_file():
             raise FileNotFoundError(rel_path)
         return candidate

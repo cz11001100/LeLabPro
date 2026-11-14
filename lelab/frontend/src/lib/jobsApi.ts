@@ -105,6 +105,7 @@ export interface ProbeResult {
 }
 
 export interface ValidationOptions {
+  mode?: "offline" | "sim";
   step?: number | null;
   num_batches?: number;
   batch_size?: number;
@@ -117,10 +118,37 @@ export interface ValidationOptions {
   saliency_frames?: number;
   aim_frames?: number;
   device?: string;
+  // Closed-loop MuJoCo evaluation.
+  sim_task?: string;
+  sim_episodes?: number;
+  sim_max_steps?: number;
+  sim_seed?: number;
+  sim_replan_steps?: number;
+  sim_scene?: string | null;
 }
 
 export interface ValidationResults {
   success: boolean;
+  mode?: "offline" | "sim";
+  // Closed-loop MuJoCo evaluator.
+  task?: string;
+  episodes?: number;
+  successes?: number;
+  success_rate?: number;
+  start_seed?: number;
+  max_steps?: number;
+  replan_steps?: number;
+  total_seconds?: number;
+  sim_episode_results?: {
+    episode: number;
+    seed: number;
+    success: boolean;
+    steps: number;
+    max_lift_cm: number;
+    seconds: number;
+    ball_positions_cm?: Record<string, number[]>;
+  }[];
+  videos?: string[];
   checkpoint_path?: string;
   dataset_repo_id?: string;
   batches_evaluated?: number;

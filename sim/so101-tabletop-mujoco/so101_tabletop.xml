@@ -1,0 +1,148 @@
+<!--
+  SO-101 tabletop scene: one red and one blue ball on a white table with a 10 cm plate.
+
+  The SO-101 arm (MuJoCo Menagerie robotstudio_so101) is attached at the `so101_mount` site.
+  This file has no <option>, so the arm's Menagerie physics options apply; add one to override them.
+  Cameras are referenced by name from the server config (`cameras`); the arm adds `wrist_cam`.
+  Reset randomization (object poses, camera jitter, joint noise) is declared in the server config.
+-->
+<mujoco model="so101_tabletop">
+  <!-- The extent of the workspace, not the room: MuJoCo scales the near clipping plane and the shadow
+       map with it, and the wrist camera sees the gripper from a few centimeters. -->
+  <statistic center="0.35 0 0.1" extent="0.6"/>
+
+  <visual>
+    <headlight diffuse="0.35 0.35 0.35" ambient="0.2 0.2 0.2" specular="0 0 0"/>
+    <global azimuth="160" elevation="-20" offwidth="1280" offheight="960"/>
+  </visual>
+
+  <custom>
+    <text name="instruction" data="grasp the red ball"/>
+  </custom>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.75 0.75 0.75" rgb2="0.45 0.45 0.45" width="512" height="3072"/>
+    <material name="table" rgba="0.92 0.92 0.90 1" specular="0.05" shininess="0.1"/>
+    <!-- Painted wooden cubes: one light wood grain, tinted by each cube's material. -->
+    <texture name="wood" type="cube" file="textures/wood.png"/>
+    <material name="red_wood" texture="wood" rgba="0.95 0.15 0.12 1" specular="0.2" shininess="0.3"/>
+    <material name="green_wood" texture="wood" rgba="0.20 0.75 0.25 1" specular="0.2" shininess="0.3"/>
+    <material name="blue_wood" texture="wood" rgba="0.15 0.35 0.95 1" specular="0.2" shininess="0.3"/>
+    <material name="yellow_wood" texture="wood" rgba="1.0 0.85 0.12 1" specular="0.2" shininess="0.3"/>
+    <material name="table_leg" rgba="0.30 0.25 0.20 1"/>
+    <material name="floor" rgba="0.38 0.37 0.36 1"/>
+    <material name="wall" rgba="0.85 0.84 0.80 1" emission="0.5"/>
+    <material name="box" rgba="0.22 0.60 0.33 1" specular="0.6" shininess="0.7" reflectance="0.05"/>
+    <material name="plate" rgba="0.55 0.55 0.54 1" specular="0.6" shininess="0.6"/>
+    <material name="stand_metal" rgba="0.16 0.16 0.17 1" specular="0.4" shininess="0.5"/>
+    <material name="camera_body" rgba="0.03 0.03 0.03 1" specular="0.2" shininess="0.2"/>
+    <material name="lens_metal" rgba="0.72 0.72 0.74 1" specular="0.8" shininess="0.8"/>
+    <material name="red_ball" rgba="0.72 0.06 0.05 1" specular="0.1" shininess="0.1"/>
+    <material name="blue_ball" rgba="0.05 0.15 0.65 1" specular="0.1" shininess="0.1"/>
+  </asset>
+
+  <default>
+    <default class="cube">
+      <geom type="box" size="0.015 0.015 0.015" mass="0.01" condim="4" friction="1 0.03 0.003" solref="0.01 1"/>
+    </default>
+    <default class="box_wall">
+      <geom type="box" material="box"/>
+    </default>
+    <!-- Room and table legs: visual only. -->
+    <default class="decor">
+      <geom type="box" contype="0" conaffinity="0"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 3.5" dir="0 0 -1" directional="true"/>
+    <light pos="0.3 -0.4 0.8" dir="-0.3 0.5 -1" diffuse="0.25 0.25 0.25" castshadow="true"/>
+    <!-- Table: 80 x 100 cm top, surface at z=0. Wide enough for the side
+         camera's round base (x=40 cm in the user frame) to sit fully on it.
+         The arm base rear edge is at x=-0.057, so the table rear edge is there:
+         center = -0.057 + 0.40 = 0.343. -->
+    <geom name="table" type="box" size="0.40 0.50 0.015" pos="0.343 0 -0.015" material="table"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.703 0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.703 -0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.017 0.36 -0.39" material="table_leg"/>
+    <geom class="decor" size="0.02 0.02 0.36" pos="0.017 -0.36 -0.39" material="table_leg"/>
+
+    <!-- Room: a floor and three 2 m walls around the table. -->
+    <geom name="floor" type="plane" size="1.8 1.5 0.05" pos="0 0 -0.75" material="floor"/>
+    <geom class="decor" size="0.02 1.5 1.0" pos="-2.5 0 0.25" material="wall"/>
+    <geom class="decor" size="1.8 0.02 1.0" pos="0 1.5 0.25" material="wall"/>
+    <geom class="decor" size="1.8 0.02 1.0" pos="0 -1.5 0.25" material="wall"/>
+
+    <site name="so101_mount" pos="0 0 0"/>
+
+    <!-- Task objects. 4 cm balls, positions estimated from the 1021_8 up frame:
+         red 20 cm to the right of the plate center, blue 22 cm right and 14 cm forward. -->
+    <body name="red_ball" pos="0.20 -0.1055 0.02">
+      <freejoint/>
+      <geom type="sphere" size="0.02" mass="0.02" condim="4"
+            friction="1.2 0.05 0.01" solref="0.01 1" material="red_ball"/>
+    </body>
+    <body name="blue_ball" pos="0.34 -0.0855 0.02">
+      <freejoint/>
+      <geom type="sphere" size="0.02" mass="0.02" condim="4"
+            friction="1.2 0.05 0.01" solref="0.01 1" material="blue_ball"/>
+    </body>
+
+    <!-- 10 x 10 cm plate, center at x=20 cm, y=25 cm in the user frame
+         (x=0 base right edge, y=0 base front edge, +x right, +y forward).
+         Mapped to MuJoCo: X = y + 0.083, Y = -x - 0.0555. -->
+    <body name="plate" pos="0.333 -0.2555 0.005">
+      <geom type="box" size="0.05 0.05 0.005" material="plate"/>
+    </body>
+
+    <!-- Up-camera stand: a four-link articulated arm on the table edge directly
+         opposite the robot arm (user x=0, y=45 cm). The links curve up and back
+         to the camera at x=0, y=25, z=45 cm. Visual only. -->
+    <geom class="decor" type="box" size="0.06 0.06 0.01" pos="0.533 -0.0555 0.005"
+          material="stand_metal"/>
+    <geom class="decor" type="cylinder" size="0.035 0.015" pos="0.533 -0.0555 0.03"
+          material="stand_metal"/>
+    <geom class="decor" type="sphere" size="0.020" pos="0.533 -0.0555 0.05"
+          material="lens_metal"/>
+    <geom class="decor" type="capsule" size="0.012" fromto="0.533 -0.0555 0.05 0.533 -0.0555 0.22"
+          material="stand_metal"/>
+    <geom class="decor" type="sphere" size="0.018" pos="0.533 -0.0555 0.22"
+          material="lens_metal"/>
+    <geom class="decor" type="capsule" size="0.011" fromto="0.533 -0.0555 0.22 0.515 -0.0555 0.38"
+          material="stand_metal"/>
+    <geom class="decor" type="sphere" size="0.017" pos="0.515 -0.0555 0.38"
+          material="lens_metal"/>
+    <geom class="decor" type="capsule" size="0.010" fromto="0.515 -0.0555 0.38 0.470 -0.0555 0.48"
+          material="stand_metal"/>
+    <geom class="decor" type="sphere" size="0.016" pos="0.470 -0.0555 0.48"
+          material="lens_metal"/>
+    <geom class="decor" type="capsule" size="0.010" fromto="0.470 -0.0555 0.48 0.3535 -0.0555 0.5117"
+          material="stand_metal"/>
+    <geom class="decor" type="box" size="0.026 0.026 0.026" pos="0.3535 -0.0555 0.5117"
+          material="camera_body"/>
+    <geom class="decor" type="capsule" size="0.018" fromto="0.3343 -0.0555 0.4538 0.3472 -0.0555 0.4927"
+          material="lens_metal"/>
+
+    <!-- Small tabletop stand for the side camera, like the photo: round black
+         base directly under the camera, short post, small black camera head. -->
+    <geom class="decor" type="cylinder" size="0.040 0.006" pos="0.533 -0.4555 0.006"
+          material="stand_metal"/>
+    <geom class="decor" type="cylinder" size="0.008 0.09" pos="0.533 -0.4555 0.09"
+          material="stand_metal"/>
+    <geom class="decor" type="sphere" size="0.010" pos="0.533 -0.4555 0.19"
+          material="stand_metal"/>
+    <geom class="decor" type="box" size="0.022 0.016 0.016" pos="0.5751 -0.5036 0.2120"
+          material="camera_body"/>
+    <geom class="decor" type="capsule" size="0.012" fromto="0.5356 -0.4585 0.2007 0.5621 -0.4888 0.2083"
+          material="lens_metal"/>
+
+    <!-- Cameras in the same user frame. up: x=0, y=25, h=45, aimed at the plate
+         center (66 deg depression). side: x=40, y=45, h=20, aimed at the plate
+         center (35 deg depression); it sits 5.5 cm past the 80 cm table's right
+         edge, i.e. on a tripod. -->
+    <camera name="top" pos="0.333 -0.0555 0.45"
+            xyaxes="0 1 0 -0.9487 0 0.3162" fovy="55"/>
+    <camera name="front" pos="0.533 -0.4555 0.20"
+            xyaxes="0.7525 0.6585 0 -0.1218 0.1391 0.9829" fovy="55"/>
+  </worldbody>
+</mujoco>

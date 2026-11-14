@@ -1,0 +1,5 @@
+# 本地仿真产物，不入库
+.venv/
+out/
+__pycache__/
+so101-tabletop-mujoco/.cache/

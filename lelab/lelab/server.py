@@ -1334,8 +1334,9 @@ def cancel_export_checkpoint(job_id: str, step: int):
 
 
 class ValidationOptions(BaseModel):
-    """Sampling knobs for the offline evaluator. Omit the body for the defaults."""
+    """Sampling knobs for the evaluator. Omit the body for the defaults."""
 
+    mode: str = "offline"
     step: int | None = None
     num_batches: int = 20
     batch_size: int = 8
@@ -1348,6 +1349,13 @@ class ValidationOptions(BaseModel):
     saliency_frames: int = 2
     aim_frames: int = 4
     device: str = "cuda"
+    # Closed-loop MuJoCo evaluation (mode="sim").
+    sim_task: str = "grasp the red ball"
+    sim_episodes: int = 5
+    sim_max_steps: int = 300
+    sim_seed: int = 0
+    sim_replan_steps: int = 20
+    sim_scene: str | None = None
 
 
 @app.post("/jobs/{job_id}/validate")
@@ -1381,14 +1389,15 @@ def stop_job_validation(job_id: str):
 
 @app.get("/jobs/{job_id}/evaluation/artifact")
 def get_evaluation_artifact(job_id: str, path: str):
-    """Serve one evaluator chart PNG (paths are relative to the job directory)."""
+    """Serve one evaluator chart/video (paths are relative to the job directory)."""
     try:
         artifact = job_registry.get_evaluation_artifact(job_id, path)
     except JobNotFoundError as exc:
         raise HTTPException(status_code=404, detail=f"Job {job_id!r} not found") from exc
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-    return FileResponse(artifact, media_type="image/png")
+    media_type = "video/mp4" if artifact.suffix.lower() == ".mp4" else "image/png"
+    return FileResponse(artifact, media_type=media_type)
 
 
 @app.get("/jobs/{job_id}/validation")

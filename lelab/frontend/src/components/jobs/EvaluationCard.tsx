@@ -80,6 +80,92 @@ const Field: React.FC<{ label: string; children: React.ReactNode }> = ({ label, 
   </div>
 );
 
+const SimResult: React.FC<{ baseUrl: string; jobId: string; results: ValidationResults }> = ({
+  baseUrl,
+  jobId,
+  results,
+}) => {
+  const rows = results.sim_episode_results ?? [];
+  const episodes = results.episodes ?? rows.length;
+  const successes = results.successes ?? rows.filter((r) => r.success).length;
+  const rate = results.success_rate ?? (episodes ? successes / episodes : 0);
+  const avgSteps = rows.length ? rows.reduce((sum, r) => sum + r.steps, 0) / rows.length : 0;
+  const videos = results.videos ?? [];
+
+  return (
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <Metric
+          label="闭环成功率"
+          value={`${(rate * 100).toFixed(1)}%`}
+          tone={rate > 0 ? "ok" : "bad"}
+          hint="仿真里真正抓起目标球的回合比例"
+        />
+        <Metric label="成功/回合" value={`${successes}/${episodes}`} />
+        <Metric label="平均步数" value={avgSteps ? avgSteps.toFixed(0) : "—"} />
+        <Metric label="任务" value={results.task ?? "—"} />
+      </div>
+
+      <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-xs text-slate-400">
+        仿真评估是闭环成功率：策略驱动机械臂跑完整回合，成功条件是目标球抬起超过 5cm。
+        离线动作误差、敏感度、定位分析仍在“离线诊断”模式里，不参与这个成功率。
+      </div>
+
+      {rows.length ? (
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="text-slate-400">
+              <tr>
+                <th className="text-left py-1 pr-3">回合</th>
+                <th className="text-left py-1 pr-3">seed</th>
+                <th className="text-left py-1 pr-3">结果</th>
+                <th className="text-right py-1 pr-3">步数</th>
+                <th className="text-right py-1 pr-3">最大抬升</th>
+                <th className="text-left py-1">球位 (cm)</th>
+              </tr>
+            </thead>
+            <tbody className="text-slate-200">
+              {rows.map((row) => (
+                <tr key={row.episode} className="border-t border-slate-700/60">
+                  <td className="py-1 pr-3">#{row.episode + 1}</td>
+                  <td className="py-1 pr-3 tabular-nums">{row.seed}</td>
+                  <td className={`py-1 pr-3 ${row.success ? "text-green-300" : "text-red-300"}`}>
+                    {row.success ? "成功" : "失败"}
+                  </td>
+                  <td className="py-1 pr-3 text-right tabular-nums">{row.steps}</td>
+                  <td className="py-1 pr-3 text-right tabular-nums">{row.max_lift_cm.toFixed(1)}cm</td>
+                  <td className="py-1 text-slate-400">
+                    {Object.entries(row.ball_positions_cm ?? {})
+                      .map(([name, xy]) => `${name.replace("_ball", "")}:(${xy[0]}, ${xy[1]})`)
+                      .join(" · ")}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      ) : null}
+
+      {videos.length ? (
+        <div className="space-y-1">
+          <div className="text-sm font-semibold text-slate-300">回合录像（up | side | wrist）</div>
+          {videos.map((video, index) => (
+            <a
+              key={video}
+              href={evaluationChartUrl(baseUrl, jobId, video)}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="block text-xs text-cyan-300 hover:text-cyan-200 underline underline-offset-2"
+            >
+              第 {index + 1} 回合录像
+            </a>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
 const EVAL_CONFIG_KEY = "lelab.eval.config";
 
 type EvalPreset = "quick" | "normal" | "deep";
@@ -166,9 +252,21 @@ const EvaluationCard: React.FC<{
   const [state, setState] = useState<ValidationState>(job.validation_state ?? "none");
   const [results, setResults] = useState<ValidationResults | null>(job.validation_results ?? null);
   const [expandedDim, setExpandedDim] = useState<string | null>(null);
+  const [mode, setMode] = useState<"sim" | "offline">(() => {
+    const resultMode = job.validation_results?.mode;
+    if (resultMode === "sim" || resultMode === "offline") return resultMode;
+    // Results written before the sim evaluator existed have no mode.
+    return job.validation_results ? "offline" : "sim";
+  });
+  const [simTask, setSimTask] = useState("grasp the red ball");
+  const [simEpisodes, setSimEpisodes] = useState(5);
+  const [simMaxSteps, setSimMaxSteps] = useState(300);
+  const [simSeed, setSimSeed] = useState(0);
+  const [simReplan, setSimReplan] = useState(20);
 
-  // 计算三维度评分
-  const dimensions = results?.success ? computeDimensionScores(results) : null;
+  // 计算三维度评分（仅离线诊断；仿真结果不使用这套指标）
+  const dimensions =
+    results && results.mode !== "sim" && results.success ? computeDimensionScores(results) : null;
 
   useEffect(() => {
     const controller = new AbortController();
@@ -193,6 +291,9 @@ const EvaluationCard: React.FC<{
   useEffect(() => {
     setState(job.validation_state ?? "none");
     setResults(job.validation_results ?? null);
+    const resultMode = job.validation_results?.mode;
+    if (resultMode === "sim" || resultMode === "offline") setMode(resultMode);
+    else if (job.validation_results) setMode("offline");
   }, [job.id, job.validation_state, job.validation_results]);
 
   // The parent page refetches the job on its own cadence; poll directly so the
@@ -204,6 +305,9 @@ const EvaluationCard: React.FC<{
         .then((r) => {
           setState(r.validation_state);
           setResults(r.validation_results);
+          const resultMode = r.validation_results?.mode;
+          if (resultMode === "sim" || resultMode === "offline") setMode(resultMode);
+          else if (r.validation_results) setMode("offline");
         })
         .catch(() => {});
     }, 3000);
@@ -212,27 +316,42 @@ const EvaluationCard: React.FC<{
 
   const run = async () => {
     const p = EVAL_PRESETS[preset];
-    // Save current config to localStorage before running
+    // Save current offline config to localStorage before running.
     saveEvalConfig({ preset, batchSize, probe, device });
 
     setStarting(true);
     setState("running");
     setResults(null);
     try {
-      await startJobValidation(baseUrl, fetchWithHeaders, job.id, {
-        step: step ? Number(step) : undefined,
-        num_batches: p.numBatches,
-        batch_size: batchSize,
-        seed: p.seed,
-        holdout_episodes: 0,
-        dataset_repo_id: valDataset || undefined,
-        frames_per_episode: p.framesPerEpisode,
-        probe,
-        saliency_frames: p.saliencyFrames,
-        aim_frames: p.aimFrames,
-        device,
-      });
-      toast({ title: "评测已启动" });
+      if (mode === "sim") {
+        await startJobValidation(baseUrl, fetchWithHeaders, job.id, {
+          step: step ? Number(step) : undefined,
+          mode: "sim",
+          sim_task: simTask,
+          sim_episodes: simEpisodes,
+          sim_max_steps: simMaxSteps,
+          sim_seed: simSeed,
+          sim_replan_steps: simReplan,
+          device,
+        });
+        toast({ title: "仿真评估已启动" });
+      } else {
+        await startJobValidation(baseUrl, fetchWithHeaders, job.id, {
+          step: step ? Number(step) : undefined,
+          mode: "offline",
+          num_batches: p.numBatches,
+          batch_size: batchSize,
+          seed: p.seed,
+          holdout_episodes: 0,
+          dataset_repo_id: valDataset || undefined,
+          frames_per_episode: p.framesPerEpisode,
+          probe,
+          saliency_frames: p.saliencyFrames,
+          aim_frames: p.aimFrames,
+          device,
+        });
+        toast({ title: "离线诊断已启动" });
+      }
     } catch (e) {
       setState("failed");
       toast({
@@ -268,6 +387,7 @@ const EvaluationCard: React.FC<{
   const relative = results?.per_joint_mae_vs_naive ?? [];
   const vision = results?.probe?.vision_sensitivity ?? null;
   const running = state === "running";
+  const hasSimResult = results?.mode === "sim";
 
   return (
     <Card className="bg-slate-800/50 border-slate-700 rounded-xl">
@@ -278,6 +398,32 @@ const EvaluationCard: React.FC<{
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <div className="inline-flex rounded-lg border border-slate-700 p-0.5">
+            <button
+              type="button"
+              onClick={() => setMode("sim")}
+              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                mode === "sim" ? "bg-purple-500 text-white" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              仿真评估
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode("offline")}
+              className={`px-3 py-1.5 text-xs rounded-md transition-colors ${
+                mode === "offline" ? "bg-slate-600 text-white" : "text-slate-400 hover:text-white"
+              }`}
+            >
+              离线诊断
+            </button>
+          </div>
+          <div className="text-xs text-slate-500">
+            {mode === "sim" ? "闭环成功率为主指标" : "动作误差 / 视觉语言敏感度 / 定位分析"}
+          </div>
+        </div>
+
         <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
           {variants && variants.length > 0 ? (
             <Field label="Checkpoint">
@@ -296,43 +442,91 @@ const EvaluationCard: React.FC<{
               />
             </Field>
           ) : null}
-          <Field label="评估深度">
-            <Select value={preset} onValueChange={(v) => setPreset(v as EvalPreset)}>
-              <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent className="bg-slate-800 border-slate-600 text-white">
-                <SelectItem value="quick">快速评估</SelectItem>
-                <SelectItem value="normal">一般评估</SelectItem>
-                <SelectItem value="deep">深度评估</SelectItem>
-              </SelectContent>
-            </Select>
-          </Field>
-          <Field label="每批样本">
-            <NumberInput
-              value={batchSize}
-              onChange={(v) => v !== undefined && setBatchSize(v)}
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
-            />
-          </Field>
-          <Field label="验证数据集">
-            <Select
-              value={valDataset || "__train__"}
-              onValueChange={(v) => setValDataset(v === "__train__" ? "" : v)}
-            >
-              <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
-                <SelectValue placeholder="用训练数据集" />
-              </SelectTrigger>
-              <SelectContent className="bg-slate-800 border-slate-600 text-white">
-                <SelectItem value="__train__">用训练数据集</SelectItem>
-                {datasets.map((d) => (
-                  <SelectItem key={d.repo_id} value={d.repo_id}>
-                    {d.repo_id}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </Field>
+
+          {mode === "sim" ? (
+            <>
+              <Field label="任务">
+                <Select value={simTask} onValueChange={setSimTask}>
+                  <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-slate-800 border-slate-600 text-white">
+                    <SelectItem value="grasp the red ball">抓红球</SelectItem>
+                    <SelectItem value="grasp the blue ball">抓蓝球</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="回合数">
+                <NumberInput
+                  value={simEpisodes}
+                  onChange={(v) => v !== undefined && setSimEpisodes(v)}
+                  className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+                />
+              </Field>
+              <Field label="最大步数">
+                <NumberInput
+                  value={simMaxSteps}
+                  onChange={(v) => v !== undefined && setSimMaxSteps(v)}
+                  className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+                />
+              </Field>
+              <Field label="起始 seed">
+                <NumberInput
+                  value={simSeed}
+                  onChange={(v) => v !== undefined && setSimSeed(v)}
+                  className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+                />
+              </Field>
+              <Field label="重推理步数">
+                <NumberInput
+                  value={simReplan}
+                  onChange={(v) => v !== undefined && setSimReplan(v)}
+                  className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label="评估深度">
+                <Select value={preset} onValueChange={(v) => setPreset(v as EvalPreset)}>
+                  <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent className="bg-slate-800 border-slate-600 text-white">
+                    <SelectItem value="quick">快速评估</SelectItem>
+                    <SelectItem value="normal">一般评估</SelectItem>
+                    <SelectItem value="deep">深度评估</SelectItem>
+                  </SelectContent>
+                </Select>
+              </Field>
+              <Field label="每批样本">
+                <NumberInput
+                  value={batchSize}
+                  onChange={(v) => v !== undefined && setBatchSize(v)}
+                  className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1"
+                />
+              </Field>
+              <Field label="验证数据集">
+                <Select
+                  value={valDataset || "__train__"}
+                  onValueChange={(v) => setValDataset(v === "__train__" ? "" : v)}
+                >
+                  <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
+                    <SelectValue placeholder="用训练数据集" />
+                  </SelectTrigger>
+                  <SelectContent className="bg-slate-800 border-slate-600 text-white">
+                    <SelectItem value="__train__">用训练数据集</SelectItem>
+                    {datasets.map((d) => (
+                      <SelectItem key={d.repo_id} value={d.repo_id}>
+                        {d.repo_id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </Field>
+            </>
+          )}
+
           <Field label="设备">
             <Select value={device} onValueChange={setDevice}>
               <SelectTrigger className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1">
@@ -347,12 +541,14 @@ const EvaluationCard: React.FC<{
         </div>
 
         <div className="flex flex-wrap items-center gap-4">
-          <div className="flex items-center space-x-3">
-            <Switch id="eval_probe" checked={probe} onCheckedChange={setProbe} />
-            <Label htmlFor="eval_probe" className="text-slate-300 text-sm">
-              感知探针
-            </Label>
-          </div>
+          {mode === "offline" ? (
+            <div className="flex items-center space-x-3">
+              <Switch id="eval_probe" checked={probe} onCheckedChange={setProbe} />
+              <Label htmlFor="eval_probe" className="text-slate-300 text-sm">
+                感知探针
+              </Label>
+            </div>
+          ) : null}
           {running ? (
             <Button
               onClick={stop}
@@ -377,7 +573,13 @@ const EvaluationCard: React.FC<{
               ) : (
                 <FlaskConical className="w-4 h-4 mr-2" />
               )}
-              {results ? "Re-evaluate" : "Start Evaluation"}
+              {hasSimResult
+                ? "重新仿真"
+                : mode === "sim"
+                ? "开始仿真评估"
+                : results
+                ? "Re-evaluate"
+                : "Start Evaluation"}
             </Button>
           )}
         </div>
@@ -385,14 +587,18 @@ const EvaluationCard: React.FC<{
         {running ? (
           <div className="flex items-center gap-2 text-sm text-purple-400">
             <Loader2 className="w-4 h-4 animate-spin" />
-            正在评测…（加载模型约 1–2 分钟，之后每批 1–3 秒）
+            {mode === "sim"
+              ? "正在跑闭环仿真回合（加载模型约 5–15 秒，之后每回合几秒）…"
+              : "正在评测…（加载模型约 1–2 分钟，之后每批 1–3 秒）"}
           </div>
         ) : state === "failed" ? (
           <div className="flex items-start gap-2 text-sm text-red-400">
             <ShieldAlert className="w-4 h-4 mt-0.5 shrink-0" />
             <span>评测失败{results?.error ? `：${results.error}` : ""}</span>
           </div>
-        ) : results?.success ? (
+        ) : mode === "sim" && results?.mode === "sim" && results.success ? (
+          <SimResult baseUrl={baseUrl} jobId={job.id} results={results} />
+        ) : mode === "offline" && results?.mode !== "sim" && results?.success ? (
           <div className="space-y-4">
             {/* 基础指标 */}
             <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
@@ -573,6 +779,12 @@ const EvaluationCard: React.FC<{
                 ))}
               </div>
             ) : null}
+          </div>
+        ) : results ? (
+          <div className="rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-sm text-slate-300">
+            当前结果是
+            {results.mode === "sim" ? "仿真评估" : "离线诊断"}
+            结果；切换到对应模式查看。
           </div>
         ) : null}
       </CardContent>
