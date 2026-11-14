@@ -1,0 +1,296 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Notify users when a newer LeForge is available on GitHub.
+
+LeForge installs from git (`pip install git+https://github.com/.../leForge.git`),
+so "newer" means the default branch has moved past the installed commit. We
+read the installed commit from pip's `direct_url.json` and compare it to the
+repo HEAD via the GitHub API. Editable/local clones have no commit_id, so they
+are deliberately excluded — developers shouldn't be nagged to update.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from importlib.metadata import PackageNotFoundError, distribution
+from pathlib import Path
+from typing import Any
+
+from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+GITHUB_API = "https://api.github.com"
+_HTTP_TIMEOUT = 5  # seconds — GitHub check must never stall the UI
+_CACHE_TTL = 600  # seconds — avoid hammering the GitHub API on every page load
+
+# Cached UpdateStatus dict + monotonic timestamp of when it was computed.
+_cache: dict[str, Any] | None = None
+_cache_time: float = 0.0
+
+
+class UpdateStatus(BaseModel):
+    update_available: bool
+    current_commit: str | None = None
+    latest_commit: str | None = None
+    commits_behind: int | None = None
+    compare_url: str | None = None
+    update_command: str | None = None
+    can_auto_update: bool = False
+
+
+class UpdateResult(BaseModel):
+    success: bool
+    message: str
+    output: str = ""
+
+
+def _split_fragment(url: str) -> tuple[str, str]:
+    """Split a PEP 508 git URL into ``(without_fragment, fragment)``."""
+    base, _, frag = url.partition("#")
+    return base, frag
+
+
+def _parse_github_repo(url: str) -> tuple[str, str] | None:
+    """Extract ``(owner, repo)`` from a GitHub clone URL, or None if not GitHub.
+
+    The ``#subdirectory=...`` fragment a monorepo install carries must be
+    stripped before the ``.git`` suffix is removed, otherwise the repo name
+    comes back as ``LeForge.git#subdirectory=leforge`` and rebuilding the URL
+    appends a second ``.git`` after the fragment — yielding the non-existent
+    subdirectory ``leforge.git`` and a failed update.
+    """
+    if not url or "github.com" not in url:
+        return None
+    u, _ = _split_fragment(url.strip().removeprefix("git+"))
+    if u.startswith("git@"):
+        # git@github.com:owner/repo.git
+        _, _, path = u.partition(":")
+    else:
+        # https://github.com/owner/repo(.git)
+        path = u.split("github.com", 1)[1].lstrip("/:")
+    path = path.split("?", 1)[0].removesuffix(".git").strip("/")
+    parts = path.split("/")
+    if len(parts) < 2 or not parts[0] or not parts[1]:
+        return None
+    return parts[0], parts[1]
+
+
+def _parse_github_subdirectory(url: str) -> str | None:
+    """The ``subdirectory=`` value from a git URL fragment, if any."""
+    _, frag = _split_fragment((url or "").strip())
+    for part in frag.split("&"):
+        key, _, value = part.partition("=")
+        if key.strip().lower() == "subdirectory" and value.strip():
+            return value.strip("/")
+    return None
+
+
+def get_installed_source() -> dict[str, str] | None:
+    """Read the installed git commit and origin repo from pip metadata.
+
+    Returns ``{"commit", "owner", "repo"}`` (plus ``"subdirectory"`` for a
+    monorepo install) for a git install, or None for editable/local/non-git
+    installs (where there's nothing meaningful to compare against).
+    """
+    try:
+        dist = distribution("leforge")
+    except PackageNotFoundError:
+        return None
+    raw = dist.read_text("direct_url.json")
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    commit = (data.get("vcs_info") or {}).get("commit_id")
+    if not commit:
+        return None
+    url = data.get("url", "")
+    repo = _parse_github_repo(url)
+    if repo is None:
+        return None
+    owner, name = repo
+    source = {"commit": commit, "owner": owner, "repo": name}
+    subdirectory = _parse_github_subdirectory(url)
+    if subdirectory:
+        source["subdirectory"] = subdirectory
+    return source
+
+
+def _github_json(path: str) -> Any | None:
+    """GET a GitHub API path and parse JSON. Any failure returns None (silent)."""
+    req = urllib.request.Request(
+        f"{GITHUB_API}{path}",
+        headers={
+            "User-Agent": "leforge-update-check",
+            "Accept": "application/vnd.github+json",
+        },
+    )
+    try:
+        # URL is always GITHUB_API (a fixed https:// constant) plus an
+        # internally-built path; no user-controlled scheme.
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT) as resp:  # noqa: S310  # nosec B310
+            return json.loads(resp.read().decode())
+    except Exception as exc:  # noqa: BLE001 — network check must never raise
+        logger.debug("GitHub API call failed for %s: %s", path, exc)
+        return None
+
+
+def _is_uv_tool_install() -> bool:
+    """True when LeForge runs from a `uv tool install` (the standard install).
+
+    uv tools live in an isolated env under `<data>/uv/tools/<name>/`, so the
+    running interpreter sits inside a `uv/tools` path segment.
+    """
+    return "uv/tools" in Path(sys.executable).as_posix()
+
+
+def _build_update_cmd(owner: str, repo: str, subdirectory: str | None = None) -> list[str]:
+    """Pick the right updater for how LeForge was installed.
+
+    - Standard install is `uv tool install`: update the tool in place with
+      `--force`, which re-fetches the latest commit even though the version
+      string is unchanged.
+    - uv venv install: `uv pip install` pinned to this interpreter (uv venvs
+      ship no pip), matching the extra-install flow in utils/system.py.
+    - Plain pip env: `python -m pip install`.
+
+    ``subdirectory`` is re-attached because LeForge is a monorepo: the
+    installable package lives in ``leforge/``, so a bare repo URL has no
+    ``pyproject.toml`` at its root and the install fails.
+    """
+    target = f"git+https://github.com/{owner}/{repo}.git"
+    if subdirectory:
+        target = f"{target}#subdirectory={subdirectory}"
+    if shutil.which("uv") and _is_uv_tool_install():
+        # Pin the interpreter: without this, uv picks the machine's default
+        # Python, which on boxes where 3.14 is the newest resolves torch to a
+        # version with no cp314 wheels and the upgrade dies mid-resolve.
+        return ["uv", "tool", "install", "--force", "--python", "3.12", target]
+    flags = ["--upgrade", "--force-reinstall", target]
+    if shutil.which("uv"):
+        return ["uv", "pip", "install", "--python", sys.executable, *flags]
+    return [sys.executable, "-m", "pip", "install", *flags]
+
+
+def _update_command(owner: str, repo: str, subdirectory: str | None = None) -> str:
+    """The exact command the Update button runs — shown so manual copy matches."""
+    return shlex.join(_build_update_cmd(owner, repo, subdirectory))
+
+
+def _compute_status() -> dict[str, Any]:
+    source = get_installed_source()
+    if source is None:
+        return UpdateStatus(update_available=False).model_dump()
+
+    current = source["commit"]
+    owner, repo = source["owner"], source["repo"]
+    base = UpdateStatus(
+        update_available=False,
+        current_commit=current,
+        update_command=_update_command(owner, repo, source.get("subdirectory")),
+        can_auto_update=True,
+    )
+
+    head = _github_json(f"/repos/{owner}/{repo}/commits/HEAD")
+    latest = head.get("sha") if isinstance(head, dict) else None
+    if not latest:
+        return base.model_dump()  # GitHub unreachable — stay silent
+
+    base.latest_commit = latest
+    if latest == current:
+        base.commits_behind = 0
+        return base.model_dump()
+
+    # compare(base=installed, head=latest) reports how the repo relates to the
+    # installed commit. Only status "ahead" means the repo has strictly newer
+    # commits the install can fast-forward to — the one case worth a nudge.
+    # "behind" (the install sits ahead of the default branch) and "diverged"
+    # (history rewritten / force-push) must not nag: the in-place --force
+    # reinstall would throw away those local commits. If the compare is
+    # unavailable (e.g. the installed commit is no longer in the repo), stay
+    # silent rather than guess.
+    compare = _github_json(f"/repos/{owner}/{repo}/compare/{current}...{latest}")
+    if isinstance(compare, dict):
+        base.commits_behind = compare.get("ahead_by")
+        base.compare_url = compare.get("html_url")
+        base.update_available = compare.get("status") == "ahead"
+    return base.model_dump()
+
+
+def check_for_update(force: bool = False) -> dict[str, Any]:
+    """Return the cached update status, refreshing past the TTL or when forced."""
+    global _cache, _cache_time
+    now = time.monotonic()
+    if not force and _cache is not None and (now - _cache_time) < _CACHE_TTL:
+        return _cache
+    _cache = _compute_status()
+    _cache_time = now
+    return _cache
+
+
+def handle_update_check() -> dict[str, Any]:
+    return check_for_update()
+
+
+def handle_run_update() -> UpdateResult:
+    """Run the pip upgrade in-process (best-effort). User must restart after.
+
+    Unlike the /system extra-installs (Popen + background thread + log polling
+    via InstallManager), this is a single blocking subprocess.run: the update is
+    a one-shot, fire-and-restart action with no live log UI, so streaming
+    machinery would be unused complexity. FastAPI runs this sync handler in a
+    threadpool, and the frontend shows a spinner for the duration.
+    """
+    source = get_installed_source()
+    if source is None:
+        return UpdateResult(
+            success=False,
+            message="This install can't auto-update (editable or non-git). "
+            "Update it the way you installed it.",
+        )
+    try:
+        proc = subprocess.run(
+            _build_update_cmd(source["owner"], source["repo"], source.get("subdirectory")),
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface failure to the UI
+        logger.exception("Auto-update subprocess failed")
+        return UpdateResult(success=False, message=f"Update failed: {exc}")
+
+    output = (proc.stdout or "") + (proc.stderr or "")
+    if proc.returncode == 0:
+        global _cache
+        _cache = None  # bust cache so the next check reflects the new install
+        return UpdateResult(
+            success=True,
+            message="Updated. Restart leforge to apply the new version.",
+            output=output,
+        )
+    return UpdateResult(
+        success=False,
+        message="Update failed. See the output, or run the command manually.",
+        output=output,
+    )

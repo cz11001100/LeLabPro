@@ -1,30 +1,30 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# LeLabPro 一键安装
+# LeForge 一键安装
 #
-#   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash
 #
-# 也可以先 clone 再执行：git clone ... && cd LeLabPro && bash install.sh
+# 也可以先 clone 再执行：git clone ... && cd LeForge && bash install.sh
 #
 # 轻薄本（不做本地训练，只要遥操/采集 + SSH 云端训练）走轻量档，省约 3GB：
 #
-#   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+#   curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash -s -- --lite
 #
 # 做的事：退出 conda → 装 uv → 建 Python 3.12 虚拟环境 → 装本仓库的 lerobot 与
-# lelab（国内镜像）→ 装 MuJoCo 仿真评测依赖 → 自检关键模块 → 生成 ./lelab-run.sh
+# leforge（国内镜像）→ 装 MuJoCo 仿真评测依赖 → 自检关键模块 → 生成 ./leforge-run.sh
 #
 # 档位自动选：检测到 NVIDIA GPU 才下 CUDA 版 torch（cu128，RTX 50 系必需），
 # 没有就下 CPU 版（少约 4GB）。想强制：--full 装 CUDA 版，--lite 装 CPU 版。
 
-REPO_URL="https://github.com/cz11001100/LeLabPro.git"
+REPO_URL="https://github.com/cz11001100/LeForge.git"
 MIRROR="https://pypi.tuna.tsinghua.edu.cn/simple"
 # CPU 版 torch 的索引（轻量档用；国内可换 https://mirror.sjtu.edu.cn/pytorch-wheels/cpu）
 # torch 索引：轻量档用 CPU 版，完整档用 cu128 版（国内可换镜像，见下方探测）
-TORCH_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
-TORCH_CUDA_INDEX="${LELAB_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
+TORCH_INDEX="${LEFORGE_TORCH_INDEX:-https://download.pytorch.org/whl/cpu}"
+TORCH_CUDA_INDEX="${LEFORGE_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
 # GitHub 加速前缀：astral.sh / github.com 直连不通时的回退（用法：$GH_PROXY/<原始 github 地址>）
-GH_PROXY="${LELAB_GH_PROXY:-https://gh-proxy.com}"
+GH_PROXY="${LEFORGE_GH_PROXY:-https://gh-proxy.com}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 info() { echo -e "${GREEN}[INFO]${NC} $*"; }
@@ -39,7 +39,7 @@ note() { info "$@" >&2; }
 # full: 强制 CUDA 版 torch（本地训练需要 NVIDIA GPU）
 # lite: 强制 CPU 版 torch，跳过 CUDA 运行库（实测同依赖组合 6.5GB→2.2GB）
 #       遥操/采集/回放/评估页全都照常，本地训练改走 SSH 云端 GPU
-PROFILE="${LELAB_PROFILE:-auto}"
+PROFILE="${LEFORGE_PROFILE:-auto}"
 for arg in "$@"; do
     case "$arg" in
         --lite) PROFILE="lite" ;;
@@ -79,7 +79,7 @@ on_error() {
         *环境*)   echo "  uv 下 Python 3.12 超时：sudo apt install python3.12 python3.12-venv 后重跑" ;;
         *lerobot*) echo "  多为下载超时或磁盘不足。查 df -h ~ （需 ≥${NEED_GB}GB），再单独重试："
                    echo "    uv pip install --python \$VENV/bin/python -e ./lerobot[core_scripts,feetech,smolvla,training,placo-dep]" ;;
-        *lelab*)  echo "  单独重试：uv pip install --python \$VENV/bin/python fastapi[standard] websockets uvicorn psutil paramiko" ;;
+        *leforge*)  echo "  单独重试：uv pip install --python \$VENV/bin/python fastapi[standard] websockets uvicorn psutil paramiko" ;;
         *自检*)   echo "  依赖装了但代码对不上，把上面 [X] 的报错原文发给维护者" ;;
     esac
     echo "  更多排查见 TROUBLESHOOTING.md"
@@ -149,14 +149,14 @@ pick_fast() {
 
 # ---------- 选择包索引 ----------
 # 1) 尊重用户已设的 UV_DEFAULT_INDEX / UV_INDEX_URL / PIP_INDEX_URL
-# 2) LELAB_INDEX=off 强制官方源，LELAB_INDEX=<url> 自定义
+# 2) LEFORGE_INDEX=off 强制官方源，LEFORGE_INDEX=<url> 自定义
 # 3) 否则实测清华与官方的下载吞吐，谁快用谁
 pick_index() {
     local cn="$MIRROR" off="https://pypi.org/simple"
-    if [[ -n "${LELAB_INDEX:-}" ]]; then
-        case "$LELAB_INDEX" in
+    if [[ -n "${LEFORGE_INDEX:-}" ]]; then
+        case "$LEFORGE_INDEX" in
             off|pypi|official) echo "$off" ;;
-            *) echo "$LELAB_INDEX" ;;
+            *) echo "$LEFORGE_INDEX" ;;
         esac
         return
     fi
@@ -169,7 +169,7 @@ pick_index() {
     pick_fast pyarrow "$cn" "$off"
 }
 export UV_INDEX_URL="$(pick_index)"
-info "包索引: $UV_INDEX_URL（VPN 下嫌国内源慢可设 LELAB_INDEX=off 重跑）"
+info "包索引: $UV_INDEX_URL（VPN 下嫌国内源慢可设 LEFORGE_INDEX=off 重跑）"
 
 # ---------- Hugging Face 端点 ----------
 # 国内直连 huggingface.co 常年超时，社区通行做法是设 HF_ENDPOINT 指向 hf-mirror.com。
@@ -180,10 +180,10 @@ info "包索引: $UV_INDEX_URL（VPN 下嫌国内源慢可设 LELAB_INDEX=off �
 HF_OFFICIAL="https://huggingface.co"
 HF_MIRROR="https://hf-mirror.com"
 pick_hf_endpoint() {
-    if [[ -n "${LELAB_HF_ENDPOINT:-}" ]]; then
-        case "$LELAB_HF_ENDPOINT" in
+    if [[ -n "${LEFORGE_HF_ENDPOINT:-}" ]]; then
+        case "$LEFORGE_HF_ENDPOINT" in
             off|hf|official) echo "$HF_OFFICIAL" ;;
-            *) echo "$LELAB_HF_ENDPOINT" ;;
+            *) echo "$LEFORGE_HF_ENDPOINT" ;;
         esac
         return
     fi
@@ -223,11 +223,11 @@ command -v conda &>/dev/null && { eval "$(conda shell.bash hook 2>/dev/null)" 2>
 
 # ---------- 定位仓库：升级 = 重跑本命令，任意目录都能找回已有克隆 ----------
 # 查找顺序（找到就复用并拉最新，找不到才新克隆）：
-# 1) 直接在仓库里跑 bash install.sh —— 脚本旁有 lelab/ 与 lerobot/
-# 2) 上次安装写进 ~/.local/bin/lelab 启动器里的路径（在哪个目录重跑都找得回）
-# 3) 常见位置 $HOME/LeLabPro、$PWD/LeLabPro
-# 新克隆统一放 $HOME/LeLabPro，避免在不同目录重跑时克隆出多份。
-is_repo() { [[ -d "$1/lelab" && -d "$1/lerobot" ]]; }
+# 1) 直接在仓库里跑 bash install.sh —— 脚本旁有 leforge/ 与 lerobot/
+# 2) 上次安装写进 ~/.local/bin/leforge 启动器里的路径（在哪个目录重跑都找得回）
+# 3) 常见位置 $HOME/LeForge、$PWD/LeForge
+# 新克隆统一放 $HOME/LeForge，避免在不同目录重跑时克隆出多份。
+is_repo() { [[ -d "$1/leforge" && -d "$1/lerobot" ]]; }
 
 pull_repo() {   # pull_repo <目录>：ff-only 拉最新；直连不通换 gh-proxy，都失败沿用当前版本
     local dir="$1" branch
@@ -242,7 +242,7 @@ pull_repo() {   # pull_repo <目录>：ff-only 拉最新；直连不通换 gh-pr
         return 0
     fi
     note "  直连 GitHub 拉取失败，改用镜像加速重试"
-    if git -C "$dir" pull --ff-only -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$branch" 2>/dev/null; then
+    if git -C "$dir" pull --ff-only -q "$GH_PROXY/https://github.com/cz11001100/LeForge.git" "$branch" 2>/dev/null; then
         info "已更新到最新版本（镜像加速）: $dir"
     else
         warn "pull 失败，沿用当前版本（不影响启动）"
@@ -255,12 +255,12 @@ if [[ -n "$SCRIPT_PATH" && -f "$SCRIPT_PATH" ]]; then
     CAND="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
     is_repo "$CAND" && ROOT="$CAND"
 fi
-if [[ -z "$ROOT" && -f "$HOME/.local/bin/lelab" ]]; then
-    CAND=$(sed -n 's#^exec "\(.*\)/lelab-run\.sh".*#\1#p' "$HOME/.local/bin/lelab" 2>/dev/null | head -1)
+if [[ -z "$ROOT" && -f "$HOME/.local/bin/leforge" ]]; then
+    CAND=$(sed -n 's#^exec "\(.*\)/leforge-run\.sh".*#\1#p' "$HOME/.local/bin/leforge" 2>/dev/null | head -1)
     [[ -n "$CAND" ]] && is_repo "$CAND" && ROOT="$CAND"
 fi
 if [[ -z "$ROOT" ]]; then
-    for CAND in "$HOME/LeLabPro" "$PWD/LeLabPro"; do
+    for CAND in "$HOME/LeForge" "$PWD/LeForge"; do
         if is_repo "$CAND"; then ROOT="$CAND"; break; fi
     done
 fi
@@ -270,7 +270,7 @@ if [[ -n "$ROOT" ]]; then
     FAILED_STEP="更新仓库"
     pull_repo "$ROOT"
 else
-    ROOT="$HOME/LeLabPro"
+    ROOT="$HOME/LeForge"
     FAILED_STEP="克隆仓库"
     command -v git &>/dev/null || die "需要 git，请先安装：sudo apt install git"
     info "克隆 $REPO_URL 到 $ROOT"
@@ -278,7 +278,7 @@ else
     if ! git clone --depth 1 -q "$REPO_URL" "$ROOT" 2>/dev/null; then
         rm -rf "$ROOT"
         info "  直连 GitHub 失败，改用镜像加速重试"
-        git clone --depth 1 -q "$GH_PROXY/https://github.com/cz11001100/LeLabPro.git" "$ROOT" \
+        git clone --depth 1 -q "$GH_PROXY/https://github.com/cz11001100/LeForge.git" "$ROOT" \
             || die "克隆失败：直连与 $GH_PROXY 都不通。换个网络，或手动 git clone 后在该目录里跑 bash install.sh"
     fi
 fi
@@ -330,7 +330,7 @@ AVAIL=$(df -BG --output=avail "$ROOT" 2>/dev/null | tail -1 | tr -dc '0-9' || ec
 ls /dev/ttyUSB* /dev/ttyACM* &>/dev/null || warn "  没看到 /dev/ttyUSB* 或 /dev/ttyACM* —— 机械臂没插或未被识别"
 id -nG 2>/dev/null | grep -qw dialout || warn "  当前用户不在 dialout 组，连机械臂会 Permission denied
       修复: sudo usermod -aG dialout \$USER  然后注销重新登录"
-command -v ss &>/dev/null && ss -ltn 2>/dev/null | grep -q ':8000 ' && warn "  端口 8000 已被占用，启动会失败（先 ./lelab-run.sh --stop）"
+command -v ss &>/dev/null && ss -ltn 2>/dev/null | grep -q ':8000 ' && warn "  端口 8000 已被占用，启动会失败（先 ./leforge-run.sh --stop）"
 
 # ---------- 虚拟环境 ----------
 FAILED_STEP="步骤2 创建虚拟环境"
@@ -372,7 +372,7 @@ if [[ "$PROFILE" == lite ]]; then
         # 反而正常；所以下轮子前先拿真 wheel 比一次吞吐，除非用户显式指定了索引。
         # 探测限定 2.7.x —— 要跟 pyproject 里的 torch 区间一致，否则镜像上还没有的
         # 新版本会让两边都测不出，白退回默认值
-        if [[ -z "${LELAB_TORCH_INDEX:-}" ]]; then
+        if [[ -z "${LEFORGE_TORCH_INDEX:-}" ]]; then
             info "实测 CPU torch 索引下载吞吐（各拉 4MB）..."
             TORCH_INDEX=$(pick_fast "torch:2.7." "$TORCH_INDEX" "https://mirror.sjtu.edu.cn/pytorch-wheels/cpu")
         fi
@@ -386,7 +386,7 @@ elif [[ "$PROFILE" == full && "$(uname -s)" == Linux ]]; then
     # PyPI/镜像上的 torch==2.7.1 默认带 cu126，只编译到 sm_90；RTX 50 系（sm_120）
     # 跑任何 CUDA kernel 都报 "no kernel image is available"，必须从 cu128 索引装。
     # 钉死 +cu128 本地段：只写版本区间时，uv 见到已装的 2.7.1+cu126 会认为已满足而跳过。
-    if [[ -z "${LELAB_TORCH_INDEX:-}" ]]; then
+    if [[ -z "${LEFORGE_TORCH_INDEX:-}" ]]; then
         info "实测 CUDA torch 索引下载吞吐（各拉 4MB）..."
         TORCH_CUDA_INDEX=$(pick_fast "torch:2.7." "$TORCH_CUDA_INDEX" "https://mirror.sjtu.edu.cn/pytorch-wheels/cu128")
     fi
@@ -449,14 +449,14 @@ else
     warn "  跳过 pyrealsense2 —— 只有 RealSense 深度相机需要，普通 USB 摄像头不受影响"
 fi
 
-# ---------- lelab ----------
-FAILED_STEP="步骤5 安装 LeLab"
-info "安装 LeLab 依赖..."
+# ---------- leforge ----------
+FAILED_STEP="步骤5 安装 LeForge"
+info "安装 LeForge 依赖..."
 uv pip install --python "$VENV_PY" \
     "fastapi[standard]>=0.115.12" "websockets>=15.0.1" "uvicorn>=0.24.0" \
     "psutil>=5.9.0" "paramiko>=3.4.0"
-info "安装 LeLab..."
-uv pip install --python "$VENV_PY" --no-deps -e "$ROOT/lelab"
+info "安装 LeForge..."
+uv pip install --python "$VENV_PY" --no-deps -e "$ROOT/leforge"
 
 # ---------- 仿真评测依赖（MuJoCo 闭环评估）----------
 FAILED_STEP="步骤5c 仿真评测依赖（MuJoCo）"
@@ -467,7 +467,7 @@ uv pip install --python "$VENV_PY" \
 # ---------- 修复 torchcodec 缺 FFmpeg 共享库 ----------
 FAILED_STEP="步骤5b torchcodec 的 FFmpeg 共享库"
 info "检查 torchcodec 能否加载 FFmpeg 共享库..."
-if "$VENV_PY" -m lelab.utils.ffmpeg_shim --ensure 2>&1 | tail -2 | sed 's/^/  /'; then
+if "$VENV_PY" -m leforge.utils.ffmpeg_shim --ensure 2>&1 | tail -2 | sed 's/^/  /'; then
     :
 else
     warn "  未能自动修复 —— 视频解码会退回 pyav，训练/回放仍可用"
@@ -477,15 +477,15 @@ fi
 
 # ---------- 启动脚本 ----------
 FAILED_STEP="生成启动脚本"
-# 仓库自带 lelab-run.sh；只有从别处（如旧 tarball）安装、缺少该文件时才生成。
+# 仓库自带 leforge-run.sh；只有从别处（如旧 tarball）安装、缺少该文件时才生成。
 # 无条件覆盖会让"升级"这一步把受版本控制的文件改脏，而且生成内容一旦与仓库版本
 # 不同，升级后启动器就指向了错误的虚拟环境。
-if [[ ! -f "$ROOT/lelab-run.sh" ]]; then
-    cat > "$ROOT/lelab-run.sh" << 'WRAPPER'
+if [[ ! -f "$ROOT/leforge-run.sh" ]]; then
+    cat > "$ROOT/leforge-run.sh" << 'WRAPPER'
 #!/usr/bin/env bash
-# 启动 LeLab（代码与环境均来自本仓库）
+# 启动 LeForge（代码与环境均来自本仓库）
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="$DIR/../LeLabPro_venv"; [[ -d "$VENV" ]] || VENV="$DIR/venv"
+VENV="$DIR/../LeForge_venv"; [[ -d "$VENV" ]] || VENV="$DIR/venv"
 [[ -d "$VENV" ]] || VENV="$DIR/lerobot-env"
 [[ -d "$VENV" ]] || { echo "[ERROR] 未找到环境，先跑 install.sh"; exit 1; }
 
@@ -493,16 +493,16 @@ if [[ -n "${CONDA_DEFAULT_ENV:-}" ]]; then conda deactivate 2>/dev/null || true;
 
 # torchcodec 在 import 前就要看到 FFmpeg 的 soname，运行时改 LD_LIBRARY_PATH 无效，
 # 所以在这里注入 install.sh 按需建好的 shim（没有系统 FFmpeg 时由 PyAV 自带库提供）。
-SHIM="$("$VENV/bin/python" -c 'from lelab.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
+SHIM="$("$VENV/bin/python" -c 'from leforge.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
 if [[ -n "${SHIM:-}" && -d "$SHIM" ]]; then
     export LD_LIBRARY_PATH="$SHIM${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 fi
 
 source "$VENV/bin/activate"
-exec lelab "$@"
+exec leforge "$@"
 WRAPPER
 fi
-chmod +x "$ROOT/lelab-run.sh"
+chmod +x "$ROOT/leforge-run.sh"
 
 # ---------- 自检 ----------
 FAILED_STEP="步骤6 安装自检"
@@ -521,7 +521,7 @@ check "paramiko（SSH 远程训练/装环境）" "import paramiko"
 check "lerobot 采集与数据集模块"        "from lerobot.scripts.lerobot_record import DatasetRecordConfig; from lerobot.datasets.lerobot_dataset import LeRobotDataset"
 check "SO-101 机械臂配置"              "from lerobot.robots.so_follower import SO101FollowerConfig"
 check "rewards（RA-BC 打分）"          "from lerobot.rewards.robometer import compute_rabc_weights"
-check "LeLab 后端（启动入口）"          "import lelab.server"
+check "LeForge 后端（启动入口）"          "import leforge.server"
 check "MuJoCo 仿真评测"                "import mujoco, gymnasium"
 if MUJOCO_GL=egl "$VENV_PY" - <<'PY' >/dev/null 2>&1
 import mujoco
@@ -558,26 +558,26 @@ else
     warn "  [!] torchcodec 不可用 —— 视频解码退回 pyav，功能不受影响但更慢"
 fi
 
-# ---------- 全局 lelab 命令 ----------
-FAILED_STEP="配置全局 lelab 命令"
+# ---------- 全局 leforge 命令 ----------
+FAILED_STEP="配置全局 leforge 命令"
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
-if [[ -e "$BIN_DIR/lelab" ]] && ! grep -q "LeLabPro" "$BIN_DIR/lelab" 2>/dev/null; then
-    BAK="$BIN_DIR/lelab.bak.$(date +%Y%m%d-%H%M%S)"
-    mv "$BIN_DIR/lelab" "$BAK"
-    warn "已备份原有的 $BIN_DIR/lelab → $(basename "$BAK")"
+if [[ -e "$BIN_DIR/leforge" ]] && ! grep -q "LeForge" "$BIN_DIR/leforge" 2>/dev/null; then
+    BAK="$BIN_DIR/leforge.bak.$(date +%Y%m%d-%H%M%S)"
+    mv "$BIN_DIR/leforge" "$BAK"
+    warn "已备份原有的 $BIN_DIR/leforge → $(basename "$BAK")"
 fi
 # 脚本/非交互场景用：直接转发到启动器（启动器内含 conda 退出与 FFmpeg 路径注入）
-cat > "$BIN_DIR/lelab" << WRAPPER
+cat > "$BIN_DIR/leforge" << WRAPPER
 #!/usr/bin/env bash
-# 由 LeLabPro install.sh 生成
+# 由 LeForge install.sh 生成
 export HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_DISABLE_XET="$HF_DISABLE_XET" HF_HUB_DOWNLOAD_TIMEOUT="$HF_DL_TIMEOUT"
-exec "$ROOT/lelab-run.sh" "\$@"
+exec "$ROOT/leforge-run.sh" "\$@"
 WRAPPER
-chmod +x "$BIN_DIR/lelab"
+chmod +x "$BIN_DIR/leforge"
 
 # 交互场景用 shell 函数：能真正把激活态留在当前 shell，方便接着调试。
-# 注意函数里不能调用 lelab-run.sh —— 它结尾是 exec，会把当前 shell 顶掉。
+# 注意函数里不能调用 leforge-run.sh —— 它结尾是 exec，会把当前 shell 顶掉。
 BASHRC="$HOME/.bashrc"
 if [[ ! -f "$BASHRC" ]]; then
     # 精简的系统/容器里可能没有 .bashrc；先建空文件，否则函数会被静默跳过
@@ -585,30 +585,30 @@ if [[ ! -f "$BASHRC" ]]; then
 else
     cp "$BASHRC" "$BASHRC.bak.$(date +%Y%m%d-%H%M%S)"
 fi
-sed -i '/^# >>> LeLabPro/,/^# <<< LeLabPro/d' "$BASHRC"
+sed -i '/^# >>> LeForge/,/^# <<< LeForge/d' "$BASHRC"
     cat >> "$BASHRC" << BLOCK
 
-# >>> LeLabPro (install.sh) >>>
-# 输入 lelab 自动准备环境：退出 conda → 激活虚拟环境 → 注入 FFmpeg 路径 → 启动。
+# >>> LeForge (install.sh) >>>
+# 输入 leforge 自动准备环境：退出 conda → 激活虚拟环境 → 注入 FFmpeg 路径 → 启动。
 case ":\$PATH:" in *":\$HOME/.local/bin:"*) ;; *) export PATH="\$HOME/.local/bin:\$PATH" ;; esac
-lelab() {
+leforge() {
     local root="$ROOT" venv=""
-    for cand in "\$root/lerobot-env" "\$root/venv" "\$root/../LeLabPro_venv"; do
+    for cand in "\$root/lerobot-env" "\$root/venv" "\$root/../LeForge_venv"; do
         [[ -d "\$cand" ]] && { venv="\$cand"; break; }
     done
-    [[ -n "\$venv" ]] || { echo "[lelab] 未找到环境，先执行: cd \$root && bash install.sh" >&2; return 1; }
+    [[ -n "\$venv" ]] || { echo "[leforge] 未找到环境，先执行: cd \$root && bash install.sh" >&2; return 1; }
     [[ -n "\${CONDA_DEFAULT_ENV:-}" ]] && conda deactivate 2>/dev/null
     source "\$venv/bin/activate"
     # 模型与数据集下载端点：装的时候实测选定的。Xet 传输无视 HF_ENDPOINT，走镜像必须关
     export HF_ENDPOINT="$HF_ENDPOINT" HF_HUB_DISABLE_XET="$HF_DISABLE_XET" HF_HUB_DOWNLOAD_TIMEOUT="$HF_DL_TIMEOUT"
     local shim
-    shim="\$("\$venv/bin/python" -c 'from lelab.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
+    shim="\$("\$venv/bin/python" -c 'from leforge.utils.ffmpeg_shim import loader_path; print(loader_path())' 2>/dev/null)"
     [[ -n "\$shim" && -d "\$shim" ]] && export LD_LIBRARY_PATH="\$shim\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-    "\$venv/bin/lelab" "\$@"
+    "\$venv/bin/leforge" "\$@"
 }
-# <<< LeLabPro (install.sh) <<<
+# <<< LeForge (install.sh) <<<
 BLOCK
-info "已在 $BASHRC 配置 lelab 函数（原文件已备份）"
+info "已在 $BASHRC 配置 leforge 函数（原文件已备份）"
 
 # ---------- 收尾 ----------
 echo ""
@@ -625,13 +625,13 @@ if [[ "$PROFILE" == lite ]]; then
     echo ""
 fi
 step "启动"
-echo "  lelab                      （新开终端生效；当前终端可先 source ~/.bashrc）"
-echo "  $ROOT/lelab-run.sh   （等价写法）"
+echo "  leforge                      （新开终端生效；当前终端可先 source ~/.bashrc）"
+echo "  $ROOT/leforge-run.sh   （等价写法）"
 echo "  浏览器打开 http://localhost:8000"
 echo ""
 step "常用参数"
-echo "  lelab --stop      清理残留进程（端口被占时用）"
-echo "  lelab --no-open   不自动开浏览器"
+echo "  leforge --stop      清理残留进程（端口被占时用）"
+echo "  leforge --no-open   不自动开浏览器"
 echo ""
 step "环境出问题时"
 echo "  rm -rf $VENV && bash install.sh    # 重建环境"

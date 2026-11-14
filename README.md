@@ -1,29 +1,29 @@
-# LeLabPro
+# LeForge
 
-SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥操作、数据采集、训练、评估、部署全流程在浏览器里完成。单仓库同时包含界面（`lelab/`）与打过补丁的框架（`lerobot/`）。
+SO-100 / SO-101 机械臂的 LeRobot 一体化 Web 工作台 —— 标定、遥操作、数据采集、训练、评估、部署全流程在浏览器里完成。单仓库同时包含界面（`leforge/`）与打过补丁的框架（`lerobot/`）。
 
 **安装**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash
 ```
 
 **最小安装**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash -s -- --lite
 ```
 
 **升级**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash        # 轻量档加 -s -- --lite
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash        # 轻量档加 -s -- --lite
 ```
 
 **启动**
 
 ```bash
-lelab
+leforge
 ```
 
 浏览器打开 http://localhost:8000。
@@ -69,14 +69,14 @@ lelab
 - 修复 包索引选择改用实测下载吞吐（原先按索引页延迟选，方向经常是反的）
 - 修复 没有独显的机器也在下 2.7GB CUDA 库导致安装普遍超时 —— 档位改为按 GPU 自动选择，无 GPU 自动走 CPU 版 torch
 - 修复 uv 引导、Python 解释器下载、仓库克隆三处只认 GitHub/Cloudflare 直连 —— 各加一条镜像加速回退
-- 新增 Windows 11 一键安装 `install.ps1`（PowerShell 一条命令，装完直接 `lelab`）
+- 新增 Windows 11 一键安装 `install.ps1`（PowerShell 一条命令，装完直接 `leforge`）
 - 新增 轻量安装档 `bash install.sh --lite`：torch 装 CPU 版，环境从约 6.5GB 降到 2.2GB，适合只做采集、训练放云端的轻薄本
 - 修复 排查表里的虚拟环境路径仍写着旧目录名（`lerobot/` → `lerobot-env/`），照抄会报找不到文件
 
 **2026-10-27**
 - 新增 部署与推理页「结束本回合」：收尾当前试次并自动进入下一回合
-- 新增 装完即用的全局 `lelab` 命令（自动准备环境并启动）
-- 新增 安装时自动挑快的包索引（开 VPN 时国内源变慢可用 `LELAB_INDEX=off` 切官方源）
+- 新增 装完即用的全局 `leforge` 命令（自动准备环境并启动）
+- 新增 安装时自动挑快的包索引（开 VPN 时国内源变慢可用 `LEFORGE_INDEX=off` 切官方源）
 - 修复 SARM / RA-BC 训练参数节点错误（`--policy.*` → `--reward_model.*`、`sample_weighting` 层级），训练可正常启动
 - 修复 一键升级在 monorepo 布局与 Python 3.14 下失败
 - 修复 SSH 远端装环境的权限探测、连接心跳与依赖下载超时

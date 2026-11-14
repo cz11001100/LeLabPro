@@ -5,7 +5,7 @@
 # 所以这个错误在装完自检里是查不出来的。
 #
 # 必须入库、不要加宽泛规则的路径：
-#   lelab/frontend/dist/   预构建前端，一条命令安装依赖它
+#   leforge/frontend/dist/   预构建前端，一条命令安装依赖它
 #   lerobot/               打过补丁的框架源码（含 lerobot/src/lerobot/datasets/）
 #   *.stl                  3D 网格，以普通 Git 对象存放（不用 LFS）
 

@@ -1,0 +1,337 @@
+# Copyright 2025 The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Tests for the GitHub update-notifier module."""
+
+from __future__ import annotations
+
+import json
+import types
+
+import pytest
+
+from leforge import update
+
+
+@pytest.fixture(autouse=True)
+def _clear_cache():
+    """Each test starts with a cold update cache."""
+    update._cache = None
+    update._cache_time = 0.0
+    yield
+    update._cache = None
+    update._cache_time = 0.0
+
+
+@pytest.mark.parametrize(
+    "url,expected",
+    [
+        ("https://github.com/huggingface/LeForge.git", ("huggingface", "LeForge")),
+        ("https://github.com/huggingface/LeForge", ("huggingface", "LeForge")),
+        ("git+https://github.com/huggingface/LeForge.git", ("huggingface", "LeForge")),
+        ("git@github.com:huggingface/LeForge.git", ("huggingface", "LeForge")),
+        ("https://gitlab.com/foo/bar.git", None),
+        ("file:///home/me/LeForge", None),
+        ("", None),
+    ],
+)
+def test_parse_github_repo(url, expected):
+    assert update._parse_github_repo(url) == expected
+
+
+def _fake_dist(direct_url: dict | None):
+    class _Dist:
+        def read_text(self, name):
+            if name != "direct_url.json" or direct_url is None:
+                return None
+            return json.dumps(direct_url)
+
+    return _Dist()
+
+
+def test_installed_source_from_vcs(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "distribution",
+        lambda name: _fake_dist(
+            {
+                "url": "https://github.com/huggingface/LeForge.git",
+                "vcs_info": {"vcs": "git", "commit_id": "abc123"},
+            }
+        ),
+    )
+    src = update.get_installed_source()
+    assert src == {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"}
+
+
+def test_installed_source_editable_returns_none(monkeypatch):
+    """Editable / local installs have no commit_id — no nagging developers."""
+    monkeypatch.setattr(
+        update,
+        "distribution",
+        lambda name: _fake_dist({"url": "file:///home/me/LeForge", "dir_info": {"editable": True}}),
+    )
+    assert update.get_installed_source() is None
+
+
+def test_installed_source_no_direct_url_returns_none(monkeypatch):
+    monkeypatch.setattr(update, "distribution", lambda name: _fake_dist(None))
+    assert update.get_installed_source() is None
+
+
+def test_check_no_source_means_no_update(monkeypatch):
+    monkeypatch.setattr(update, "get_installed_source", lambda: None)
+    status = update.check_for_update()
+    assert status["update_available"] is False
+    assert status["current_commit"] is None
+
+
+def test_check_up_to_date(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+    monkeypatch.setattr(update, "_github_json", lambda path: {"sha": "abc123"})
+    status = update.check_for_update()
+    assert status["update_available"] is False
+    assert status["latest_commit"] == "abc123"
+    assert status["commits_behind"] == 0
+
+
+def test_check_update_available(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+
+    def fake_github(path: str):
+        if path.endswith("/commits/HEAD"):
+            return {"sha": "def456"}
+        if "/compare/" in path:
+            return {
+                "status": "ahead",
+                "ahead_by": 7,
+                "html_url": "https://github.com/huggingface/LeForge/compare/abc123...def456",
+            }
+        return None
+
+    monkeypatch.setattr(update, "_github_json", fake_github)
+    status = update.check_for_update()
+    assert status["update_available"] is True
+    assert status["latest_commit"] == "def456"
+    assert status["commits_behind"] == 7
+    assert status["compare_url"].endswith("abc123...def456")
+    assert "git+https://github.com/huggingface/LeForge.git" in status["update_command"]
+    assert status["can_auto_update"] is True
+
+
+def test_check_diverged_does_not_nag(monkeypatch):
+    """A rewritten/force-pushed default branch reads as 'diverged'. Offering an
+    in-place --force reinstall there would silently discard the local commits,
+    so we must not flag an update."""
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+
+    def fake_github(path: str):
+        if path.endswith("/commits/HEAD"):
+            return {"sha": "def456"}
+        if "/compare/" in path:
+            return {"status": "diverged", "ahead_by": 3, "behind_by": 2}
+        return None
+
+    monkeypatch.setattr(update, "_github_json", fake_github)
+    status = update.check_for_update()
+    assert status["update_available"] is False
+
+
+def test_check_install_ahead_of_remote_does_not_nag(monkeypatch):
+    """If the installed commit is ahead of the default branch, compare reports
+    'behind' (head=latest is behind base=installed). There is nothing to update
+    to, so stay silent."""
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+
+    def fake_github(path: str):
+        if path.endswith("/commits/HEAD"):
+            return {"sha": "def456"}
+        if "/compare/" in path:
+            return {"status": "behind", "ahead_by": 0, "behind_by": 5}
+        return None
+
+    monkeypatch.setattr(update, "_github_json", fake_github)
+    status = update.check_for_update()
+    assert status["update_available"] is False
+
+
+def test_check_compare_unavailable_does_not_nag(monkeypatch):
+    """HEAD differs but the compare call fails (e.g. the installed commit is no
+    longer in the repo). Without proof the install is behind, stay silent."""
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+
+    def fake_github(path: str):
+        if path.endswith("/commits/HEAD"):
+            return {"sha": "def456"}
+        return None  # compare unreachable
+
+    monkeypatch.setattr(update, "_github_json", fake_github)
+    status = update.check_for_update()
+    assert status["update_available"] is False
+
+
+def test_check_github_unreachable_is_silent(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {"commit": "abc123", "owner": "huggingface", "repo": "LeForge"},
+    )
+    monkeypatch.setattr(update, "_github_json", lambda path: None)
+    status = update.check_for_update()
+    assert status["update_available"] is False
+
+
+def test_run_update_no_source(monkeypatch):
+    monkeypatch.setattr(update, "get_installed_source", lambda: None)
+    result = update.handle_run_update()
+    assert result.success is False
+
+
+def test_update_command_for_uv_tool_install(monkeypatch):
+    """Standard `uv tool install` setup updates the tool in place with --force."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    cmd = update._build_update_cmd("huggingface", "LeForge")
+    assert cmd == [
+        "uv",
+        "tool",
+        "install",
+        "--force",
+        "--python",
+        "3.12",
+        "git+https://github.com/huggingface/LeForge.git",
+    ]
+
+
+def test_update_command_for_pip_env(monkeypatch):
+    """A plain pip environment (no uv) updates via `python -m pip`."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: None)
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
+    cmd = update._build_update_cmd("huggingface", "LeForge")
+    assert cmd[:4] == [update.sys.executable, "-m", "pip", "install"]
+    assert "--force-reinstall" in cmd
+
+
+# ---- monorepo: the installable package lives in a subdirectory ----
+
+MONOREPO_URL = "git+https://github.com/cz11001100/LeForge.git#subdirectory=leforge"
+
+
+def test_parse_github_repo_strips_subdirectory_fragment():
+    """Without stripping, the repo comes back as "LeForge.git#subdirectory=leforge"."""
+    assert update._parse_github_repo(MONOREPO_URL) == ("cz11001100", "LeForge")
+
+
+def test_parse_github_subdirectory():
+    assert update._parse_github_subdirectory(MONOREPO_URL) == "leforge"
+    assert update._parse_github_subdirectory("https://github.com/a/b.git") is None
+    assert update._parse_github_subdirectory("") is None
+
+
+def test_installed_source_keeps_subdirectory(monkeypatch):
+    monkeypatch.setattr(
+        update,
+        "distribution",
+        lambda name: _fake_dist(
+            {"url": MONOREPO_URL, "vcs_info": {"vcs": "git", "commit_id": "abc123"}}
+        ),
+    )
+    assert update.get_installed_source() == {
+        "commit": "abc123",
+        "owner": "cz11001100",
+        "repo": "LeForge",
+        "subdirectory": "leforge",
+    }
+
+
+def test_update_command_keeps_fragment_out_of_repo_name(monkeypatch):
+    """Regression: ".git" used to be appended *after* the fragment, producing
+    the non-existent subdirectory "leforge.git" and a failed upgrade."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
+    cmd = update._build_update_cmd("cz11001100", "LeForge", "leforge")
+    assert cmd[-1] == "git+https://github.com/cz11001100/LeForge.git#subdirectory=leforge"
+
+
+def test_uv_tool_update_command_keeps_fragment(monkeypatch):
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    cmd = update._build_update_cmd("cz11001100", "LeForge", "leforge")
+    assert cmd == ["uv", "tool", "install", "--force", "--python", "3.12",
+                   "git+https://github.com/cz11001100/LeForge.git#subdirectory=leforge"]
+
+
+def test_single_repo_install_unaffected(monkeypatch):
+    """Upstream's flat layout must keep working with no fragment at all."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: False)
+    cmd = update._build_update_cmd("huggingface", "LeForge")
+    assert cmd[-1] == "git+https://github.com/huggingface/LeForge.git"
+
+
+def test_run_update_passes_subdirectory_to_the_real_command(monkeypatch):
+    """The displayed command and the executed one are built separately — both
+    must carry the fragment, or the button still runs the broken URL."""
+    monkeypatch.setattr(
+        update,
+        "get_installed_source",
+        lambda: {
+            "commit": "abc123",
+            "owner": "cz11001100",
+            "repo": "LeForge",
+            "subdirectory": "leforge",
+        },
+    )
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    captured = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(update.subprocess, "run", fake_run)
+    result = update.handle_run_update()
+    assert result.success is True
+    assert captured["cmd"][-1] == (
+        "git+https://github.com/cz11001100/LeForge.git#subdirectory=leforge"
+    )
+
+
+def test_uv_tool_update_pins_python_312(monkeypatch):
+    """Without the pin, uv resolves the machine default (often 3.14) and the
+    upgrade fails on torch having no cp314 wheels."""
+    monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
+    monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    cmd = update._build_update_cmd("cz11001100", "LeForge", "leforge")
+    assert cmd[cmd.index("--python") + 1] == "3.12"

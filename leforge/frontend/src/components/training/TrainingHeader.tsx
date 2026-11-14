@@ -1,0 +1,27 @@
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { Button } from '@/components/ui/button';
+import { ArrowLeft } from 'lucide-react';
+import Logo from '@/components/Logo';
+
+const TrainingHeader: React.FC = () => {
+  const navigate = useNavigate();
+  return (
+    <div className="flex items-center justify-between mb-8">
+      <div className="flex items-center gap-4 text-3xl">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={() => navigate('/')}
+          className="text-slate-600 hover:bg-sky-200 hover:text-slate-900 rounded-lg"
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </Button>
+        <Logo />
+        <h1 className="font-bold text-slate-900 text-2xl">Training</h1>
+      </div>
+    </div>
+  );
+};
+
+export default TrainingHeader;

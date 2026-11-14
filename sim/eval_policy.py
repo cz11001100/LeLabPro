@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 """Closed-loop policy evaluation in the SO-101 tabletop MuJoCo scene.
 
-Run with the LeLab Python environment (it has torch/lerobot):
+Run with the LeForge Python environment (it has torch/lerobot):
 
     cd <仓库根>/sim
     MUJOCO_GL=egl <仓库根>/lerobot-env/bin/python \

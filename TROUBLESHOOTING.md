@@ -1,30 +1,30 @@
-# LeLab 常见问题排查
+# LeForge 常见问题排查
 
 ## 启动类
 
-### `lelab: command not found`
+### `leforge: command not found`
 
 **原因：conda 环境覆盖了 PATH。** venv 激活后再执行 `conda activate xxx`，conda 会重置 PATH，把 venv 的 `bin/` 挤掉。
 
 ```bash
 conda deactivate          # 退出所有 conda 环境
 source lerobot-env/bin/activate
-lelab
+leforge
 ```
 
 或直接用最省事的方式（脚本内部已处理 conda）：
 
 ```bash
-./lelab-run.sh
+./leforge-run.sh
 ```
 
 ### `Address already in use` / 端口 8000 被占用
 
-之前有 LeLab 进程没退干净。
+之前有 LeForge 进程没退干净。
 
 ```bash
-./lelab-run.sh --stop     # 杀掉占用 8000/8080 的残留进程
-./lelab-run.sh
+./leforge-run.sh --stop     # 杀掉占用 8000/8080 的残留进程
+./leforge-run.sh
 ```
 
 手动查占用：
@@ -35,12 +35,12 @@ ss -ltnp | grep 8000
 
 ### `ModuleNotFoundError: No module named 'lerobot.configs.dataset'`
 
-**原因：lelab 里 import 路径写错。** 旧版指向 `lerobot.configs.dataset`，但该类实际在 `lerobot.scripts.lerobot_record`。
+**原因：leforge 里 import 路径写错。** 旧版指向 `lerobot.configs.dataset`，但该类实际在 `lerobot.scripts.lerobot_record`。
 
 已在当前版本修复。若你手上是旧包，手动改：
 
 ```bash
-sed -i 's/from lerobot.configs.dataset import DatasetRecordConfig/from lerobot.scripts.lerobot_record import DatasetRecordConfig/' lelab/lelab/record.py
+sed -i 's/from lerobot.configs.dataset import DatasetRecordConfig/from lerobot.scripts.lerobot_record import DatasetRecordConfig/' leforge/leforge/record.py
 ```
 
 ### `ImportError: cannot import name 'LeRobotDataset' from 'lerobot.datasets'`
@@ -48,8 +48,8 @@ sed -i 's/from lerobot.configs.dataset import DatasetRecordConfig/from lerobot.s
 同样是 import 路径问题，实际在 `lerobot.datasets.lerobot_dataset`：
 
 ```bash
-sed -i 's/from lerobot\.datasets import LeRobotDataset/from lerobot.datasets.lerobot_dataset import LeRobotDataset/g' lelab/lelab/record.py
-sed -i 's/from lerobot\.datasets import CODEBASE_VERSION/from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION/' lelab/lelab/record.py
+sed -i 's/from lerobot\.datasets import LeRobotDataset/from lerobot.datasets.lerobot_dataset import LeRobotDataset/g' leforge/leforge/record.py
+sed -i 's/from lerobot\.datasets import CODEBASE_VERSION/from lerobot.datasets.lerobot_dataset import CODEBASE_VERSION/' leforge/leforge/record.py
 ```
 
 ### `ModuleNotFoundError: No module named 'paramiko'`
@@ -130,7 +130,7 @@ cat /sys/class/video4linux/video0/name
 # 在 ssh_remote_env.py 的 client.connect(**kw) 后面插入三行
 python3 - <<'PY'
 import re, pathlib
-p = pathlib.Path("lelab/lelab/ssh_remote_env.py")
+p = pathlib.Path("leforge/leforge/ssh_remote_env.py")
 s = p.read_text()
 if "set_keepalive" not in s:
     s = s.replace(
@@ -165,11 +165,11 @@ ClientAliveCountMax 10
    ```bash
    ssh -p 端口 用户名@主机
    ```
-   如果手动都不行，LeLab 也不行 —— 是网络/密钥/防火墙问题，不是 LeLab 的问题。
+   如果手动都不行，LeForge 也不行 —— 是网络/密钥/防火墙问题，不是 LeForge 的问题。
 
-2. **用密码还是密钥？** LeLab 两种都支持，但密码登录要在服务器端确认 `PasswordAuthentication yes`。
+2. **用密码还是密钥？** LeForge 两种都支持，但密码登录要在服务器端确认 `PasswordAuthentication yes`。
 
-3. **密钥路径**必须是服务器本机上的绝对路径（LeLab 跑在哪台机器，密钥就要在那台机器上）。
+3. **密钥路径**必须是服务器本机上的绝对路径（LeForge 跑在哪台机器，密钥就要在那台机器上）。
 
 4. **主机名不要带 `~`**，`~/.ssh/id_rsa` 这种路径脚本会展开，但界面里填的时候注意别写错。
 
@@ -193,10 +193,10 @@ uv pip install --python lerobot-env/bin/python --force-reinstall torch torchvisi
 模型权重与数据集从 HuggingFace 下载。`install.sh` 已经实测过官方站与 `hf-mirror.com` 的吞吐、谁快用谁，并把结果连同下面两个变量写进了启动配置，一般不用管。手动指定或临时切换：
 
 ```bash
-LELAB_HF_ENDPOINT=https://hf-mirror.com bash install.sh   # 装的时候就钉死镜像
+LEFORGE_HF_ENDPOINT=https://hf-mirror.com bash install.sh   # 装的时候就钉死镜像
 # 或临时一次：
 export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TIMEOUT=60
-./lelab-run.sh
+./leforge-run.sh
 ```
 
 **只设 `HF_ENDPOINT` 常常还是不生效**，两个原因：
@@ -215,7 +215,7 @@ export HF_ENDPOINT=https://hf-mirror.com HF_HUB_DISABLE_XET=1 HF_HUB_DOWNLOAD_TI
 用轻量档，别装 CUDA 版 torch：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/cz11001100/LeLabPro/main/install.sh | bash -s -- --lite
+curl -fsSL https://raw.githubusercontent.com/cz11001100/LeForge/main/install.sh | bash -s -- --lite
 ```
 
 差别只在 torch：默认档从 PyPI 装 CUDA 版，连带 `nvidia-*` 那一整套 CUDA 运行库；轻量档从 PyTorch 的 CPU 索引装同版本区间的 CPU 版。遥操、采集、回放、评估、SSH 云端训练都不受影响，同一套依赖组合下环境从 6.5GB 降到 2.2GB（本机实测）。
@@ -231,7 +231,7 @@ rm -rf lerobot-env && bash install.sh --lite
 CPU 索引默认是 `https://download.pytorch.org/whl/cpu`，国内嫌慢可以换上交大镜像：
 
 ```bash
-LELAB_TORCH_INDEX=https://mirror.sjtu.edu.cn/pytorch-wheels/cpu bash install.sh --lite
+LEFORGE_TORCH_INDEX=https://mirror.sjtu.edu.cn/pytorch-wheels/cpu bash install.sh --lite
 ```
 
 ### 想彻底重装
@@ -257,7 +257,7 @@ uv pip install --python lerobot-env/bin/python 包名
 du -sh ~/.local/share/uv/python       # 隔 20 秒看两次，数字在涨就正常
 ```
 
-嫌慢的话，脚本已经会自动处理一部分：它先测一次 GitHub 的响应时间，超过 3 秒就把解释器下载切到加速前缀（`LELAB_GH_PROXY` 可换前缀）。不想依赖这个判断，就手动二选一：
+嫌慢的话，脚本已经会自动处理一部分：它先测一次 GitHub 的响应时间，超过 3 秒就把解释器下载切到加速前缀（`LEFORGE_GH_PROXY` 可换前缀）。不想依赖这个判断，就手动二选一：
 
 ```bash
 # 1) 用系统自带的 3.12，uv 就不会下载
@@ -276,14 +276,14 @@ export UV_PYTHON_INSTALL_MIRROR=https://gh-proxy.com/https://github.com/astral-s
 所以脚本不写死，装的时候会各测一次索引页响应时间，谁快用谁，并打印选中的源：
 
 ```
-包索引: https://pypi.tuna.tsinghua.edu.cn/simple（VPN 下嫌国内源慢可设 LELAB_INDEX=off 重跑）
+包索引: https://pypi.tuna.tsinghua.edu.cn/simple（VPN 下嫌国内源慢可设 LEFORGE_INDEX=off 重跑）
 ```
 
 想手动指定，重跑前设一个环境变量即可：
 
 ```bash
-LELAB_INDEX=off bash install.sh    # 强制官方源
-LELAB_INDEX=https://mirrors.aliyun.com/pypi/simple bash install.sh   # 任意镜像
+LEFORGE_INDEX=off bash install.sh    # 强制官方源
+LEFORGE_INDEX=https://mirrors.aliyun.com/pypi/simple bash install.sh   # 任意镜像
 ```
 
 已经自己配好 `UV_INDEX_URL` / `UV_DEFAULT_INDEX` / `PIP_INDEX_URL` 的，脚本尊重你的设置，不再探测。
@@ -315,7 +315,7 @@ sudo apt install python3.12 python3.12-venv
 ```bash
 # 1. 自检结果
 source lerobot-env/bin/activate
-python -c "import lelab.server"
+python -c "import leforge.server"
 
 # 2. 环境与硬件
 uname -sm; python --version; nvidia-smi --query-gpu=name,driver_version --format=csv,noheader
@@ -339,17 +339,17 @@ FFmpeg version 6: libavutil.so.58: ...
 
 **原因**：torchcodec 按 7→6→5→4 顺序加载 `libtorchcodec_coreN.so`，每个都要求对应 FFmpeg 大版本的**普通 soname**（如 `libavcodec.so.61`）。新机器上没有系统 FFmpeg 就全失败。
 
-**已自动处理**：`install.sh` 会调用 `python -m lelab.utils.ffmpeg_shim --ensure`，把 **PyAV 自带的 FFmpeg 7**（`site-packages/av.libs/`）接上。做法是建一个 shim 目录，同时链两种名字 —— 普通 soname 给 torchcodec 用，hash 名（`libdrm-b0291a67.so.2.4.0`）给这批库互相引用用。`lelab-run.sh` 与 `lelab` 命令会在启动前把它注入 `LD_LIBRARY_PATH`（必须启动前设，运行时改无效）。
+**已自动处理**：`install.sh` 会调用 `python -m leforge.utils.ffmpeg_shim --ensure`，把 **PyAV 自带的 FFmpeg 7**（`site-packages/av.libs/`）接上。做法是建一个 shim 目录，同时链两种名字 —— 普通 soname 给 torchcodec 用，hash 名（`libdrm-b0291a67.so.2.4.0`）给这批库互相引用用。`leforge-run.sh` 与 `leforge` 命令会在启动前把它注入 `LD_LIBRARY_PATH`（必须启动前设，运行时改无效）。
 
 **手动处理**（三选一）：
 
 ```bash
 sudo apt install ffmpeg                     # 有 root 时最干净
 conda install -y -c conda-forge ffmpeg      # 无 root；需把 $CONDA_PREFIX/lib 加进 LD_LIBRARY_PATH
-python -m lelab.utils.ffmpeg_shim --ensure  # 无 root 无 conda，用 PyAV 自带的库
+python -m leforge.utils.ffmpeg_shim --ensure  # 无 root 无 conda，用 PyAV 自带的库
 ```
 
-**不修也能用**：`lelab.utils.video_backend` 会探测到 torchcodec 不可用并自动退回 **pyav** 解码，训练/回放照常，只是慢一些。
+**不修也能用**：`leforge.utils.video_backend` 会探测到 torchcodec 不可用并自动退回 **pyav** 解码，训练/回放照常，只是慢一些。
 
 **验证修好了**：
 
