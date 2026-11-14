@@ -12,6 +12,7 @@ export interface PolicyConfigSummary {
   image_features: Record<string, { height: number; width: number }>;
   requires_task: boolean;
   tasks?: string[];
+  temporal_ensemble?: boolean;
 }
 
 export interface ModelTrainingInfo {

@@ -1003,6 +1003,30 @@ export async function listSimEnvironments(
   return r.environments ?? [];
 }
 
+export async function createSimEnvironment(
+  baseUrl: string,
+  fetcher: Fetcher,
+  name: string,
+): Promise<SimEnvOption> {
+  return apiRequest(baseUrl, fetcher, "/sim-eval/environments/create", {
+    method: "POST",
+    body: { name },
+    action: "Create sim environment",
+  });
+}
+
+export async function openSimEnvironment(
+  baseUrl: string,
+  fetcher: Fetcher,
+  path: string,
+): Promise<{ launched: boolean; scene: string }> {
+  return apiRequest(baseUrl, fetcher, "/sim-eval/environments/open", {
+    method: "POST",
+    body: { path },
+    action: "Open sim environment",
+  });
+}
+
 export async function getJobSimEvalLogs(
   baseUrl: string,
   fetcher: Fetcher,

@@ -1689,11 +1689,19 @@ print(json.dumps(out))
         repo_id = record.config.dataset_repo_id
         if record.runner != "ssh" and (not repo_id or repo_id == "(imported)") and match.source == "local":
             repo_id = _read_train_config_dataset_repo_id(Path(match.ref))
+        supports_ensemble = False
+        try:
+            from .sim_eval import policy_supports_temporal_ensemble
+
+            supports_ensemble = policy_supports_temporal_ensemble(str(match.ref))
+        except Exception:
+            pass
         return {
             "policy_type": policy_type,
             "image_features": image_features,
             "requires_task": policy_type in _LANGUAGE_CONDITIONED_POLICY_TYPES,
             "tasks": _dataset_task_strings(repo_id),
+            "temporal_ensemble": supports_ensemble,
         }
 
     def get_model_info(self, job_id: str, step: int) -> dict[str, object]:

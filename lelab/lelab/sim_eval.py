@@ -29,6 +29,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -79,6 +80,63 @@ def available_environments() -> list[dict]:
             entries.append({"label": f"本地：{d.name}", "value": str(d), "kind": "local"})
     entries.append({"label": f"Hub：{DEFAULT_ENV_HUB}", "value": DEFAULT_ENV_HUB, "kind": "hub"})
     return entries
+
+
+_ENV_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{1,40}$")
+
+
+def create_local_environment(name: str) -> dict:
+    """Copy the builtin scene into sim/<name>/ so it can be edited and picked."""
+    name = (name or "").strip().lower()
+    if not _ENV_NAME_RE.fullmatch(name):
+        raise ValueError("场景名需为 2–41 位小写字母、数字、下划线或连字符（以字母/数字开头）")
+    builtin = builtin_scene_dir()
+    if builtin is None:
+        raise ValueError("内置场景缺失，无法复制")
+    target = builtin.parent / name
+    if target.exists():
+        raise ValueError(f"场景目录已存在：{target}")
+    shutil.copytree(
+        builtin,
+        target,
+        ignore=shutil.ignore_patterns(".cache", "__pycache__", "MUJOCO_LOG.TXT"),
+    )
+    return {"label": f"本地：{name}", "value": str(target), "kind": "local"}
+
+
+def open_scene_in_viewer(value: str | None) -> dict:
+    """Launch sim/view_sim.py (MuJoCo window) on a local scene of this repo."""
+    resolved = Path(resolve_env_path(value))
+    repo_root = Path(__file__).resolve().parents[2]
+    sim_root = (repo_root / "sim").resolve()
+    try:
+        resolved = resolved.resolve()
+        inside = sim_root in resolved.parents
+    except OSError:
+        inside = False
+    if not resolved.is_dir() or not inside or not (resolved / "env.py").is_file():
+        raise ValueError("只能打开本机 sim/ 下的场景目录（Hub 仓库请先在列表里选本机场景）")
+    xml = resolved / "so101_tabletop.xml"
+    if not xml.is_file():
+        candidates = sorted(resolved.glob("*.xml"))
+        if not candidates:
+            raise ValueError(f"场景目录里没有 XML：{resolved}")
+        xml = candidates[0]
+    env = os.environ.copy()
+    env["MUJOCO_GL"] = "glfw"
+    if "DISPLAY" not in env:
+        raise ValueError("当前 LeLab 进程没有图形显示（DISPLAY 未设置），无法打开 MuJoCo 窗口")
+    log = open(Path("/tmp/lelab-viewer.log"), "ab")
+    subprocess.Popen(
+        [sys.executable, str(repo_root / "sim" / "view_sim.py"), "--scene", str(xml)],
+        stdout=log,
+        stderr=subprocess.STDOUT,
+        env=env,
+        cwd=str(resolved),
+        start_new_session=True,
+    )
+    log.close()
+    return {"launched": True, "scene": str(xml)}
 
 
 def _policy_type(checkpoint_path: str) -> str:

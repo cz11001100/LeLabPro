@@ -15,9 +15,11 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import {
+  createSimEnvironment,
   getJobSimEval,
   getJobSimEvalLogs,
   listSimEnvironments,
+  openSimEnvironment,
   simEvalArtifactUrl,
   startJobSimEval,
   stopJobSimEval,
@@ -28,7 +30,7 @@ import {
   SimEvalResults,
   SimEvalState,
 } from "@/lib/jobsApi";
-import { JobCheckpoint, listJobCheckpoints } from "@/lib/checkpointsApi";
+import { getCheckpointPolicyConfig, JobCheckpoint, listJobCheckpoints } from "@/lib/checkpointsApi";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 import { ModelVariant } from "@/lib/modelGroups";
 
@@ -254,6 +256,11 @@ const SimEvalCard: React.FC<{
   const [ensemble, setEnsemble] = useState(saved.ensemble);
   const [envOptions, setEnvOptions] = useState<SimEnvOption[]>([]);
   const [showCustomEnv, setShowCustomEnv] = useState(false);
+  const [ensembleSupported, setEnsembleSupported] = useState<boolean | null>(null);
+  const [showNewEnv, setShowNewEnv] = useState(false);
+  const [newEnvName, setNewEnvName] = useState("");
+  const [creatingEnv, setCreatingEnv] = useState(false);
+  const [openingViewer, setOpeningViewer] = useState(false);
   const [state, setState] = useState<SimEvalState>(job.sim_eval_state ?? "none");
   const [results, setResults] = useState<SimEvalResults | null>(job.sim_eval_results ?? null);
   const [history, setHistory] = useState<SimEvalHistoryEntry[]>([]);
@@ -288,6 +295,20 @@ const SimEvalCard: React.FC<{
       .catch(() => {});
     return () => controller.abort();
   }, [baseUrl, fetchWithHeaders]);
+
+  // Temporal ensembling exists only on some policies (ACT today): show the
+  // knob once the selected checkpoint reports it, hide it for the rest.
+  useEffect(() => {
+    setEnsembleSupported(null);
+    if (checkpoints.length === 0) return;
+    const target = step ? Number(step) : checkpoints[checkpoints.length - 1]?.step;
+    if (target == null || Number.isNaN(target)) return;
+    const controller = new AbortController();
+    getCheckpointPolicyConfig(baseUrl, fetchWithHeaders, job.id, target, controller.signal)
+      .then((s) => setEnsembleSupported(!!s.temporal_ensemble))
+      .catch(() => setEnsembleSupported(null));
+    return () => controller.abort();
+  }, [baseUrl, fetchWithHeaders, job.id, step, checkpoints]);
 
   useEffect(() => {
     setState(job.sim_eval_state ?? "none");
@@ -379,6 +400,55 @@ const SimEvalCard: React.FC<{
       setStopping(false);
     }
   };
+
+  const handleCreateEnv = async () => {
+    const name = newEnvName.trim();
+    if (!name || creatingEnv) return;
+    setCreatingEnv(true);
+    try {
+      const entry = await createSimEnvironment(baseUrl, fetchWithHeaders, name);
+      try {
+        const list = await listSimEnvironments(baseUrl, fetchWithHeaders);
+        setEnvOptions(list);
+      } catch {
+        // Keep the current list; the new scene is still selected below.
+      }
+      setEnvHub(entry.value);
+      setShowCustomEnv(false);
+      setShowNewEnv(false);
+      setNewEnvName("");
+      toast({ title: `已创建本地场景 ${name}` });
+    } catch (e) {
+      toast({
+        title: "创建场景失败",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setCreatingEnv(false);
+    }
+  };
+
+  const handleOpenViewer = async () => {
+    if (openingViewer) return;
+    setOpeningViewer(true);
+    try {
+      await openSimEnvironment(baseUrl, fetchWithHeaders, envHub);
+      toast({ title: "已在 MuJoCo 窗口打开场景" });
+    } catch (e) {
+      toast({
+        title: "打开 MuJoCo 失败",
+        description: e instanceof Error ? e.message : String(e),
+        variant: "destructive",
+      });
+    } finally {
+      setOpeningViewer(false);
+    }
+  };
+
+  const selectedEnvKind =
+    envHub === "" ? "builtin" : envOptions.find((o) => o.value === envHub)?.kind;
+  const canOpenViewer = selectedEnvKind === "builtin" || selectedEnvKind === "local";
 
   const overall = results?.overall;
   const pct =
@@ -473,6 +543,41 @@ const SimEvalCard: React.FC<{
             <div className="text-[11px] text-slate-500 mt-1">
               默认内置场景；可选本机 sim/ 下的其它场景，或任意 Hub 仓库
             </div>
+            <div className="flex flex-wrap items-center gap-2 mt-2">
+              <Button
+                type="button"
+                onClick={() => setShowNewEnv((v) => !v)}
+                className="h-7 px-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-100"
+              >
+                新建本地场景
+              </Button>
+              <Button
+                type="button"
+                onClick={handleOpenViewer}
+                disabled={!canOpenViewer || openingViewer}
+                className="h-7 px-2 text-xs bg-slate-700 hover:bg-slate-600 text-slate-100 disabled:opacity-40"
+              >
+                {openingViewer ? "启动中…" : "在 MuJoCo 打开"}
+              </Button>
+            </div>
+            {showNewEnv && (
+              <div className="flex items-center gap-2 mt-2">
+                <Input
+                  value={newEnvName}
+                  onChange={(e) => setNewEnvName(e.target.value)}
+                  placeholder="新场景名，如 my-tabletop"
+                  className="h-8 bg-slate-900 border-slate-600 text-white rounded-lg font-mono text-xs"
+                />
+                <Button
+                  type="button"
+                  onClick={handleCreateEnv}
+                  disabled={creatingEnv || !newEnvName.trim()}
+                  className="h-8 px-3 text-xs bg-cyan-600 hover:bg-cyan-700 text-white disabled:opacity-40"
+                >
+                  {creatingEnv ? "创建中…" : "创建"}
+                </Button>
+              </div>
+            )}
           </Field>
           <Field label="动作平滑">
             <input
@@ -488,17 +593,19 @@ const SimEvalCard: React.FC<{
               当前 {Number(smooth) || 0}（0=关；越大越稳但越滞后）
             </div>
           </Field>
-          <Field label="时序集成（留空=关）">
-            <Input
-              value={ensemble}
-              onChange={(e) => setEnsemble(e.target.value)}
-              placeholder="0.01"
-              className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
-            />
-            <div className="text-[11px] text-slate-500 mt-1">
-              支持该特性的策略（如 ACT）自动启用，其它策略自动跳过；建议 0.01
-            </div>
-          </Field>
+          {ensembleSupported !== false && (
+            <Field label="时序集成（留空=关）">
+              <Input
+                value={ensemble}
+                onChange={(e) => setEnsemble(e.target.value)}
+                placeholder="0.01"
+                className="bg-slate-900 border-slate-600 text-white rounded-lg mt-1 font-mono text-xs"
+              />
+              <div className="text-[11px] text-slate-500 mt-1">
+                当前模型支持该特性（如 ACT）时启用；建议 0.01
+              </div>
+            </Field>
+          )}
         </div>
 
         <div className="flex flex-wrap items-center gap-4">

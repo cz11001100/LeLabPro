@@ -1517,6 +1517,38 @@ def list_sim_environments():
     return {"environments": available_environments()}
 
 
+class SimEnvCreateBody(BaseModel):
+    name: str
+
+
+@app.post("/sim-eval/environments/create")
+def create_sim_environment(body: SimEnvCreateBody):
+    """Copy the builtin scene into sim/<name>/ and return the new picker entry."""
+    from .sim_eval import create_local_environment
+
+    try:
+        return create_local_environment(body.name)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class SimEnvOpenBody(BaseModel):
+    path: str = ""
+
+
+@app.post("/sim-eval/environments/open")
+def open_sim_environment(body: SimEnvOpenBody):
+    """Open a local scene in a MuJoCo window (sim/view_sim.py)."""
+    from .sim_eval import open_scene_in_viewer
+
+    try:
+        return open_scene_in_viewer(body.path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"启动 MuJoCo 失败: {exc}") from exc
+
+
 @app.get("/jobs/{job_id}/sim-eval")
 def get_job_sim_eval(job_id: str):
     """State, latest results, run history (for ranking) and batch progress."""
