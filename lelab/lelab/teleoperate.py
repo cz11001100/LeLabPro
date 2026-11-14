@@ -83,7 +83,8 @@ def get_joint_positions_from_robot(robot, observation: dict | None = None) -> di
     }
 
     try:
-        observation = robot.get_observation()
+        if observation is None:
+            observation = robot.get_observation()
 
         joint_positions: dict[str, float] = {}
         debug_rows = []
@@ -129,8 +130,11 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     success. Only the teleoperation loop runs in the background thread.
     """
     global teleoperation_active, teleoperation_thread, current_robot, current_teleop
+    global current_teleop_mode, _last_request
 
     from . import record as _record, rollout as _rollout
+
+    mode = normalize_teleop_mode(request.teleop_mode)
 
     with _state_lock:
         if teleoperation_active:
@@ -145,14 +149,20 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     teleop_device = None
     try:
         logger.info(
-            f"Starting teleoperation with leader port: {request.leader_port}, follower port: {request.follower_port}"
+            f"Starting teleoperation (mode={mode}) with leader port: {request.leader_port}, "
+            f"follower port: {request.follower_port}"
         )
         logger.info(f"EMA alpha received from frontend: {request.ema_alpha}")
 
-        # Setup calibration files
-        leader_config_name, follower_config_name = setup_calibration_files(
-            request.leader_config, request.follower_config
-        )
+        # Setup calibration files. Keyboard mode never touches the leader, so a
+        # missing/unplugged leader calibration must not block it.
+        if mode == TELEOP_MODE_KEYBOARD_EE:
+            leader_config_name = ""
+            follower_config_name = setup_follower_calibration_file(request.follower_config)
+        else:
+            leader_config_name, follower_config_name = setup_calibration_files(
+                request.leader_config, request.follower_config
+            )
 
         # Create robot and teleop configs
         # EMA lives in the robot's send_action, one implementation shared with
@@ -164,17 +174,17 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         )
         logger.info(f"Robot config created (EMA alpha={request.ema_alpha})")
 
-        teleop_config = SO101LeaderConfig(
-            port=request.leader_port,
-            id=leader_config_name,
-        )
-
         # Connect synchronously. If either device fails to connect, clean up the
         # other (so its serial port is released) and report the error — do NOT
         # leave the caller thinking teleoperation started.
         logger.info("Initializing robot and teleop device...")
         robot = SO101Follower(robot_config)
-        teleop_device = SO101Leader(teleop_config)
+        if mode == TELEOP_MODE_KEYBOARD_EE:
+            teleop_device = make_keyboard_ee_teleop()
+        else:
+            teleop_device = SO101Leader(
+                SO101LeaderConfig(port=request.leader_port, id=leader_config_name)
+            )
 
         # Connect each arm separately so the error names which one failed and
         # tells the user what to do, instead of a generic "failed to start".
@@ -187,19 +197,29 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                 "Make sure it's plugged in and powered on, then try again."
             ) from e
 
-        logger.info("Connecting to leader arm...")
-        try:
-            teleop_device.bus.connect()
-        except Exception as e:
-            raise RuntimeError(
-                f"Could not connect to the leader arm on {request.leader_port}. "
-                "Make sure it's plugged in and powered on, then try again."
-            ) from e
+        if mode == TELEOP_MODE_KEYBOARD_EE:
+            logger.info("Starting keyboard listener...")
+            teleop_device.connect()
+            if not teleop_device.is_connected:
+                raise RuntimeError(
+                    "Keyboard teleoperation is unavailable: pynput needs an X11/Windows/macOS "
+                    "desktop session (it cannot capture keys on Wayland or headless machines)."
+                )
+        else:
+            logger.info("Connecting to leader arm...")
+            try:
+                teleop_device.bus.connect()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Could not connect to the leader arm on {request.leader_port}. "
+                    "Make sure it's plugged in and powered on, then try again."
+                ) from e
 
         # Write calibration to motors' memory
         logger.info("Writing calibration to motors...")
         robot.bus.write_calibration(robot.calibration)
-        teleop_device.bus.write_calibration(teleop_device.calibration)
+        if mode != TELEOP_MODE_KEYBOARD_EE:
+            teleop_device.bus.write_calibration(teleop_device.calibration)
 
         # Connect cameras and configure motors
         logger.info("Connecting cameras and configuring motors...")
@@ -207,10 +227,18 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             cam.connect()
         robot.configure()
         teleop_device.configure()
+
+        # Keyboard deltas need the FK/IK chain; the leader already speaks joints.
+        keyboard_pipeline = None
+        if mode == TELEOP_MODE_KEYBOARD_EE:
+            logger.info("Building keyboard -> IK pipeline...")
+            keyboard_pipeline = build_keyboard_ee_pipeline(robot)
+
         logger.info("Successfully connected to both devices")
 
         current_robot = robot
         current_teleop = teleop_device
+        current_teleop_mode = mode
 
         # Stream the arms in the background; the worker owns disconnect so stop()
         # does not race the serial bus from the request thread.
@@ -221,14 +249,26 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
             try:
                 last_broadcast_time = 0
                 broadcast_interval = 0.05  # 20 FPS
+                # Keyboard mode reads the follower every iteration for IK, so cap
+                # it at the control rate instead of spinning the serial bus.
+                loop_period = 1.0 / 30 if keyboard_pipeline is not None else 0.0
 
                 while teleoperation_active:
-                    robot.send_action(teleop_device.get_action())
+                    loop_start = time.perf_counter()
+
+                    if keyboard_pipeline is not None:
+                        obs = robot.get_observation()
+                        action = keyboard_pipeline((teleop_device.get_action(), obs))
+                    else:
+                        obs = None
+                        action = teleop_device.get_action()
+
+                    robot.send_action(action)
 
                     current_time = time.time()
                     if current_time - last_broadcast_time >= broadcast_interval:
                         try:
-                            joint_positions = get_joint_positions_from_robot(robot)
+                            joint_positions = get_joint_positions_from_robot(robot, observation=obs)
                             joint_data = {
                                 "type": "joint_update",
                                 "joints": joint_positions,
@@ -240,7 +280,12 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                         except Exception as e:
                             logger.error(f"Error broadcasting joint data: {e}")
 
-                    time.sleep(0.001)
+                    if loop_period:
+                        remaining = loop_period - (time.perf_counter() - loop_start)
+                        if remaining > 0:
+                            time.sleep(remaining)
+                    else:
+                        time.sleep(0.001)
             except Exception as e:
                 logger.error(f"Error during teleoperation loop: {e}")
             finally:
@@ -256,11 +301,14 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         )
         teleoperation_thread.start()
 
+        _last_request = request.model_copy(update={"teleop_mode": mode})
+
         return {
             "success": True,
             "message": "Teleoperation started successfully",
             "leader_port": request.leader_port,
             "follower_port": request.follower_port,
+            "teleop_mode": mode,
         }
 
     except Exception as e:
@@ -306,11 +354,59 @@ def handle_teleoperation_status() -> dict[str, Any]:
     """Handle teleoperation status request"""
     return {
         "teleoperation_active": teleoperation_active,
+        "teleop_mode": current_teleop_mode,
         "available_controls": {
             "stop_teleoperation": teleoperation_active,
         },
         "message": "Teleoperation status retrieved successfully",
     }
+
+
+class SetTeleopModeRequest(BaseModel):
+    mode: str
+
+
+def handle_set_teleop_mode(
+    request: SetTeleopModeRequest, websocket_manager=None
+) -> dict[str, Any]:
+    """Switch the global teleop mode.
+
+    Both teleoperation and dataset recording read this setting. An active
+    session is restarted in the new mode so the switch is not silently ignored
+    until the next start; a stopped session only records the choice.
+    """
+    global current_teleop_mode
+
+    mode = normalize_teleop_mode(request.mode)
+    previous = current_teleop_mode
+
+    if not teleoperation_active:
+        current_teleop_mode = mode
+        return {
+            "success": True,
+            "mode": mode,
+            "restarted": False,
+            "message": "Teleop mode saved. It applies the next time teleoperation or recording starts.",
+        }
+
+    if mode == previous:
+        return {"success": True, "mode": mode, "restarted": False, "message": "Teleop mode unchanged."}
+
+    if _last_request is None:
+        return {"success": False, "message": "No previous teleoperation request to restart from."}
+
+    logger.info(f"Switching teleop mode {previous} -> {mode}; restarting session")
+    current_teleop_mode = mode
+    stop_result = handle_stop_teleoperation()
+    if not stop_result.get("success"):
+        return {"success": False, "message": stop_result.get("message", "Could not stop the current session.")}
+
+    result = handle_start_teleoperation(
+        _last_request.model_copy(update={"teleop_mode": mode}), websocket_manager
+    )
+    result["mode"] = mode
+    result["restarted"] = bool(result.get("success"))
+    return result
 
 
 class UpdateEmaRequest(BaseModel):
